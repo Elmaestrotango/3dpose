@@ -6,7 +6,8 @@ from datetime import datetime
 from pathlib import Path
 
 
-PROFILES_DIR = Path(__file__).parent.parent / "profiles"
+REPO_ROOT = Path(__file__).parent.parent
+PROFILES_DIR = REPO_ROOT / "profiles"
 
 
 @dataclass
@@ -18,6 +19,7 @@ class RigProfile:
     quality: int = 21
     pfs_path: str = ""
     output_dir: str = ""
+    board_config: str = ""
     serial_port: str = "COM3"
     trigger_pins: list = field(default_factory=lambda: [2, 4, 6, 8, 10, 12])
 
@@ -25,14 +27,23 @@ class RigProfile:
     def load(cls, path: Path) -> "RigProfile":
         with open(path) as f:
             data = yaml.safe_load(f)
+        def _resolve(raw: str) -> str:
+            if not raw:
+                return ""
+            p = Path(raw)
+            if not p.is_absolute():
+                p = REPO_ROOT / p
+            return str(p)
+
         return cls(
             name=data.get("name", path.stem),
             frame_width=data.get("frame_width", 1920),
             frame_height=data.get("frame_height", 1200),
             frame_rate=data.get("frame_rate", 100),
             quality=data.get("quality", 21),
-            pfs_path=data.get("pfs_path", ""),
-            output_dir=data.get("output_dir", ""),
+            pfs_path=_resolve(data.get("pfs_path", "")),
+            output_dir=_resolve(data.get("output_dir", "")),
+            board_config=_resolve(data.get("board_config", "")),
             serial_port=data.get("serial_port", "COM3"),
             trigger_pins=data.get("trigger_pins", [2, 4, 6, 8, 10, 12]),
         )
@@ -75,7 +86,7 @@ class SessionConfig:
 
     @classmethod
     def from_profile(cls, profile: RigProfile, **overrides) -> "SessionConfig":
-        return cls(
+        defaults = dict(
             base_data_dir=Path(profile.output_dir) if profile.output_dir else Path(""),
             pfs_path=Path(profile.pfs_path) if profile.pfs_path else Path(""),
             serial_port=profile.serial_port,
@@ -84,8 +95,9 @@ class SessionConfig:
             frame_width=profile.frame_width,
             frame_height=profile.frame_height,
             quality=profile.quality,
-            **overrides,
         )
+        defaults.update(overrides)
+        return cls(**defaults)
 
     @property
     def session_id(self) -> str:

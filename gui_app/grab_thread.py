@@ -37,8 +37,12 @@ class GrabThread(QThread):
         if recording:
             fd = os.open(str(self._raw_path), os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_BINARY)
 
+        print(f"[grab{self._cam_index}] StartGrabbing (recording={recording})", flush=True)
         self._camera.StartGrabbing(pylon.GrabStrategy_OneByOne)
+        print(f"[grab{self._cam_index}] grabbing={self._camera.IsGrabbing()}", flush=True)
         frame_n = 0
+        timeout_n = 0
+        first_frame_logged = False
 
         try:
             while self._running and self._camera.IsGrabbing():
@@ -46,6 +50,7 @@ class GrabThread(QThread):
                     timeout = 200 if (recording and self._triggers_stopped) else (200 if recording else 2000)
                     result = self._camera.RetrieveResult(timeout, pylon.TimeoutHandling_ThrowException)
                     if not result.GrabSucceeded():
+                        print(f"[grab{self._cam_index}] grab failed: {result.ErrorCode} {result.ErrorDescription}", flush=True)
                         result.Release()
                         continue
 
@@ -57,6 +62,11 @@ class GrabThread(QThread):
                         self.timestamps.append(result.TimeStamp * 1e-9)
 
                     frame_n += 1
+                    if recording and not first_frame_logged:
+                        print(f"[grab{self._cam_index}] first frame received", flush=True)
+                        first_frame_logged = True
+                    if recording and frame_n % 100 == 0:
+                        print(f"[grab{self._cam_index}] frames={frame_n} timeouts={timeout_n}", flush=True)
                     now = time.perf_counter()
                     self._fps_times.append(now)
                     if len(self._fps_times) >= 2:
@@ -71,15 +81,20 @@ class GrabThread(QThread):
                     result.Release()
 
                 except pylon.TimeoutException:
+                    timeout_n += 1
+                    if recording and timeout_n in (1, 5, 20):
+                        print(f"[grab{self._cam_index}] TIMEOUT #{timeout_n} (no frame in {timeout}ms, triggers_stopped={self._triggers_stopped})", flush=True)
                     if recording and self._triggers_stopped:
                         break
                     if not self._running:
                         break
-                except Exception:
+                except Exception as e:
+                    print(f"[grab{self._cam_index}] exception: {type(e).__name__}: {e}", flush=True)
                     if not self._running:
                         break
                     time.sleep(0.001)
         finally:
+            print(f"[grab{self._cam_index}] exiting: frames={frame_n} timeouts={timeout_n}", flush=True)
             if fd is not None:
                 os.close(fd)
             try:
