@@ -4,4 +4,4 @@ square_length: 15.0   # mm
 marker_length: 10.0   # mm
 marker_bits: 4
 dict_size: 1000
-max_frames: 200
+max_frames: 500
