@@ -293,15 +293,22 @@ def prepare_prescan_videos(cam_dirs, per_cam_frames):
 def run_calibration(calib_dir, board_toml, excluded, calib_fname,
                     metadata_fname, histogram_path, reproj_path):
     """Run sleap-anipose calibration. Returns (cgroup, metadata) or raises."""
-    result = slap.calibrate(
-        session=str(calib_dir),
-        board=str(board_toml),
-        excluded_views=excluded,
-        calib_fname=str(calib_fname),
-        metadata_fname=str(metadata_fname),
-        histogram_path=str(histogram_path),
-        reproj_path=str(reproj_path),
-    )
+    try:
+        result = slap.calibrate(
+            session=str(calib_dir),
+            board=str(board_toml),
+            excluded_views=excluded,
+            calib_fname=str(calib_fname),
+            metadata_fname=str(metadata_fname),
+            histogram_path=str(histogram_path),
+            reproj_path=str(reproj_path),
+        )
+    except (ValueError, TypeError) as e:
+        if Path(calib_fname).exists():
+            print("  (metadata generation failed: {}, but calibration.toml "
+                  "was written successfully)".format(e))
+            return True, None
+        raise
     if not result or (hasattr(result, '__len__') and len(result) < 2):
         raise RuntimeError("Calibration returned empty result")
     if isinstance(result, tuple):
