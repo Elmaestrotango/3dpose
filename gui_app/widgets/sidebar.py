@@ -9,7 +9,7 @@ from PyQt5.QtCore import Qt, pyqtSignal
 from PyQt5.QtGui import QFont, QColor
 
 from gui_app.widgets.toggle_switch import ToggleSwitch
-from gui_app.session_config import RigProfile
+from gui_app.session_config import RigProfile, REPO_ROOT
 
 
 class SidebarWidget(QWidget):
@@ -18,7 +18,7 @@ class SidebarWidget(QWidget):
     run_calibration_clicked = pyqtSignal()
     profile_changed = pyqtSignal(object)
 
-    def __init__(self, default_output_dir: str = r"C:\Users\isaac\Desktop\3dpose\data", parent=None):
+    def __init__(self, default_output_dir: str = str(REPO_ROOT / "data"), parent=None):
         super().__init__(parent)
         self.setFixedWidth(260)
         layout = QVBoxLayout(self)

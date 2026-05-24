@@ -1,15 +1,13 @@
 # 3DPose — 6x Basler a2A1920-165g5m GigE, 1920x1200, 100 fps
 name: 3dpose
-camera_make: basler
 frame_width: 1920
 frame_height: 1200
 frame_rate: 100
 quality: 21
 
-pfs_path: "C:\\Users\\isaac\\Desktop\\3dpose\\data\\configs\\mono8_1920x1200.pfs"
-output_dir: "C:\\Users\\isaac\\Desktop\\3dpose\\data"
+pfs_path: "configs/mono8_1920x1200.pfs"
+output_dir: "data"
+board_config: "configs/boards/charuco_8x8_15mm.yaml"
 
 serial_port: COM3
 trigger_pins: [2, 4, 6, 8, 10, 12]
-
-encoding: post_hoc

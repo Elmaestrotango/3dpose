@@ -12,6 +12,7 @@ from gui_app.camera_manager import CameraManager
 from gui_app.serial_controller import TeensyController
 from gui_app.encode_worker import EncodeWorker
 from gui_app.calibration_worker import CalibrationWorker
+from gui_app.hardware_check import HardwareCheckThread, format_report
 from gui_app.session_config import SessionConfig, RigProfile
 from gui_app.widgets.camera_grid import CameraGridWidget
 from gui_app.widgets.sidebar import SidebarWidget
@@ -45,6 +46,7 @@ class MainWindow(QMainWindow):
 
         self._camera_mgr = CameraManager()
         self._teensy = TeensyController()
+        self._hw_check_thread: HardwareCheckThread | None = None
 
         self._camera_grid = CameraGridWidget()
         self._sidebar = SidebarWidget()
@@ -90,6 +92,7 @@ class MainWindow(QMainWindow):
         self._open_cameras()
         self._size_to_screen()
         self._sidebar.set_status("IDLE", "#888")
+        self._run_hardware_check()
 
     def _open_cameras(self):
         pfs = self._profile.pfs_path
@@ -118,6 +121,18 @@ class MainWindow(QMainWindow):
             (screen.width() - target_w) // 2 + screen.x(),
             (screen.height() - target_h) // 2 + screen.y(),
         )
+
+    def _run_hardware_check(self):
+        output_dir = self._profile.output_dir if self._profile else ""
+        self._hw_check_thread = HardwareCheckThread(output_dir)
+        self._hw_check_thread.finished.connect(self._on_hardware_check_done)
+        self._hw_check_thread.start()
+
+    def _on_hardware_check_done(self, report):
+        if report.warnings:
+            msg = format_report(report)
+            print(msg, flush=True)
+            QMessageBox.warning(self, "Hardware Check", msg)
 
     def _on_profile_changed(self, profile: RigProfile):
         if self._state != State.IDLE:
@@ -155,10 +170,13 @@ class MainWindow(QMainWindow):
                     f = frame.astype(np.float32)
                     if contrast != 0:
                         factor = (100 + contrast) / 100
-                        f = 128 + factor * (f - 128)
+                        np.subtract(f, 128, out=f)
+                        np.multiply(f, factor, out=f)
+                        np.add(f, 128, out=f)
                     if brightness != 0:
-                        f = f + brightness
-                    frame = np.clip(f, 0, 255).astype(np.uint8)
+                        np.add(f, brightness, out=f)
+                    np.clip(f, 0, 255, out=f)
+                    frame = f.astype(np.uint8)
                 self._camera_grid.update_frame(i, frame)
 
         if self._display_tick % 10 == 0:
@@ -270,6 +288,7 @@ class MainWindow(QMainWindow):
         if not counts:
             return
         min_frames = min(counts)
+        frame_nums = np.arange(1, min_frames + 1, dtype=np.float64)
 
         for i, (count, timestamps) in enumerate(cam_results):
             if not timestamps:
@@ -277,13 +296,10 @@ class MainWindow(QMainWindow):
             cam = self._camera_names[i]
             cam_dir = self._video_dir / cam
 
-            timestamps = timestamps[:min_frames]
-            t0 = timestamps[0]
-            rel_ts = [t - t0 for t in timestamps]
-            frame_nums = list(range(1, min_frames + 1))
+            ts_arr = np.array(timestamps[:min_frames])
+            ts_arr -= ts_arr[0]
 
-            npy_path = cam_dir / "frametimes.npy"
-            np.save(npy_path, np.array([frame_nums, rel_ts]))
+            np.save(cam_dir / "frametimes.npy", np.stack([frame_nums, ts_arr]))
 
             raw_path = cam_dir / "raw.bin"
             if raw_path.exists():
@@ -341,11 +357,20 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "No Data", f"No calibration videos found in:\n{calib_dir}")
             return
 
+        board_cfg = self._profile.board_config
+        if not board_cfg or not Path(board_cfg).exists():
+            QMessageBox.warning(
+                self, "Missing Board Config",
+                f"Board config not found: {board_cfg or '(not set)'}\n\n"
+                "Set board_config in your profile YAML to a valid file in configs/boards/.")
+            return
+
         self._sidebar.set_status("CALIBRATING...", "#aa88ff")
         self._sidebar.set_toggles_enabled(False)
         self.statusBar().showMessage("Running sleap-anipose calibration...")
 
-        self._calib_worker = CalibrationWorker(config.session_dir, CALIBRATION_SCRIPT)
+        self._calib_worker = CalibrationWorker(
+            config.session_dir, CALIBRATION_SCRIPT, board_cfg)
         self._calib_worker.status.connect(lambda s: self.statusBar().showMessage(s))
         self._calib_worker.finished.connect(self._on_calibration_done)
         self._calib_worker.start()
@@ -360,11 +385,15 @@ class MainWindow(QMainWindow):
             if src.exists():
                 dst.parent.mkdir(parents=True, exist_ok=True)
                 shutil.copy2(src, dst)
-                self.statusBar().showMessage(f"Calibration solved — copied to {dst}", 10000)
+                status = f"Calibration solved — copied to {dst}"
             else:
-                self.statusBar().showMessage("Calibration solved (no toml found to copy)", 10000)
+                status = "Calibration solved (no toml found to copy)"
+            if msg:
+                QMessageBox.warning(self, "Calibration Warnings", msg[:800])
+                status += " (with warnings)"
+            self.statusBar().showMessage(status, 15000)
         else:
-            QMessageBox.warning(self, "Calibration Failed", msg[:500])
+            QMessageBox.warning(self, "Calibration Failed", msg[:800])
             self.statusBar().showMessage("Calibration failed", 10000)
 
     def _on_camera_error(self, msg: str):
