@@ -16,6 +16,7 @@ class RigProfile:
     frame_width: int = 1920
     frame_height: int = 1200
     frame_rate: int = 100
+    calibration_frame_rate: int = 30
     quality: int = 21
     pfs_path: str = ""
     output_dir: str = ""
@@ -40,6 +41,7 @@ class RigProfile:
             frame_width=data.get("frame_width", 1920),
             frame_height=data.get("frame_height", 1200),
             frame_rate=data.get("frame_rate", 100),
+            calibration_frame_rate=data.get("calibration_frame_rate", 30),
             quality=data.get("quality", 21),
             pfs_path=_resolve(data.get("pfs_path", "")),
             output_dir=_resolve(data.get("output_dir", "")),
@@ -71,6 +73,7 @@ class SessionConfig:
     serial_port: str = "COM3"
     trigger_pins: list = field(default_factory=lambda: [2, 4, 6, 8, 10, 12])
     frame_rate: int = 100
+    calibration_frame_rate: int = 30
     frame_width: int = 1920
     frame_height: int = 1200
     camera_names: list = field(default_factory=lambda: ["cam1", "cam2", "cam3", "cam4", "cam5", "cam6"])
@@ -92,6 +95,7 @@ class SessionConfig:
             serial_port=profile.serial_port,
             trigger_pins=profile.trigger_pins,
             frame_rate=profile.frame_rate,
+            calibration_frame_rate=profile.calibration_frame_rate,
             frame_width=profile.frame_width,
             frame_height=profile.frame_height,
             quality=profile.quality,
@@ -110,6 +114,10 @@ class SessionConfig:
     def video_dir(self, acq_type: str) -> Path:
         return self.session_dir / acq_type
 
+    def rate_for(self, acq_type: str) -> int:
+        """Trigger/encode frame rate for an acquisition type."""
+        return self.calibration_frame_rate if acq_type == "calibration" else self.frame_rate
+
     def video_filename(self, cam: str, acq_type: str) -> str:
         return f"{self.date}-{self.session_id}-{cam}-{acq_type}.mp4"
 
@@ -127,7 +135,8 @@ class SessionConfig:
             assay=self.assay, cohort=self.cohort, cage=self.cage,
             experimenter=self.experimenter, notes=self.notes,
             num_cameras=len(self.camera_names), camera_names=self.camera_names,
-            frame_rate=self.frame_rate, resolution=[self.frame_width, self.frame_height],
+            frame_rate=self.frame_rate, calibration_frame_rate=self.calibration_frame_rate,
+            resolution=[self.frame_width, self.frame_height],
             time_of_day=now.strftime("%H:%M:%S"),
             timestamp_iso=now.isoformat(),
         )

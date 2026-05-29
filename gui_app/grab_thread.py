@@ -25,6 +25,8 @@ class GrabThread(QThread):
         self.latest_frame = None
         self.current_fps = 0.0
         self._fps_times = deque(maxlen=10)
+        self._snapshot_requested = False
+        self.snapshot_frame = None
 
     def run(self):
         self._running = True
@@ -55,6 +57,10 @@ class GrabThread(QThread):
                         continue
 
                     img = result.Array
+
+                    if self._snapshot_requested:
+                        self.snapshot_frame = img.copy()  # full-resolution still
+                        self._snapshot_requested = False
 
                     if recording:
                         os.write(fd, img)
@@ -104,6 +110,11 @@ class GrabThread(QThread):
 
     def signal_triggers_stopped(self):
         self._triggers_stopped = True
+
+    def request_snapshot(self):
+        """Ask the grab loop to stash the next full-resolution frame."""
+        self.snapshot_frame = None
+        self._snapshot_requested = True
 
     def stop(self):
         self._running = False

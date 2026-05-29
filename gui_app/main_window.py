@@ -1,5 +1,6 @@
 """Main application window — wires cameras, sidebar, state machine, and encoding."""
 import shutil
+from datetime import datetime
 import numpy as np
 from enum import Enum
 from pathlib import Path
@@ -16,6 +17,11 @@ from gui_app.hardware_check import HardwareCheckThread, format_report
 from gui_app.session_config import SessionConfig, RigProfile
 from gui_app.widgets.camera_grid import CameraGridWidget
 from gui_app.widgets.sidebar import SidebarWidget
+
+try:
+    from gui_app.board_detector import BoardDetector
+except Exception:  # OpenCV missing → coverage HUD disabled, rest of GUI still runs
+    BoardDetector = None
 
 CALIBRATION_SCRIPT = Path(__file__).parent.parent / "1_calibrate.py"
 
@@ -39,6 +45,8 @@ class MainWindow(QMainWindow):
 
         self._state = State.IDLE
         self._acq_type = ""
+        self._acq_fps = 0
+        self._detector = None
         self._encode_worker: EncodeWorker | None = None
         self._calib_worker: CalibrationWorker | None = None
         self._config: SessionConfig | None = None
@@ -69,6 +77,7 @@ class MainWindow(QMainWindow):
         self._sidebar.calibrate_toggled.connect(self._on_calibrate_toggle)
         self._sidebar.record_toggled.connect(self._on_record_toggle)
         self._sidebar.run_calibration_clicked.connect(self._on_run_calibration)
+        self._sidebar.snapshot_clicked.connect(self._on_snapshot)
         self._sidebar.profile_changed.connect(self._on_profile_changed)
         self._camera_mgr.error.connect(self._on_camera_error)
 
@@ -183,6 +192,12 @@ class MainWindow(QMainWindow):
             for i, fps in enumerate(self._camera_mgr.current_fps):
                 self._camera_grid.update_fps(i, fps)
 
+        # Live ChArUco coverage HUD during calibration (~10 Hz, on raw preview frames).
+        if (self._state == State.CALIBRATING and self._detector is not None
+                and self._display_tick % 3 == 0):
+            self._detector.update(self._camera_mgr.latest_frames)
+            self._sidebar.update_coverage(self._detector)
+
     def _build_config(self) -> SessionConfig:
         vals = self._sidebar.get_field_values()
         return SessionConfig.from_profile(
@@ -235,29 +250,56 @@ class MainWindow(QMainWindow):
             for cam in self._camera_names
         ]
 
-        print(f"[acq] start_acquisition({acq_type}): switching cameras to trigger mode", flush=True)
-        self._camera_mgr.start_acquisition(raw_paths)
+        # Calibration runs at a lower trigger rate (still sharp, plenty of distinct
+        # board poses) with a smooth 1:1 preview; recording stays at the full rate
+        # with a decimated preview to protect the disk-write loop.
+        fps = self._config.rate_for(acq_type)
+        self._acq_fps = fps
+        display_every = 1 if acq_type == "calibration" else 10
+
+        print(f"[acq] start_acquisition({acq_type}) fps={fps}: switching cameras to trigger mode", flush=True)
+        self._camera_mgr.start_acquisition(raw_paths, display_every=display_every)
 
         print(f"[acq] opening teensy on {self._profile.serial_port}", flush=True)
         self._teensy = TeensyController(port=self._profile.serial_port)
         if not self._teensy.open():
             self._on_camera_error("Could not open serial port")
             return
-        print(f"[acq] sending start_triggers pins={self._profile.trigger_pins} fps={self._profile.frame_rate}", flush=True)
-        self._teensy.start_triggers(self._profile.trigger_pins, self._profile.frame_rate)
+        print(f"[acq] sending start_triggers pins={self._profile.trigger_pins} fps={fps}", flush=True)
+        self._teensy.start_triggers(self._profile.trigger_pins, fps)
         print(f"[acq] start_acquisition done", flush=True)
 
         self._sidebar.set_fields_editable(False)
         if acq_type == "calibration":
             self._state = State.CALIBRATING
             self._sidebar.set_status("CALIBRATING", "#4488ff")
+            self._start_coverage_hud()
         else:
             self._state = State.RECORDING
             self._sidebar.set_status("RECORDING", "#ff4444")
 
+    def _start_coverage_hud(self):
+        """Spin up the live ChArUco coverage graph for this calibration run."""
+        self._detector = None
+        board_cfg = self._profile.board_config
+        n = self._camera_mgr.num_cameras
+        if BoardDetector is None or n == 0 or not board_cfg or not Path(board_cfg).exists():
+            return
+        try:
+            self._detector = BoardDetector(n, board_cfg)
+        except Exception as e:
+            print(f"[hud] coverage detector unavailable: {e}", flush=True)
+            self._detector = None
+            return
+        self._sidebar.setup_coverage(n)
+        self._sidebar.show_coverage()
+
     def _stop_acquisition(self):
         self._teensy.stop_triggers(self._profile.trigger_pins)
         self._teensy.close()
+
+        self._detector = None
+        self._sidebar.hide_coverage()
 
         cam_results = self._camera_mgr.stop_acquisition()
 
@@ -274,7 +316,7 @@ class MainWindow(QMainWindow):
             self._acq_type,
             self._config.frame_width,
             self._config.frame_height,
-            self._config.frame_rate,
+            self._acq_fps,
             self._config.quality,
             self._config.date,
             self._config.session_id,
@@ -395,6 +437,33 @@ class MainWindow(QMainWindow):
         else:
             QMessageBox.warning(self, "Calibration Failed", msg[:800])
             self.statusBar().showMessage("Calibration failed", 10000)
+
+    def _on_snapshot(self):
+        if self._camera_mgr.num_cameras == 0:
+            self.statusBar().showMessage("Snapshot: no cameras open", 5000)
+            return
+        self._camera_mgr.request_snapshots()
+        # Give the grab threads a moment to stash the next full-res frame.
+        QTimer.singleShot(250, self._save_snapshots)
+
+    def _save_snapshots(self):
+        from PIL import Image
+        cfg = self._build_config()
+        out_dir = cfg.session_dir / "snapshots" / f"{cfg.date}_{datetime.now().strftime('%H%M%S')}"
+        out_dir.mkdir(parents=True, exist_ok=True)
+        frames = self._camera_mgr.snapshots
+        saved = 0
+        for i, frame in enumerate(frames):
+            if frame is None:
+                continue
+            cam = self._camera_names[i] if i < len(self._camera_names) else f"cam{i+1}"
+            try:
+                Image.fromarray(frame).save(out_dir / f"{cam}.png")
+                saved += 1
+            except Exception as e:
+                print(f"[snapshot] {cam} failed: {e}", flush=True)
+        self.statusBar().showMessage(
+            f"Snapshot: saved {saved}/{len(frames)} cameras → {out_dir}", 10000)
 
     def _on_camera_error(self, msg: str):
         QMessageBox.critical(self, "Error", msg)
