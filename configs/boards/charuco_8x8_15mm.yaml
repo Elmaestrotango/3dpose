@@ -4,4 +4,5 @@ square_length: 15.0   # mm
 marker_length: 10.0   # mm
 marker_bits: 4
 dict_size: 1000
+board_legacy: true   # physical board printed with pre-OpenCV-4.6 ChArUco layout; required for >=4.7 CharucoDetector to map corners correctly
 max_frames: 500

@@ -9,6 +9,7 @@ from PyQt5.QtCore import Qt, pyqtSignal
 from PyQt5.QtGui import QFont, QColor
 
 from gui_app.widgets.toggle_switch import ToggleSwitch
+from gui_app.widgets.coverage_graph import CoverageGraphWidget
 from gui_app.session_config import RigProfile, REPO_ROOT
 
 
@@ -16,6 +17,7 @@ class SidebarWidget(QWidget):
     calibrate_toggled = pyqtSignal(bool)
     record_toggled = pyqtSignal(bool)
     run_calibration_clicked = pyqtSignal()
+    snapshot_clicked = pyqtSignal()
     profile_changed = pyqtSignal(object)
 
     def __init__(self, default_output_dir: str = str(REPO_ROOT / "data"), parent=None):
@@ -129,6 +131,22 @@ class SidebarWidget(QWidget):
         layout.addLayout(calib_row)
 
         layout.addWidget(self._record_toggle)
+
+        self._snapshot_btn = QPushButton("Snapshot")
+        self._snapshot_btn.setToolTip("Save a full-resolution still from every camera to the session's snapshots/ folder")
+        self._snapshot_btn.setStyleSheet(
+            "QPushButton { background: #2a2a4a; color: #88aadd; border: 1px solid #444; "
+            "border-radius: 3px; padding: 5px 8px; font-size: 11px; }"
+            "QPushButton:hover { background: #333366; border-color: #5078c8; }"
+            "QPushButton:disabled { color: #555; border-color: #333; }"
+        )
+        self._snapshot_btn.clicked.connect(self.snapshot_clicked.emit)
+        layout.addWidget(self._snapshot_btn)
+
+        # Live ChArUco coverage graph — shown only during calibration.
+        self._coverage_graph = CoverageGraphWidget()
+        self._coverage_graph.setVisible(False)
+        layout.addWidget(self._coverage_graph)
 
         layout.addSpacing(12)
 
@@ -278,3 +296,16 @@ class SidebarWidget(QWidget):
         self._record_toggle.setChecked(False)
         self._calibrate_toggle.setEnabled(True)
         self._record_toggle.setEnabled(True)
+
+    # --- calibration coverage graph ---
+    def setup_coverage(self, n_cams: int):
+        self._coverage_graph.setup(n_cams)
+
+    def show_coverage(self):
+        self._coverage_graph.setVisible(True)
+
+    def hide_coverage(self):
+        self._coverage_graph.setVisible(False)
+
+    def update_coverage(self, detector):
+        self._coverage_graph.update_from(detector)
