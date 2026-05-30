@@ -27,6 +27,24 @@ class CameraManager(QObject):
     def current_fps(self) -> list[float]:
         return [gt.current_fps for gt in self._grab_threads]
 
+    @property
+    def snapshots(self) -> list:
+        return [gt.snapshot_frame for gt in self._grab_threads]
+
+    @property
+    def latest_full_frames(self) -> list:
+        return [gt.latest_full_frame for gt in self._grab_threads]
+
+    def request_snapshots(self):
+        """Ask every camera to stash its next full-resolution frame."""
+        for gt in self._grab_threads:
+            gt.request_snapshot()
+
+    def set_keep_full(self, flag: bool):
+        """Toggle full-resolution frame retention (for the coverage HUD)."""
+        for gt in self._grab_threads:
+            gt.set_keep_full(flag)
+
     def open_all(self, pfs_path: str):
         tlf = pylon.TlFactory.GetInstance()
         devices = tlf.EnumerateDevices()
@@ -85,10 +103,10 @@ class CameraManager(QObject):
             gt.wait(5000)
         self._grab_threads.clear()
 
-    def start_acquisition(self, raw_paths: list[Path]):
+    def start_acquisition(self, raw_paths: list[Path], display_every: int = 10):
         self._stop_grab_threads()
         self._set_trigger_mode()
-        self._start_grab_threads(raw_paths=raw_paths, display_every=10)
+        self._start_grab_threads(raw_paths=raw_paths, display_every=display_every)
 
     def stop_acquisition(self) -> list[tuple[int, list[float]]]:
         for gt in self._grab_threads:

@@ -13,6 +13,7 @@ dependencies = [
     "imageio-ffmpeg>=0.5",
     "psutil>=5.9",
     "pillow>=10.0",
+    "opencv-contrib-python>=4.6",
 ]
 
 [project.scripts]

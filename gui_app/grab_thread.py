@@ -25,6 +25,10 @@ class GrabThread(QThread):
         self.latest_frame = None
         self.current_fps = 0.0
         self._fps_times = deque(maxlen=10)
+        self._snapshot_requested = False
+        self.snapshot_frame = None
+        self._keep_full = False
+        self.latest_full_frame = None
 
     def run(self):
         self._running = True
@@ -56,6 +60,10 @@ class GrabThread(QThread):
 
                     img = result.Array
 
+                    if self._snapshot_requested:
+                        self.snapshot_frame = img.copy()  # full-resolution still
+                        self._snapshot_requested = False
+
                     if recording:
                         os.write(fd, img)
                         self.frame_count += 1
@@ -77,6 +85,11 @@ class GrabThread(QThread):
                     if frame_n % self._display_every == 0:
                         d = self._downsample
                         self.latest_frame = img[::d, ::d].copy()
+                        # Full-res copy for the coverage HUD detector (calibration
+                        # only) — oblique cams (1/4) need full res to resolve the
+                        # board, same as the post-hoc calibration.
+                        if self._keep_full:
+                            self.latest_full_frame = img.copy()
 
                     result.Release()
 
@@ -104,6 +117,18 @@ class GrabThread(QThread):
 
     def signal_triggers_stopped(self):
         self._triggers_stopped = True
+
+    def request_snapshot(self):
+        """Ask the grab loop to stash the next full-resolution frame."""
+        self.snapshot_frame = None
+        self._snapshot_requested = True
+
+    def set_keep_full(self, flag: bool):
+        """Keep a full-resolution copy of each display-cadence frame for the
+        coverage HUD detector. Off by default to avoid recording-loop overhead."""
+        self._keep_full = flag
+        if not flag:
+            self.latest_full_frame = None
 
     def stop(self):
         self._running = False
