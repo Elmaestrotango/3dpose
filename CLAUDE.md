@@ -5,17 +5,26 @@ rig. The `gui_app/` codebase is shared with the **3dface** repo; only the rig
 profile (`profiles/*.yaml`) differs. Launch: `uv run gui.py` (or
 `conda run -n 3dpose python gui.py`).
 
-## Active work — read this if continuing the calibration-HUD feature
+## Calibration coverage HUD (merged — PR #1, rig-validated 2026-05-29)
 
-There is an in-progress **draft PR #1** on branch `feat/calibration-coverage-hud`
-adding: a live ChArUco coverage graph (sidebar, during calibration), 30 fps
-calibration capture+preview, parallel NVENC encoding, and a snapshot button.
+The live ChArUco coverage graph (sidebar, during calibration), 30 fps calibration
+capture+preview, parallel NVENC encoding, and snapshot button are **merged to
+master and validated on the rig**. `docs/CALIBRATION_HUD_HANDOFF.md` has the
+original design rationale and file map.
 
-**It was implemented off-rig and has NOT been tested on real cameras.** Before
-changing anything, read **`docs/CALIBRATION_HUD_HANDOFF.md`** — it has the full
-file map, design rationale, the rig-test checklist, the tunable thresholds, and
-how to iterate. Push fixes to the same branch; merge PR #1 when it works; then
-mirror `gui_app/` to the 3dface repo.
+Rig-validated fixes layered on top of the original PR (all on master):
+- **`board_legacy: true`** in the board config — the physical 3dpose board uses
+  the pre-OpenCV-4.6 ChArUco layout; without `setLegacyPattern(True)` the ≥4.7
+  `CharucoDetector` returns 0 corners silently. Defaults false for other boards.
+- **HUD counts markers, not charuco corners** (`board_detector.py`) — matches the
+  `1_calibrate.py` prescan (`len(ids) >= 4`). Corner-counting was far stricter
+  than calibration eligibility and starved oblique cameras (cam1/cam4).
+- **`coverage_worker.py`** runs detection off the UI thread at ~30 Hz on full-res
+  frames (`GrabThread.set_keep_full`).
+- **`encode_parallel`** profile field (default 3) caps concurrent NVENC jobs.
+- READY target `min_per_cam_shared = 20` (~2× the ~10-frame sleap-anipose floor).
+
+3dface mirror of `gui_app/` is deferred — this rig only runs 3dpose for now.
 
 ## Conventions
 - New OpenCV dependency: `opencv-contrib-python` (run `uv sync`). The coverage
