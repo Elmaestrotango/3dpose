@@ -24,6 +24,7 @@ class CoverageGraphWidget(QWidget):
         self._shared = None
         self._per_cam = None
         self._optimal = 50
+        self._target = 40
         self._ready = False
 
     def setup(self, n_cams: int):
@@ -41,6 +42,7 @@ class CoverageGraphWidget(QWidget):
         self._shared = np.asarray(det.shared, dtype=int).copy()
         self._per_cam = np.asarray(det.per_cam_covis, dtype=int).copy()
         self._optimal = det.optimal_shared or 1
+        self._target = getattr(det, "min_per_cam_shared", 40)
         self._ready = bool(det.ready)
         self.update()
 
@@ -106,6 +108,8 @@ class CoverageGraphWidget(QWidget):
             p.setPen(QPen(QColor(255, 255, 255)))
             p.drawText(QRectF(0, h - 18, w, 16), Qt.AlignCenter, "READY — coverage complete")
         else:
+            mn = int(self._per_cam.min()) if (self._per_cam is not None and self._n) else 0
             p.setPen(QPen(QColor(150, 150, 170)))
-            p.drawText(QRectF(0, h - 18, w, 16), Qt.AlignCenter, "Calibration coverage")
+            p.drawText(QRectF(0, h - 18, w, 16), Qt.AlignCenter,
+                       f"weakest cam {mn}/{self._target} paired")
         p.end()

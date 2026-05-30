@@ -31,10 +31,19 @@ class CameraManager(QObject):
     def snapshots(self) -> list:
         return [gt.snapshot_frame for gt in self._grab_threads]
 
+    @property
+    def latest_full_frames(self) -> list:
+        return [gt.latest_full_frame for gt in self._grab_threads]
+
     def request_snapshots(self):
         """Ask every camera to stash its next full-resolution frame."""
         for gt in self._grab_threads:
             gt.request_snapshot()
+
+    def set_keep_full(self, flag: bool):
+        """Toggle full-resolution frame retention (for the coverage HUD)."""
+        for gt in self._grab_threads:
+            gt.set_keep_full(flag)
 
     def open_all(self, pfs_path: str):
         tlf = pylon.TlFactory.GetInstance()

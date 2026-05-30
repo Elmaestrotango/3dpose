@@ -14,6 +14,7 @@ from gui_app.serial_controller import TeensyController
 from gui_app.encode_worker import EncodeWorker
 from gui_app.calibration_worker import CalibrationWorker
 from gui_app.hardware_check import HardwareCheckThread, format_report
+from gui_app.coverage_worker import CoverageWorker
 from gui_app.session_config import SessionConfig, RigProfile
 from gui_app.widgets.camera_grid import CameraGridWidget
 from gui_app.widgets.sidebar import SidebarWidget
@@ -47,6 +48,7 @@ class MainWindow(QMainWindow):
         self._acq_type = ""
         self._acq_fps = 0
         self._detector = None
+        self._coverage_worker: CoverageWorker | None = None
         self._encode_worker: EncodeWorker | None = None
         self._calib_worker: CalibrationWorker | None = None
         self._config: SessionConfig | None = None
@@ -192,12 +194,6 @@ class MainWindow(QMainWindow):
             for i, fps in enumerate(self._camera_mgr.current_fps):
                 self._camera_grid.update_fps(i, fps)
 
-        # Live ChArUco coverage HUD during calibration (~10 Hz, on raw preview frames).
-        if (self._state == State.CALIBRATING and self._detector is not None
-                and self._display_tick % 3 == 0):
-            self._detector.update(self._camera_mgr.latest_frames)
-            self._sidebar.update_coverage(self._detector)
-
     def _build_config(self) -> SessionConfig:
         vals = self._sidebar.get_field_values()
         return SessionConfig.from_profile(
@@ -294,10 +290,32 @@ class MainWindow(QMainWindow):
         self._sidebar.setup_coverage(n)
         self._sidebar.show_coverage()
 
+        # Run detection off the UI thread on full-res frames (resolves oblique
+        # cams, same as the post-hoc calibration).
+        self._camera_mgr.set_keep_full(True)
+        self._coverage_worker = CoverageWorker(self._detector, self._camera_mgr)
+        self._coverage_worker.updated.connect(self._on_coverage_updated)
+        self._coverage_worker.start()
+
+    def _on_coverage_updated(self):
+        if self._detector is not None:
+            self._sidebar.update_coverage(self._detector)
+
+    def _stop_coverage_hud(self):
+        if self._coverage_worker is not None:
+            self._coverage_worker.stop()
+            self._coverage_worker.wait(2000)
+            self._coverage_worker = None
+        try:
+            self._camera_mgr.set_keep_full(False)
+        except Exception:
+            pass
+
     def _stop_acquisition(self):
         self._teensy.stop_triggers(self._profile.trigger_pins)
         self._teensy.close()
 
+        self._stop_coverage_hud()
         self._detector = None
         self._sidebar.hide_coverage()
 
@@ -320,6 +338,7 @@ class MainWindow(QMainWindow):
             self._config.quality,
             self._config.date,
             self._config.session_id,
+            max_parallel=self._config.encode_parallel,
         )
         self._encode_worker.progress.connect(self._sidebar.show_progress)
         self._encode_worker.finished_all.connect(self._on_encoding_done)
@@ -470,6 +489,7 @@ class MainWindow(QMainWindow):
 
     def closeEvent(self, event):
         self._display_timer.stop()
+        self._stop_coverage_hud()
         if self._state in (State.CALIBRATING, State.RECORDING):
             self._teensy.stop_triggers(self._profile.trigger_pins)
             self._teensy.close()

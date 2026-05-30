@@ -18,6 +18,7 @@ class RigProfile:
     frame_rate: int = 100
     calibration_frame_rate: int = 30
     quality: int = 21
+    encode_parallel: int = 3
     pfs_path: str = ""
     output_dir: str = ""
     board_config: str = ""
@@ -43,6 +44,7 @@ class RigProfile:
             frame_rate=data.get("frame_rate", 100),
             calibration_frame_rate=data.get("calibration_frame_rate", 30),
             quality=data.get("quality", 21),
+            encode_parallel=data.get("encode_parallel", 3),
             pfs_path=_resolve(data.get("pfs_path", "")),
             output_dir=_resolve(data.get("output_dir", "")),
             board_config=_resolve(data.get("board_config", "")),
@@ -78,6 +80,7 @@ class SessionConfig:
     frame_height: int = 1200
     camera_names: list = field(default_factory=lambda: ["cam1", "cam2", "cam3", "cam4", "cam5", "cam6"])
     quality: int = 21
+    encode_parallel: int = 3
 
     def __post_init__(self):
         if not self.date:
@@ -99,6 +102,7 @@ class SessionConfig:
             frame_width=profile.frame_width,
             frame_height=profile.frame_height,
             quality=profile.quality,
+            encode_parallel=profile.encode_parallel,
         )
         defaults.update(overrides)
         return cls(**defaults)
