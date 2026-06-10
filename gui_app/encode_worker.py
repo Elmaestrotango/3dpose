@@ -29,7 +29,8 @@ class EncodeWorker(QThread):
 
     def __init__(self, video_dir: Path, camera_names: list[str],
                  acq_type: str, w: int, h: int, fps: int, quality: int,
-                 date: str, session_id: str, max_parallel: int = 0):
+                 date: str, session_id: str, max_parallel: int = 0,
+                 realtime: bool = False):
         super().__init__()
         self._video_dir = video_dir
         self._camera_names = camera_names
@@ -42,14 +43,26 @@ class EncodeWorker(QThread):
         self._session_id = session_id
         # 0 => encode all cameras concurrently
         self._max_parallel = max_parallel
+        # realtime: frames were already H.264-encoded on the GPU during capture;
+        # here we only wrap the .h264 elementary stream into mp4 (stream copy).
+        self._realtime = realtime
 
-    def _cmd(self, raw_path: Path, mp4_path: Path) -> list:
+    def _cmd(self, src_path: Path, mp4_path: Path) -> list:
+        if src_path.suffix == ".h264":
+            # Stream-copy remux — no re-encode, finishes in seconds, no GPU.
+            return [
+                FFMPEG, "-y", "-fflags", "+genpts",
+                "-r", str(self._fps), "-i", str(src_path),
+                "-c:v", "copy", "-movflags", "+faststart",
+                "-loglevel", "warning",
+                str(mp4_path),
+            ]
         return [
             FFMPEG, "-y",
             "-f", "rawvideo", "-vcodec", "rawvideo",
             "-s", f"{self._w}x{self._h}", "-pix_fmt", "gray",
             "-r", str(self._fps), "-an",
-            "-i", str(raw_path),
+            "-i", str(src_path),
             "-c:v", "h264_nvenc",
             "-pix_fmt", "yuv420p",
             "-preset", "fast",
@@ -63,16 +76,33 @@ class EncodeWorker(QThread):
         total = len(self._camera_names)
         results = [None] * total
 
-        # Build the job list; cameras with no raw.bin are immediate failures.
-        jobs = []  # (idx, cam, raw_path, mp4_path, n_frames)
+        # Build the job list; cameras with no source file are immediate failures.
+        # raw-to-disk mode reads raw.bin; real-time mode reads the GPU-produced
+        # H.264 elementary stream (stream.h264) and just stream-copies it to mp4.
+        jobs = []  # (idx, cam, src_path, mp4_path, n_frames)
         for i, cam in enumerate(self._camera_names):
-            raw_path = self._video_dir / cam / "raw.bin"
-            if not raw_path.exists():
+            cam_dir = self._video_dir / cam
+            h264_path = cam_dir / "stream.h264"
+            raw_bin = cam_dir / "raw.bin"
+            # Prefer the GPU-produced H.264 stream (real-time mode); fall back to
+            # raw.bin (raw-to-disk mode, or a camera whose NVENC init failed) so a
+            # runtime encoder failure can never strand a camera's data.
+            if self._realtime and h264_path.exists():
+                raw_path = h264_path
+                ft = cam_dir / "frametimes.npy"
+                try:
+                    import numpy as np
+                    n_frames = int(np.load(ft).shape[1]) if ft.exists() else 0
+                except Exception:
+                    n_frames = 0
+            elif raw_bin.exists():
+                raw_path = raw_bin
+                n_frames = os.path.getsize(raw_bin) // (self._w * self._h)
+            else:
                 results[i] = (cam, 0, False)
                 continue
-            mp4_path = self._video_dir / cam / (
+            mp4_path = cam_dir / (
                 f"{self._date}-{self._session_id}-{cam}-{self._acq_type}.mp4")
-            n_frames = os.path.getsize(raw_path) // (self._w * self._h)
             jobs.append((i, cam, raw_path, mp4_path, n_frames))
 
         done = sum(1 for r in results if r is not None)

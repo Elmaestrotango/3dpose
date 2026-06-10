@@ -9,7 +9,7 @@ The same GUI codebase (`gui_app/`) is shared with the [3dface](https://github.co
 | **Cameras** | 6x Basler a2A1920-165g5m (GigE) | 6x Basler acA1300-200um (USB3) |
 | **Resolution** | 1920x1200 | 1280x1024 (full sensor) |
 | **Interface** | GigE | USB 3.0 |
-| **Raw storage** | ~138 GB / camera / 10 min | ~79 GB / camera / 10 min |
+| **Storage / 10 min** | ~a few GB (online encode) · ~138 GB/cam in raw fallback | ~a few GB · ~79 GB/cam raw |
 | **Calibration board** | ChArUco 8x8, 15mm squares | ChArUco 5x5, 0.5mm squares |
 
 > **Offline use:** Once installed, the entire pipeline (acquisition, encoding, calibration) runs fully offline. Only initial setup (`uv sync`, `git clone`) requires internet.
@@ -22,9 +22,9 @@ The same GUI codebase (`gui_app/`) is shared with the [3dface](https://github.co
 |---|---|
 | **uv** | Python package manager ([install](https://docs.astral.sh/uv/getting-started/installation/)) |
 | **Basler Pylon SDK** | [Download](https://www.baslerweb.com/en/downloads/software-downloads/) — needed for USB3/GigE camera drivers |
-| **NVIDIA GPU + driver 550+** | For NVENC H.264 encoding. CPU fallback is much slower. |
+| **NVIDIA GPU + driver 550+** | NVENC H.264 encoding, used live during capture by default (online encode). Without it the GUI falls back to raw-to-disk + post-hoc encode. |
 | **Teensy/Arduino** | Flashed with `campy/campy/trigger/trigger.ino` via Arduino IDE |
-| **NVMe SSD** | 500+ GB free, 1000+ MB/s sustained write speed for raw capture |
+| **NVMe SSD** | Online encode writes only a few GB/session. The raw-to-disk fallback needs 500+ GB free and 1000+ MB/s sustained write. |
 
 ### Hardware requirements
 
@@ -55,7 +55,7 @@ cd 3dpose
 uv sync
 ```
 
-This creates a `.venv` with all dependencies (pypylon, PyQt5, numpy, etc.). No conda required. Requires internet access once.
+This creates a `.venv` with all dependencies (pypylon, PyQt5, numpy, plus PyNvVideoCodec + the CUDA runtime for online GPU encoding, etc.). No conda required. Requires internet access once.
 
 ### 3. Generate camera settings (.pfs file)
 
@@ -174,11 +174,17 @@ Each rig has a YAML profile in `profiles/`. The profile defines everything speci
 | `frame_height` | int | Sensor height in pixels (must match .pfs) |
 | `frame_rate` | int | Trigger rate in Hz (typically 100) |
 | `quality` | int | NVENC QP parameter (0-51, lower = better quality, 21 is default) |
+| `realtime_encode` | bool | Encode H.264 on the GPU during capture (default `true`). `false` = raw-to-disk + post-hoc encode |
+| `encode_parallel` | int | Concurrent ffmpeg jobs at stop: `.h264`→mp4 remuxes (online) or raw→H.264 encodes (fallback). Default 3 |
 | `pfs_path` | string | Path to Basler .pfs file (relative or absolute) |
 | `output_dir` | string | Base data directory (relative or absolute) |
 | `board_config` | string | Path to ChArUco board YAML (relative or absolute) |
 | `serial_port` | string | Teensy COM port (e.g., `COM3`) |
 | `trigger_pins` | list[int] | Teensy GPIO pins, one per camera (e.g., `[2, 4, 6, 8, 10, 12]`) |
+
+This repo ships two profiles: **`3dpose`** (online GPU encode — the default) and
+**`3dpose (raw)`** (`profiles/3dpose_raw.yaml`, the raw-to-disk fallback). Pick the
+latter from the dropdown if NVENC misbehaves or for a recording you can't risk.
 
 To create a new profile for a different rig:
 
@@ -220,10 +226,12 @@ To create a new board config:
 2. Select the rig profile from the dropdown
 3. Fill in session metadata (date, subject IDs, assay, experimenter, etc.)
 4. Flip **Calibrate** toggle — record calibration videos with ChArUco board visible
-5. Flip it off — videos encode in the background (progress bar shown)
+5. Flip it off — the per-camera H.264 streams are wrapped into mp4 (seconds; a brief progress bar shows during the remux)
 6. Click **Solve** — runs sleap-anipose calibration on the encoded videos
 7. Flip **Record** toggle — record behavioral data
-8. Flip it off — videos encode, `calibration.toml` is copied to the recording directory
+8. Flip it off — videos are finalized (seconds), and `calibration.toml` is copied to the recording directory
+
+> With online encode (the default), encoding happens live during capture, so step 5/8 is a near-instant remux. In the **3dpose (raw)** fallback profile these steps run the full post-hoc encode instead (~10 min for a 10-min recording).
 
 ### Keyboard / mouse
 
@@ -280,17 +288,44 @@ data/
         calibration.toml          (copied from calibration/)
 ```
 
+During an online-encode recording each `camN/` briefly holds a `stream.h264` that is
+replaced by the `.mp4` at stop; in raw fallback mode it holds `raw.bin`, removed after
+the post-hoc encode.
+
 ---
 
 ## Architecture
 
-### Raw capture + post-hoc encoding
+### Real-time GPU encoding (default) — "online encode"
 
-During recording, raw mono8 frames are written directly to disk via `os.write()`. After recording stops, ffmpeg encodes them to H.264 via NVENC.
+During recording, each camera's grab thread converts its mono8 frame to NV12 (the gray
+frame *is* the luma plane; chroma is a constant) and encodes it to H.264 on the GPU via
+[PyNvVideoCodec](https://pypi.org/project/PyNvVideoCodec/) (NVENC) — one encoder session
+per camera, all running concurrently. Frames go straight to a per-camera `stream.h264`
+elementary stream. On stop, each stream is wrapped into an `.mp4` with a fast
+`ffmpeg -c copy` remux (no re-encode — finishes in seconds).
 
-**Why not real-time encoding?** At high resolutions, ffmpeg's CPU-side gray-to-yuv420p pixel conversion bottlenecks at ~80 fps for 6 cameras. Raw-to-disk achieves 100 fps at any resolution.
+So there is **no large transient file and no post-hoc encode pass**: a 10-minute
+6-camera session writes a few GB total and is fully encoded the instant recording stops.
 
-**Storage math**: `width * height * fps * seconds` bytes of raw data per camera. For 1920x1200 at 100 fps: ~138 GB per camera per 10 minutes. Encodes to ~5-10 GB.
+**Why this works now (it didn't before):** the old path piped frames through *ffmpeg*,
+whose CPU-side gray→yuv420p conversion bottlenecked at ~80 fps for 6 cameras.
+PyNvVideoCodec does the conversion *and* encode on the GPU, so the CPU only copies the
+gray bytes — measured ~1400 fps aggregate for 6×1920x1200 on an RTX 5080 (~2.3× the
+600 fps needed), at under 2 CPU cores.
+
+Controlled by the `realtime_encode` profile field (default **true**). If PyNvVideoCodec
+or the CUDA runtime is unavailable, each camera transparently falls back to the
+raw-to-disk path below — no data is lost.
+
+### Raw capture + post-hoc encoding (fallback)
+
+Used when `realtime_encode: false` (the **3dpose (raw)** profile) or when NVENC is
+unavailable. Raw mono8 frames are written directly to disk via `os.write()` into
+`raw.bin`; after recording stops, ffmpeg encodes them to H.264 via NVENC
+(`encode_parallel` cameras at a time). Rock-solid — the disk write can never fall
+behind — but it writes ~138 GB per camera per 10 min at 1920x1200, and the encode pass
+runs at roughly real-time (~10 min for a 10-min session).
 
 ### Camera modes
 

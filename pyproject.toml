@@ -14,6 +14,8 @@ dependencies = [
     "psutil>=5.9",
     "pillow>=10.0",
     "opencv-contrib-python>=4.6",
+    "pynvvideocodec>=2.1.0",
+    "nvidia-cuda-runtime-cu12>=12.9.79",
 ]
 
 [project.scripts]

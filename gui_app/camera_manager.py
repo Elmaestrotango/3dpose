@@ -66,33 +66,43 @@ class CameraManager(QObject):
         return True
 
     def _set_freerun_mode(self):
-        for cam in self._cameras:
+        for i, cam in enumerate(self._cameras):
             try:
-                cam.StopGrabbing()
-            except Exception:
-                pass
-            cam.TriggerMode.SetValue("Off")
-            cam.AcquisitionFrameRateEnable.SetValue(True)
-            cam.AcquisitionFrameRate.SetValue(30.0)
+                try:
+                    cam.StopGrabbing()
+                except Exception:
+                    pass
+                cam.TriggerMode.SetValue("Off")
+                cam.AcquisitionFrameRateEnable.SetValue(True)
+                cam.AcquisitionFrameRate.SetValue(30.0)
+            except Exception as e:
+                # A camera that dropped off the bus must not abort teardown for the
+                # rest — log and continue so the surviving cameras still recover.
+                print(f"[cam{i+1}] free-run config failed (camera offline?): {e}", flush=True)
 
     def _set_trigger_mode(self):
-        for cam in self._cameras:
+        for i, cam in enumerate(self._cameras):
             try:
-                cam.StopGrabbing()
-            except Exception:
-                pass
-            cam.TriggerSelector.SetValue("FrameStart")
-            cam.TriggerMode.SetValue("On")
-            cam.TriggerSource.SetValue("Line1")
-            cam.TriggerActivation.SetValue("RisingEdge")
-            cam.AcquisitionFrameRateEnable.SetValue(True)
-            cam.AcquisitionFrameRate.SetValue(165.0)
+                try:
+                    cam.StopGrabbing()
+                except Exception:
+                    pass
+                cam.TriggerSelector.SetValue("FrameStart")
+                cam.TriggerMode.SetValue("On")
+                cam.TriggerSource.SetValue("Line1")
+                cam.TriggerActivation.SetValue("RisingEdge")
+                cam.AcquisitionFrameRateEnable.SetValue(True)
+                cam.AcquisitionFrameRate.SetValue(165.0)
+            except Exception as e:
+                print(f"[cam{i+1}] trigger config failed (camera offline?): {e}", flush=True)
 
-    def _start_grab_threads(self, raw_paths=None, display_every=1):
+    def _start_grab_threads(self, raw_paths=None, display_every=1,
+                            realtime=False, width=0, height=0, quality=21):
         self._stop_grab_threads()
         for i, cam in enumerate(self._cameras):
             rp = raw_paths[i] if raw_paths else None
-            gt = GrabThread(i, cam, raw_path=rp, display_every=display_every)
+            gt = GrabThread(i, cam, raw_path=rp, display_every=display_every,
+                            realtime=realtime, width=width, height=height, quality=quality)
             gt.start()
             self._grab_threads.append(gt)
 
@@ -103,12 +113,22 @@ class CameraManager(QObject):
             gt.wait(5000)
         self._grab_threads.clear()
 
-    def start_acquisition(self, raw_paths: list[Path], display_every: int = 10):
+    def start_acquisition(self, raw_paths: list[Path], display_every: int = 10,
+                          realtime: bool = False, width: int = 0, height: int = 0,
+                          quality: int = 21):
         self._stop_grab_threads()
         self._set_trigger_mode()
-        self._start_grab_threads(raw_paths=raw_paths, display_every=display_every)
+        self._start_grab_threads(raw_paths=raw_paths, display_every=display_every,
+                                 realtime=realtime, width=width, height=height, quality=quality)
 
     def stop_acquisition(self) -> list[tuple[int, list[float]]]:
+        """Stop the grab threads and return each camera's (frame_count, timestamps).
+
+        Does NOT restore preview — the caller should save frametimes/metadata first,
+        then call resume_preview(). Separating data collection from the camera
+        reconfigure means a camera that dropped off the bus can't crash teardown
+        (or take the other cameras' data down with it) before the data is written.
+        """
         for gt in self._grab_threads:
             gt.signal_triggers_stopped()
         for gt in self._grab_threads:
@@ -118,10 +138,13 @@ class CameraManager(QObject):
         for gt in self._grab_threads:
             results.append((gt.frame_count, gt.timestamps))
         self._grab_threads.clear()
+        return results
 
+    def resume_preview(self):
+        """Return all cameras to free-run preview after an acquisition. Resilient
+        to a camera that went offline mid-session (it is skipped, not fatal)."""
         self._set_freerun_mode()
         self._start_grab_threads()
-        return results
 
     def close_all(self):
         self._stop_grab_threads()
