@@ -1,12 +1,14 @@
-# 3DFace — 6x Basler acA1300-200um USB3, 1280x1024, 100 fps
-name: 3dface
+# 3DFace RAW fallback — identical rig to 3dface.yaml, but uses the proven
+# raw-to-disk + post-hoc NVENC encode path (no real-time GPU encode). Select
+# "3dface (raw)" in the dropdown if the real-time path misbehaves.
+name: 3dface (raw)
 frame_width: 1280
 frame_height: 1024
 frame_rate: 100
 calibration_frame_rate: 30
 quality: 21
 encode_parallel: 3
-realtime_encode: true
+realtime_encode: false
 
 pfs_path: "configs/mono8_mono.pfs"
 output_dir: "data"
