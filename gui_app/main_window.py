@@ -253,8 +253,12 @@ class MainWindow(QMainWindow):
         self._acq_fps = fps
         display_every = 1 if acq_type == "calibration" else 10
 
-        print(f"[acq] start_acquisition({acq_type}) fps={fps}: switching cameras to trigger mode", flush=True)
-        self._camera_mgr.start_acquisition(raw_paths, display_every=display_every)
+        rt = self._config.realtime_encode
+        print(f"[acq] start_acquisition({acq_type}) fps={fps} realtime={rt}: switching cameras to trigger mode", flush=True)
+        self._camera_mgr.start_acquisition(
+            raw_paths, display_every=display_every,
+            realtime=rt, width=self._config.frame_width,
+            height=self._config.frame_height, quality=self._config.quality)
 
         print(f"[acq] opening teensy on {self._profile.serial_port}", flush=True)
         self._teensy = TeensyController(port=self._profile.serial_port)
@@ -319,10 +323,15 @@ class MainWindow(QMainWindow):
         self._detector = None
         self._sidebar.hide_coverage()
 
+        # Collect and SAVE the captured data before touching the cameras again.
+        # Restoring preview can fail if a camera dropped off the bus mid-session;
+        # saving first guarantees the surviving cameras' recordings aren't lost.
         cam_results = self._camera_mgr.stop_acquisition()
-
         self._save_frametimes(cam_results)
         self._config.save_metadata()
+
+        # Restore live preview (resilient to an offline camera).
+        self._camera_mgr.resume_preview()
 
         self._state = State.ENCODING
         self._sidebar.set_status("ENCODING", "#ffaa00")
@@ -339,6 +348,7 @@ class MainWindow(QMainWindow):
             self._config.date,
             self._config.session_id,
             max_parallel=self._config.encode_parallel,
+            realtime=self._config.realtime_encode,
         )
         self._encode_worker.progress.connect(self._sidebar.show_progress)
         self._encode_worker.finished_all.connect(self._on_encoding_done)
@@ -401,9 +411,7 @@ class MainWindow(QMainWindow):
             count_str = f"{min_frames}-{max_frames}"
 
         self.statusBar().showMessage(
-            f"{self._acq_type.title()} complete: {count_str} frames, {avg_fps:.1f} fps",
-            15000,
-        )
+            f"{self._acq_type.title()} complete: {count_str} frames, {avg_fps:.1f} fps")
 
     def _on_run_calibration(self):
         config = self._build_config()
@@ -452,14 +460,14 @@ class MainWindow(QMainWindow):
             if msg:
                 QMessageBox.warning(self, "Calibration Warnings", msg[:800])
                 status += " (with warnings)"
-            self.statusBar().showMessage(status, 15000)
+            self.statusBar().showMessage(status)
         else:
             QMessageBox.warning(self, "Calibration Failed", msg[:800])
-            self.statusBar().showMessage("Calibration failed", 10000)
+            self.statusBar().showMessage("Calibration failed")
 
     def _on_snapshot(self):
         if self._camera_mgr.num_cameras == 0:
-            self.statusBar().showMessage("Snapshot: no cameras open", 5000)
+            self.statusBar().showMessage("Snapshot: no cameras open")
             return
         self._camera_mgr.request_snapshots()
         # Give the grab threads a moment to stash the next full-res frame.
@@ -482,7 +490,7 @@ class MainWindow(QMainWindow):
             except Exception as e:
                 print(f"[snapshot] {cam} failed: {e}", flush=True)
         self.statusBar().showMessage(
-            f"Snapshot: saved {saved}/{len(frames)} cameras → {out_dir}", 10000)
+            f"Snapshot: saved {saved}/{len(frames)} cameras → {out_dir}")
 
     def _on_camera_error(self, msg: str):
         QMessageBox.critical(self, "Error", msg)

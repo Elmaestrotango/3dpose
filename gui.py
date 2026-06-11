@@ -1,9 +1,74 @@
 """Panopticon Acquisition GUI — launch with: conda run -n 3dpose python gui.py"""
 import sys
+import traceback
+from datetime import datetime
+from pathlib import Path
 
-from PyQt5.QtWidgets import QApplication, QSplashScreen, QLabel
-from PyQt5.QtCore import Qt, QTimer
+from PyQt5.QtWidgets import QApplication, QSplashScreen, QLabel, QMessageBox
+from PyQt5.QtCore import Qt, QTimer, QThread
 from PyQt5.QtGui import QColor, QFont, QPainter, QPixmap
+
+LOG_DIR = Path(__file__).parent / "logs"
+
+
+class _Tee:
+    """Write to several streams at once (e.g. the console and a log file).
+
+    Under the pythonw launcher sys.stdout/stderr are None, so the diagnostic
+    prints from the grab threads would otherwise be discarded — this captures
+    them to a file so a crash can be diagnosed after the fact."""
+    def __init__(self, *streams):
+        self._streams = [s for s in streams if s is not None]
+
+    def write(self, data):
+        for s in self._streams:
+            try:
+                s.write(data)
+                s.flush()
+            except Exception:
+                pass
+
+    def flush(self):
+        for s in self._streams:
+            try:
+                s.flush()
+            except Exception:
+                pass
+
+
+def _setup_logging():
+    """Tee stdout/stderr to a timestamped log file under logs/ (pythonw discards
+    them otherwise). Returns the log path, or None if logging couldn't be set up."""
+    try:
+        LOG_DIR.mkdir(exist_ok=True)
+        log_path = LOG_DIR / f"panopticon_{datetime.now():%Y%m%d_%H%M%S}.log"
+        f = open(log_path, "a", buffering=1, encoding="utf-8")
+        sys.stdout = _Tee(sys.__stdout__, f)
+        sys.stderr = _Tee(sys.__stderr__, f)
+        print(f"[startup] logging to {log_path}", flush=True)
+        return log_path
+    except Exception:
+        return None
+
+
+def _install_excepthook(log_path):
+    """Surface unhandled exceptions as a dialog + log entry instead of letting
+    them escape a Qt slot — PyQt responds to that by calling abort() (the silent
+    crash we hit when a dropped camera raised during teardown)."""
+    def hook(exc_type, exc, tb):
+        msg = "".join(traceback.format_exception(exc_type, exc, tb))
+        print(f"[UNHANDLED]\n{msg}", flush=True)
+        try:
+            app = QApplication.instance()
+            on_main = app is not None and QThread.currentThread() == app.thread()
+            if on_main:  # QMessageBox is only safe on the GUI thread
+                QMessageBox.critical(
+                    None, "Panopticon — Unexpected Error",
+                    f"{exc_type.__name__}: {exc}\n\nThe app is still running. "
+                    f"Full traceback logged to:\n{log_path}")
+        except Exception:
+            pass
+    sys.excepthook = hook
 
 
 def make_splash():
@@ -21,8 +86,12 @@ def make_splash():
 
 
 def main():
+    log_path = _setup_logging()
+
     app = QApplication(sys.argv)
     app.setApplicationName("Panopticon Acquisition")
+
+    _install_excepthook(log_path)
 
     splash = QSplashScreen(make_splash())
     splash.show()

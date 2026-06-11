@@ -1,0 +1,19 @@
+# 3DPose RAW fallback — identical rig to 3dpose.yaml, but uses the proven
+# raw-to-disk + post-hoc NVENC encode path (no real-time GPU encode). Select
+# "3dpose (raw)" in the dropdown if the real-time path misbehaves or for a
+# recording you can't afford to risk.
+name: 3dpose (raw)
+frame_width: 1920
+frame_height: 1200
+frame_rate: 100
+calibration_frame_rate: 30
+quality: 21
+encode_parallel: 3
+realtime_encode: false       # <-- proven raw-to-disk + post-hoc encode
+
+pfs_path: "configs/mono8_1920x1200.pfs"
+output_dir: "data"
+board_config: "configs/boards/charuco_8x8_15mm.yaml"
+
+serial_port: COM3
+trigger_pins: [2, 4, 6, 8, 10, 12]
