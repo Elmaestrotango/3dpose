@@ -63,13 +63,23 @@ def create_h264_encoder(width: int, height: int, qp: int,
     _load()
     if _nvc is None:
         raise RuntimeError(f"PyNvVideoCodec unavailable: {_load_error}")
-    # Tolerate older/newer builds that may not accept every kwarg.
-    for kw in (dict(codec="h264", preset=preset, tuning_info=tuning, rc="constqp", qp=str(qp)),
-               dict(codec="h264", preset=preset, tuning_info=tuning),
-               dict(codec="h264")):
+    # Tolerate older/newer builds that may not accept every kwarg — but say so:
+    # a reduced kwarg set silently changes rate control (constqp -> driver
+    # default), i.e. different output quality than the profile asked for.
+    last_err = None
+    for n, kw in enumerate((
+            dict(codec="h264", preset=preset, tuning_info=tuning, rc="constqp", qp=str(qp)),
+            dict(codec="h264", preset=preset, tuning_info=tuning),
+            dict(codec="h264"))):
         try:
-            return _nvc.CreateEncoder(width, height, "NV12", True, **kw)
-        except Exception:
+            enc = _nvc.CreateEncoder(width, height, "NV12", True, **kw)
+            if n > 0:
+                print(f"[nvenc] WARNING: full encoder config rejected ({last_err}); "
+                      f"created with reduced settings {kw} — quality may differ "
+                      f"from profile qp={qp}", flush=True)
+            return enc
+        except Exception as e:
+            last_err = e
             continue
     # Last attempt: surface the real error.
     return _nvc.CreateEncoder(width, height, "NV12", True, codec="h264")

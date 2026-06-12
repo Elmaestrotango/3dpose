@@ -272,6 +272,9 @@ class SidebarWidget(QWidget):
         for field in self._fields.values():
             field.setReadOnly(not editable)
         self._dir_button.setEnabled(editable)
+        # Switching profiles mid-acquisition is ignored by the main window but
+        # would still move the dropdown, desyncing it from the active profile.
+        self._profile_combo.setEnabled(editable)
 
     def set_status(self, text: str, color: str):
         self._status.setText(text)

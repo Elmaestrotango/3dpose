@@ -32,8 +32,11 @@ class CalibrationWorker(QThread):
             cmd.extend(["--board-config", self._board_config])
 
         try:
+            # Pass 1 alone takes ~4-5 min on a full session; the pass-2 prescan
+            # decodes every frame of every video, so give the 3-pass fallback
+            # chain real headroom before declaring it hung.
             result = subprocess.run(
-                cmd, capture_output=True, text=True, timeout=600,
+                cmd, capture_output=True, text=True, timeout=1800,
             )
 
             stdout = result.stdout.strip()
@@ -52,7 +55,7 @@ class CalibrationWorker(QThread):
                 error_msg = _parse_calibration_error(stdout, stderr, result.returncode)
                 self.finished.emit(False, error_msg)
         except subprocess.TimeoutExpired:
-            self.finished.emit(False, "Calibration timed out (10 min)")
+            self.finished.emit(False, "Calibration timed out (30 min)")
         except Exception as e:
             self.finished.emit(False, str(e))
 

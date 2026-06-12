@@ -55,10 +55,20 @@ class CameraManager(QObject):
         sorted_devs = sorted(devices, key=lambda d: d.GetSerialNumber())
 
         for dev in sorted_devs:
-            cam = pylon.InstantCamera(tlf.CreateDevice(dev))
-            cam.Open()
-            pylon.FeaturePersistence.Load(pfs_path, cam.GetNodeMap(), False)
-            cam.MaxNumBuffer.SetValue(500)
+            try:
+                cam = pylon.InstantCamera(tlf.CreateDevice(dev))
+                cam.Open()
+                pylon.FeaturePersistence.Load(pfs_path, cam.GetNodeMap(), False)
+                cam.MaxNumBuffer.SetValue(500)
+            except Exception as e:
+                # Don't continue with a partial set: camera names are assigned by
+                # serial-number order, so a missing camera would silently shift
+                # every later camera's name and mislabel the recorded data.
+                self.close_all()
+                self.error.emit(
+                    f"Camera {dev.GetSerialNumber()} failed to open/configure:\n{e}\n\n"
+                    "Power-cycle it (or close the app holding it) and reselect the profile.")
+                return False
             self._cameras.append(cam)
 
         self._set_freerun_mode()

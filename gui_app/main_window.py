@@ -227,7 +227,10 @@ class MainWindow(QMainWindow):
         self._acq_type = acq_type
         video_dir = self._config.video_dir(acq_type)
 
-        if video_dir.exists() and any(video_dir.rglob("*.mp4")):
+        has_data = video_dir.exists() and any(
+            next(video_dir.rglob(pat), None) is not None
+            for pat in ("*.mp4", "raw.bin", "stream.h264"))
+        if has_data:
             reply = QMessageBox.question(
                 self, "Overwrite?",
                 f"Existing files found in:\n{video_dir}\n\nOverwrite?",
@@ -263,7 +266,14 @@ class MainWindow(QMainWindow):
         print(f"[acq] opening teensy on {self._profile.serial_port}", flush=True)
         self._teensy = TeensyController(port=self._profile.serial_port)
         if not self._teensy.open():
-            self._on_camera_error("Could not open serial port")
+            # Roll back: cameras are already grabbing in trigger mode — without
+            # this they'd be stuck (no triggers, no preview, toggle checked).
+            self._camera_mgr.stop_acquisition()
+            self._camera_mgr.resume_preview()
+            self._sidebar.reset_toggles()
+            self._on_camera_error(
+                f"Could not open serial port {self._profile.serial_port}.\n"
+                "Close Arduino Serial Monitor / other apps holding the port and retry.")
             return
         print(f"[acq] sending start_triggers pins={self._profile.trigger_pins} fps={fps}", flush=True)
         self._teensy.start_triggers(self._profile.trigger_pins, fps)
@@ -414,6 +424,9 @@ class MainWindow(QMainWindow):
             f"{self._acq_type.title()} complete: {count_str} frames, {avg_fps:.1f} fps")
 
     def _on_run_calibration(self):
+        if self._state != State.IDLE:
+            self.statusBar().showMessage("Solve unavailable while acquiring/encoding")
+            return
         config = self._build_config()
         calib_dir = config.video_dir("calibration")
 
@@ -496,6 +509,18 @@ class MainWindow(QMainWindow):
         QMessageBox.critical(self, "Error", msg)
 
     def closeEvent(self, event):
+        # Quitting mid-acquisition loses the recording's frametimes/finalization;
+        # quitting mid-encode orphans the ffmpeg jobs. Confirm first.
+        if self._state != State.IDLE:
+            reply = QMessageBox.question(
+                self, "Acquisition in progress",
+                f"State is {self._state.value}. Quit anyway?\n\n"
+                "The current acquisition will NOT be finalized "
+                "(frametimes/videos may be incomplete).",
+                QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+            if reply == QMessageBox.No:
+                event.ignore()
+                return
         self._display_timer.stop()
         self._stop_coverage_hud()
         if self._state in (State.CALIBRATING, State.RECORDING):

@@ -82,7 +82,7 @@ class GrabThread(QThread):
         try:
             while self._running and self._camera.IsGrabbing():
                 try:
-                    timeout = 200 if (recording and self._triggers_stopped) else (200 if recording else 2000)
+                    timeout = 200 if recording else 2000
                     result = self._camera.RetrieveResult(timeout, pylon.TimeoutHandling_ThrowException)
                     if not result.GrabSucceeded():
                         print(f"[grab{self._cam_index}] grab failed: {result.ErrorCode} {result.ErrorDescription}", flush=True)

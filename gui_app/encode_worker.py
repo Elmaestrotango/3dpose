@@ -9,6 +9,7 @@ import os
 import subprocess
 import sys
 import time
+import numpy as np
 from pathlib import Path
 from PyQt5.QtCore import QThread, pyqtSignal
 from imageio_ffmpeg import get_ffmpeg_exe
@@ -91,7 +92,6 @@ class EncodeWorker(QThread):
                 raw_path = h264_path
                 ft = cam_dir / "frametimes.npy"
                 try:
-                    import numpy as np
                     n_frames = int(np.load(ft).shape[1]) if ft.exists() else 0
                 except Exception:
                     n_frames = 0
@@ -110,34 +110,48 @@ class EncodeWorker(QThread):
             self.progress.emit(done, total)
 
         max_par = self._max_parallel if self._max_parallel > 0 else max(1, len(jobs))
-        running = {}  # idx -> (proc, cam, raw_path, n_frames)
+        running = {}  # idx -> (proc, cam, raw_path, n_frames, err_fd, err_path)
         ji = 0
         while ji < len(jobs) or running:
             while ji < len(jobs) and len(running) < max_par:
                 i, cam, raw_path, mp4_path, n_frames = jobs[ji]
                 ji += 1
+                # ffmpeg's stderr goes to a per-camera file so a failed encode
+                # is diagnosable (kept on failure, removed on success).
+                err_path = raw_path.parent / "encode_error.log"
                 try:
+                    err_fd = open(err_path, "wb")
                     proc = subprocess.Popen(
                         self._cmd(raw_path, mp4_path),
-                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                        stdout=subprocess.DEVNULL, stderr=err_fd,
                         startupinfo=_STARTUPINFO)
-                    running[i] = (proc, cam, raw_path, n_frames)
-                except Exception:
+                    running[i] = (proc, cam, raw_path, n_frames, err_fd, err_path)
+                except Exception as e:
+                    print(f"[encode] {cam}: ffmpeg launch failed: {e}", flush=True)
                     results[i] = (cam, n_frames, False)
                     done += 1
                     self.progress.emit(done, total)
 
             for i in list(running.keys()):
-                proc, cam, raw_path, n_frames = running[i]
+                proc, cam, raw_path, n_frames, err_fd, err_path = running[i]
                 ret = proc.poll()
                 if ret is None:
                     continue
+                err_fd.close()
                 ok = (ret == 0)
                 if ok:
                     try:
                         os.remove(raw_path)
+                        err_path.unlink(missing_ok=True)
                     except OSError:
                         pass
+                else:
+                    try:
+                        tail = err_path.read_text(errors="replace")[-2000:]
+                    except OSError:
+                        tail = "(no stderr captured)"
+                    print(f"[encode] {cam}: ffmpeg exited {ret}; source kept at "
+                          f"{raw_path}; stderr in {err_path}:\n{tail}", flush=True)
                 results[i] = (cam, n_frames, ok)
                 done += 1
                 self.progress.emit(done, total)
