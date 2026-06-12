@@ -45,6 +45,11 @@ def _setup_logging():
         f = open(log_path, "a", buffering=1, encoding="utf-8")
         sys.stdout = _Tee(sys.__stdout__, f)
         sys.stderr = _Tee(sys.__stderr__, f)
+        # Dump every thread's Python stack into the log on a NATIVE crash
+        # (access violation / abort — e.g. Qt's 0xc0000409 fail-fast), which
+        # sys.excepthook can't see. Needs the real file, not the _Tee.
+        import faulthandler
+        faulthandler.enable(file=f, all_threads=True)
         print(f"[startup] logging to {log_path}", flush=True)
         return log_path
     except Exception:

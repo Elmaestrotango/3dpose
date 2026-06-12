@@ -183,6 +183,18 @@ class CameraManager(QObject):
             gt.signal_triggers_stopped()
         for gt in self._grab_threads:
             gt.wait(5000)
+        # A thread still draining its encoder MUST be waited out: proceeding
+        # would reconfigure/restart the camera while the old thread still calls
+        # into pylon on it — concurrent native access, hard crash. The encoder
+        # drain path is bounded (~95 s worst case: 30 s sentinel put + 60 s
+        # join), so wait it out loudly rather than racing it.
+        for i, gt in enumerate(self._grab_threads):
+            if gt.isRunning():
+                print(f"[cam{i+1}] grab thread still draining at stop, waiting...", flush=True)
+                if not gt.wait(100000):
+                    print(f"[cam{i+1}] grab thread DID NOT EXIT after 100 s "
+                          f"(GPU wedged?) — preview restart may be unstable, "
+                          f"consider restarting the app", flush=True)
 
         results = []
         for gt in self._grab_threads:
