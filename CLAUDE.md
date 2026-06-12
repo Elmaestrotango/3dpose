@@ -30,12 +30,18 @@ Rig-validated fixes layered on top of the original PR (all on master):
 - New OpenCV dependency: `opencv-contrib-python` (run `uv sync`). The coverage
   HUD self-disables if OpenCV is missing, so the GUI still runs.
 - Video encoding is H.264 via `h264_nvenc` (GPU). Keep `yuv420p` for compatibility.
-- **Online (real-time) GPU encode is the default** (`realtime_encode: true`): grab
-  threads encode mono→NV12→H.264 via PyNvVideoCodec during capture
-  (`gui_app/nvenc.py`), writing `stream.h264`; on stop `encode_worker` remuxes to mp4
-  (`ffmpeg -c copy`). Transparently falls back to raw.bin + post-hoc encode if NVENC is
-  unavailable or `realtime_encode: false` (the `3dpose (raw)` profile). New deps:
-  `PyNvVideoCodec`, `nvidia-cuda-runtime-cu12`.
+- **Online (real-time) GPU encode is the default** (`realtime_encode: true`), and it is
+  **decoupled from capture** (2026-06-12): the grab loop only does retrieve→copy→queue→
+  release; a per-camera `_EncoderThread` (`grab_thread.py`) drains the queue through
+  PyNvVideoCodec (`gui_app/nvenc.py`) into `stream.h264`; on stop `encode_worker`
+  remuxes to mp4 (`ffmpeg -c copy`). Inline encode starved GigE packet reassembly and
+  dropped ~28% of frames — do NOT put work back on the grab loop's critical path.
+  If an encoder dies mid-recording the remainder spills to `raw_tail.bin` and is merged
+  at stop (`encode_worker._append_raw_tail`). Per-frame GigE BlockIDs are saved to
+  `blockids.npy` (frametimes.npy keeps its (2, N) format). Transparently falls back to
+  raw.bin + post-hoc encode if NVENC is unavailable or `realtime_encode: false` (the
+  `3dpose (raw)` profile). Deps: `PyNvVideoCodec`, `nvidia-cuda-runtime-cu12`.
+  Regression test (no cameras needed): `.venv\Scripts\python _test_decouple.py`.
 - Calibration vs recording are distinct acquisitions: calibration uses
   `calibration_frame_rate` (default 30) + 1:1 preview; recording uses `frame_rate`
   (100) + decimated preview.

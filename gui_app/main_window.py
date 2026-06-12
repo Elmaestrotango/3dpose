@@ -242,7 +242,17 @@ class MainWindow(QMainWindow):
 
         self._video_dir = video_dir
         for cam in self._camera_names:
-            (self._video_dir / cam).mkdir(parents=True, exist_ok=True)
+            cam_dir = self._video_dir / cam
+            cam_dir.mkdir(parents=True, exist_ok=True)
+            # Remove stale capture artifacts from a previous run in this dir —
+            # a leftover raw_tail.bin would otherwise be appended to the NEW
+            # recording's stream at stop.
+            for stale in ("raw.bin", "raw_tail.bin", "stream.h264",
+                          "tail.h264", "encode_error.log"):
+                try:
+                    (cam_dir / stale).unlink(missing_ok=True)
+                except OSError:
+                    pass
 
         raw_paths = [
             self._video_dir / cam / "raw.bin"
@@ -364,14 +374,14 @@ class MainWindow(QMainWindow):
         self._encode_worker.finished_all.connect(self._on_encoding_done)
         self._encode_worker.start()
 
-    def _save_frametimes(self, cam_results: list[tuple[int, list[float]]]):
-        counts = [len(ts) for _, ts in cam_results if ts]
+    def _save_frametimes(self, cam_results: list[tuple[int, list[float], list[int]]]):
+        counts = [len(ts) for _, ts, _ in cam_results if ts]
         if not counts:
             return
         min_frames = min(counts)
         frame_nums = np.arange(1, min_frames + 1, dtype=np.float64)
 
-        for i, (count, timestamps) in enumerate(cam_results):
+        for i, (count, timestamps, block_ids) in enumerate(cam_results):
             if not timestamps:
                 continue
             cam = self._camera_names[i]
@@ -381,6 +391,12 @@ class MainWindow(QMainWindow):
             ts_arr -= ts_arr[0]
 
             np.save(cam_dir / "frametimes.npy", np.stack([frame_nums, ts_arr]))
+            # Full (untruncated) per-frame GigE block IDs: block ID = trigger
+            # ordinal, so dropped frames show as gaps and cross-camera alignment
+            # survives a drop. frametimes.npy keeps its (2, N) format untouched.
+            if block_ids:
+                np.save(cam_dir / "blockids.npy",
+                        np.asarray(block_ids, dtype=np.int64))
 
             raw_path = cam_dir / "raw.bin"
             if raw_path.exists():

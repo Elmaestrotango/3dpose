@@ -298,12 +298,20 @@ the post-hoc encode.
 
 ### Real-time GPU encoding (default) — "online encode"
 
-During recording, each camera's grab thread converts its mono8 frame to NV12 (the gray
-frame *is* the luma plane; chroma is a constant) and encodes it to H.264 on the GPU via
+During recording, each camera's grab thread does only retrieve → copy → queue → release
+(so the GigE buffer pool always drains at full rate), and a dedicated per-camera
+**encoder thread** converts the mono8 frame to NV12 (the gray frame *is* the luma plane;
+chroma is a constant) and encodes it to H.264 on the GPU via
 [PyNvVideoCodec](https://pypi.org/project/PyNvVideoCodec/) (NVENC) — one encoder session
 per camera, all running concurrently. Frames go straight to a per-camera `stream.h264`
 elementary stream. On stop, each stream is wrapped into an `.mp4` with a fast
 `ffmpeg -c copy` remux (no re-encode — finishes in seconds).
+
+Encoding must never stall capture: if a camera's encoder dies mid-recording, its
+remaining frames are written raw (`raw_tail.bin`) in arrival order and merged back into
+the stream at stop, so the recording stays gapless. Each frame's GigE block ID (trigger
+ordinal) is saved to `blockids.npy` alongside `frametimes.npy`, making any dropped frame
+a detectable, re-alignable gap instead of a silent cross-camera desync.
 
 So there is **no large transient file and no post-hoc encode pass**: a 10-minute
 6-camera session writes a few GB total and is fully encoded the instant recording stops.

@@ -54,12 +54,15 @@ class CameraManager(QObject):
 
         sorted_devs = sorted(devices, key=lambda d: d.GetSerialNumber())
 
-        for dev in sorted_devs:
+        for i, dev in enumerate(sorted_devs):
             try:
                 cam = pylon.InstantCamera(tlf.CreateDevice(dev))
                 cam.Open()
                 pylon.FeaturePersistence.Load(pfs_path, cam.GetNodeMap(), False)
-                cam.MaxNumBuffer.SetValue(500)
+                # 1000 buffers = ~2.3 GB/cam at 1920x1200 (10 s of slack at
+                # 100 fps); ~13.8 GB across 6 cams, fine on the 64 GB machine.
+                cam.MaxNumBuffer.SetValue(1000)
+                self._select_gige_driver(i, cam)
             except Exception as e:
                 # Don't continue with a partial set: camera names are assigned by
                 # serial-number order, so a missing camera would silently shift
@@ -74,6 +77,23 @@ class CameraManager(QObject):
         self._set_freerun_mode()
         self._start_grab_threads()
         return True
+
+    @staticmethod
+    def _select_gige_driver(i: int, cam: pylon.InstantCamera):
+        """Prefer the in-kernel pylon GigE Vision (filter) driver over the
+        user-space socket driver — kernel packet reassembly costs far less host
+        CPU at 6x100 fps. No-op for non-GigE cameras or if unavailable."""
+        try:
+            sg = cam.GetStreamGrabberNodeMap()
+            t = sg.GetNode("Type")
+            if t is None:
+                return
+            avail = sg.GetNode("TypeIsWindowsFilterDriverAvailable")
+            if avail is not None and avail.GetValue():
+                t.FromString("WindowsFilterDriver")
+            print(f"[cam{i+1}] GigE stream driver: {t.ToString()}", flush=True)
+        except Exception as e:
+            print(f"[cam{i+1}] GigE driver selection skipped: {e}", flush=True)
 
     def _set_freerun_mode(self):
         for i, cam in enumerate(self._cameras):
@@ -131,8 +151,9 @@ class CameraManager(QObject):
         self._start_grab_threads(raw_paths=raw_paths, display_every=display_every,
                                  realtime=realtime, width=width, height=height, quality=quality)
 
-    def stop_acquisition(self) -> list[tuple[int, list[float]]]:
-        """Stop the grab threads and return each camera's (frame_count, timestamps).
+    def stop_acquisition(self) -> list[tuple[int, list[float], list[int]]]:
+        """Stop the grab threads and return each camera's
+        (frame_count, timestamps, block_ids).
 
         Does NOT restore preview — the caller should save frametimes/metadata first,
         then call resume_preview(). Separating data collection from the camera
@@ -146,7 +167,7 @@ class CameraManager(QObject):
 
         results = []
         for gt in self._grab_threads:
-            results.append((gt.frame_count, gt.timestamps))
+            results.append((gt.frame_count, gt.timestamps, gt.block_ids))
         self._grab_threads.clear()
         return results
 

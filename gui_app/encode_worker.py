@@ -73,6 +73,46 @@ class EncodeWorker(QThread):
             str(mp4_path),
         ]
 
+    def _append_raw_tail(self, cam: str, h264_path: Path, tail_bin: Path) -> bool:
+        """A camera whose encoder died mid-recording has stream.h264 (frames
+        0..k) plus raw_tail.bin (frames k..end). Encode the tail to an Annex-B
+        elementary stream with the same settings and append the bytes — both
+        segments carry their own SPS/PPS+IDR, so decoders handle the splice and
+        a single stream-copy remux finalizes the camera as usual."""
+        tail_h264 = tail_bin.parent / "tail.h264"
+        cmd = [
+            FFMPEG, "-y",
+            "-f", "rawvideo", "-vcodec", "rawvideo",
+            "-s", f"{self._w}x{self._h}", "-pix_fmt", "gray",
+            "-r", str(self._fps), "-an",
+            "-i", str(tail_bin),
+            "-c:v", "h264_nvenc",
+            "-pix_fmt", "yuv420p",
+            "-preset", "fast",
+            "-qp", str(self._quality),
+            "-bf:v", "0", "-gpu", "0",
+            "-loglevel", "warning",
+            "-f", "h264", str(tail_h264),
+        ]
+        try:
+            r = subprocess.run(cmd, capture_output=True, timeout=1800,
+                               startupinfo=_STARTUPINFO)
+            if r.returncode != 0:
+                raise RuntimeError(r.stderr.decode(errors="replace")[-500:])
+            with open(h264_path, "ab") as dst, open(tail_h264, "rb") as src:
+                while chunk := src.read(8 << 20):
+                    dst.write(chunk)
+            tail_h264.unlink()
+            tail_bin.unlink()
+            print(f"[encode] {cam}: appended raw tail "
+                  f"({os.path.getsize(h264_path)} bytes total)", flush=True)
+            return True
+        except Exception as e:
+            # Keep the raw tail on disk — the data is safe, just unmerged.
+            print(f"[encode] {cam}: raw tail merge FAILED, tail kept at "
+                  f"{tail_bin}: {e}", flush=True)
+            return False
+
     def run(self):
         total = len(self._camera_names)
         results = [None] * total
@@ -89,6 +129,9 @@ class EncodeWorker(QThread):
             # raw.bin (raw-to-disk mode, or a camera whose NVENC init failed) so a
             # runtime encoder failure can never strand a camera's data.
             if self._realtime and h264_path.exists():
+                tail_bin = cam_dir / "raw_tail.bin"
+                if tail_bin.exists() and tail_bin.stat().st_size > 0:
+                    self._append_raw_tail(cam, h264_path, tail_bin)
                 raw_path = h264_path
                 ft = cam_dir / "frametimes.npy"
                 try:
