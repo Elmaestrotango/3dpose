@@ -35,6 +35,32 @@ from concurrent.futures import ProcessPoolExecutor
 from pathlib import Path
 
 import cv2
+
+# --- Legacy ChArUco shim (installed BEFORE importing sleap_anipose) ----------
+# The physical 3dpose board predates the OpenCV 4.6 ChArUco layout change; the
+# >=4.7 CharucoDetector matches the wrong markers and finds 0 corners on it
+# unless the board is put in "legacy" mode (the coverage HUD already does this,
+# see gui_app/board_detector.py). sleap-anipose exposes no legacy flag, so we
+# wrap the CharucoBoard constructor it calls. Installed before the sleap_anipose
+# import so the wrapper is in place no matter how aniposelib references the
+# class; gated by _LEGACY_CHARUCO, which main() sets from the board config's
+# `board_legacy` field.
+_LEGACY_CHARUCO = False
+if hasattr(cv2.aruco, "CharucoBoard"):
+    _orig_charuco_board = cv2.aruco.CharucoBoard
+
+    def _charuco_board(*args, **kwargs):
+        board = _orig_charuco_board(*args, **kwargs)
+        if _LEGACY_CHARUCO:
+            try:
+                board.setLegacyPattern(True)
+            except Exception:
+                pass
+        return board
+
+    cv2.aruco.CharucoBoard = _charuco_board
+# -----------------------------------------------------------------------------
+
 import numpy as np
 import yaml
 import sleap_anipose as slap
@@ -139,25 +165,23 @@ def extract_frames_by_index(src, dst, frame_indices):
 def _prescan_single_camera(args_tuple):
     """Detect ChArUco boards in a single camera's video. Runs in a worker."""
     video_path, board_x, board_y, marker_bits, dict_size = args_tuple
+    aruco = cv2.aruco
 
-    if marker_bits == 4:
-        aruco_dict = cv2.aruco.getPredefinedDictionary(
-            getattr(cv2.aruco, "DICT_4X4_{}".format(dict_size),
-                    cv2.aruco.DICT_4X4_1000))
-    elif marker_bits == 5:
-        aruco_dict = cv2.aruco.getPredefinedDictionary(
-            getattr(cv2.aruco, "DICT_5X5_{}".format(dict_size),
-                    cv2.aruco.DICT_5X5_1000))
-    elif marker_bits == 6:
-        aruco_dict = cv2.aruco.getPredefinedDictionary(
-            getattr(cv2.aruco, "DICT_6X6_{}".format(dict_size),
-                    cv2.aruco.DICT_6X6_1000))
+    dict_name = "DICT_{0}X{0}_{1}".format(marker_bits, dict_size)
+    aruco_dict = aruco.getPredefinedDictionary(
+        getattr(aruco, dict_name, aruco.DICT_4X4_1000))
+
+    # New (>=4.7) ArucoDetector API with a pre-4.7 fallback. We only count
+    # markers (len(ids) >= 4) to match the calibration-eligibility gate, so no
+    # CharucoBoard is needed here.
+    if hasattr(aruco, "ArucoDetector"):
+        _detector = aruco.ArucoDetector(aruco_dict, aruco.DetectorParameters())
+        def _detect(gray):
+            return _detector.detectMarkers(gray)[1]
     else:
-        aruco_dict = cv2.aruco.getPredefinedDictionary(cv2.aruco.DICT_4X4_1000)
-
-    charuco_board = cv2.aruco.CharucoBoard_create(
-        board_x, board_y, 1.0, 0.8, aruco_dict)
-    params = cv2.aruco.DetectorParameters_create()
+        _params = aruco.DetectorParameters_create()
+        def _detect(gray):
+            return aruco.detectMarkers(gray, aruco_dict, parameters=_params)[1]
 
     cap = cv2.VideoCapture(str(video_path))
     total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
@@ -169,7 +193,7 @@ def _prescan_single_camera(args_tuple):
         if not ret:
             break
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        corners, ids, _ = cv2.aruco.detectMarkers(gray, aruco_dict, parameters=params)
+        ids = _detect(gray)
         if ids is not None and len(ids) >= 4:
             detected_frames.append(frame_num)
         frame_num += 1
@@ -264,7 +288,10 @@ def prepare_calibration_videos(cam_dirs, max_frames, use_all_frames=False):
             except OSError:
                 shutil.copy2(mp4s[0], dst)
             print("  {}: using ALL frames".format(cam_dir.name))
-        elif not dst.exists():
+        elif (not dst.exists()
+              or dst.stat().st_mtime < mp4s[0].stat().st_mtime):
+            # (Re)build when missing OR stale — a re-recorded calibration video
+            # must not be solved against the previous recording's cached subsample.
             n = subsample_video(mp4s[0], dst, max_frames)
             print("  {}: subsampled to {} frames".format(cam_dir.name, n))
         else:
@@ -417,9 +444,11 @@ def main():
     marker_bits = board.get("marker_bits", 4)
     dict_size = board.get("dict_size", 1000)
     max_frames = args.max_frames or board.get("max_frames", DEFAULT_MAX_FRAMES)
+    global _LEGACY_CHARUCO
+    _LEGACY_CHARUCO = bool(board.get("board_legacy", False))
     print("Board config: {}".format(args.board_config))
-    print("  {}x{}, square={}mm, marker={}mm".format(
-        board_x, board_y, square_length, marker_length))
+    print("  {}x{}, square={}mm, marker={}mm, legacy={}".format(
+        board_x, board_y, square_length, marker_length, _LEGACY_CHARUCO))
 
     calib_dir = args.session_dir / "calibration"
     if not calib_dir.exists():
