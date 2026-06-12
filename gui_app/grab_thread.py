@@ -27,13 +27,16 @@ PUT_TIMEOUT_S = 2.0
 
 
 class _EncoderThread(threading.Thread):
-    """Drains gray frames from a queue into an NVENC H.264 elementary stream.
+    """Drains ready-made NV12 frames from a queue into an NVENC H.264 stream.
 
-    Encode() releases the GIL, so all cameras' encoder threads run truly
-    concurrently (PoC: ~1400 fps aggregate, ~2.3x the 600 fps needed).
+    The grab thread copies each gray frame straight into a preallocated NV12
+    ring buffer (one memcpy, GIL-held ~0.3 ms) and queues the buffer; this
+    thread then only calls Encode() (releases the GIL) and os.write (ditto) —
+    so the encoder side holds the GIL for ~zero time per frame. All cameras'
+    encoder threads run truly concurrently (PoC: ~1400 fps aggregate).
 
     If the encoder dies mid-recording, the thread switches to writing the
-    remaining queued frames (and everything after) raw to ``raw_tail.bin`` —
+    remaining queued frames' Y planes (the gray data) raw to ``raw_tail.bin``
     in arrival order, so the recording stays gapless: stream.h264 holds frames
     [0..encoded) and the tail holds [encoded..end). encode_worker encodes the
     tail and concatenates it onto the stream at stop.
@@ -47,7 +50,6 @@ class _EncoderThread(threading.Thread):
         self._fd = h264_fd
         self._spill_path = spill_path
         self._height = height
-        self._nv12 = np.full((height * 3 // 2, width), 128, np.uint8)
         self.queue = queue.Queue(maxsize=ENCODE_QUEUE_DEPTH)
         self.encoded = 0
         self.spilled = 0
@@ -57,8 +59,8 @@ class _EncoderThread(threading.Thread):
         spill_fd = None
         try:
             while True:
-                img = self.queue.get()
-                if img is None:  # sentinel: flush + exit
+                nv12 = self.queue.get()
+                if nv12 is None:  # sentinel: flush + exit
                     if spill_fd is None:
                         try:
                             bs = self._enc.EndEncode()
@@ -68,12 +70,11 @@ class _EncoderThread(threading.Thread):
                             print(f"[enc{self._cam_index}] EndEncode failed: {e}", flush=True)
                     return
                 if spill_fd is not None:
-                    os.write(spill_fd, img)
+                    os.write(spill_fd, nv12[:self._height])  # Y plane = gray
                     self.spilled += 1
                     continue
                 try:
-                    self._nv12[:self._height, :] = img  # gray -> Y plane
-                    bs = self._enc.Encode(self._nv12)
+                    bs = self._enc.Encode(nv12)
                     if bs:
                         os.write(self._fd, bs)
                     self.encoded += 1
@@ -92,7 +93,7 @@ class _EncoderThread(threading.Thread):
                         pass
                     spill_fd = os.open(str(self._spill_path),
                                        os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_BINARY)
-                    os.write(spill_fd, img)
+                    os.write(spill_fd, nv12[:self._height])
                     self.spilled += 1
         finally:
             if spill_fd is not None:
@@ -129,9 +130,17 @@ class GrabThread(QThread):
         self.latest_full_frame = None
 
     def _put_frame(self, enc_thread: _EncoderThread, img) -> bool:
-        """Queue a frame for encoding; True if it will be persisted."""
+        """Copy the gray frame into the next NV12 ring buffer and queue it.
+
+        The ring has queue-capacity + slack buffers, so a buffer can only be
+        reused after the encoder has long since consumed it. Copying straight
+        into NV12 here (instead of img.copy() + a second copy in the encoder)
+        halves the GIL-held memcpy work per frame."""
+        buf = self._nv12_ring[self._ring_i]
+        self._ring_i = (self._ring_i + 1) % len(self._nv12_ring)
+        buf[:self._height, :] = img  # Y plane = gray; UV stays 128
         try:
-            enc_thread.queue.put(img.copy(), timeout=PUT_TIMEOUT_S)
+            enc_thread.queue.put(buf, timeout=PUT_TIMEOUT_S)
             return True
         except queue.Full:
             self.drops += 1
@@ -139,6 +148,26 @@ class GrabThread(QThread):
                 print(f"[grab{self._cam_index}] ENCODER BACKPRESSURE: encoder "
                       f"not draining, dropped {self.drops} frames so far", flush=True)
             return False
+
+    def _log_stream_stats(self):
+        """Dump pylon's per-stream counters — distinguishes network packet loss
+        (Failed_Packet/Resend) from pool exhaustion (Buffer_Underrun)."""
+        try:
+            sg = self._camera.GetStreamGrabberNodeMap()
+            stats = {}
+            for s in ("Statistic_Total_Buffer_Count",
+                      "Statistic_Failed_Buffer_Count",
+                      "Statistic_Buffer_Underrun_Count",
+                      "Statistic_Total_Packet_Count",
+                      "Statistic_Failed_Packet_Count",
+                      "Statistic_Resend_Request_Count",
+                      "Statistic_Resend_Packet_Count"):
+                n = sg.GetNode(s)
+                if n is not None:
+                    stats[s.replace("Statistic_", "")] = n.GetValue()
+            print(f"[grab{self._cam_index}] stream stats: {stats}", flush=True)
+        except Exception as e:
+            print(f"[grab{self._cam_index}] stream stats unavailable: {e}", flush=True)
 
     def run(self):
         self._running = True
@@ -162,6 +191,12 @@ class GrabThread(QThread):
                     self._cam_index, enc, h264_fd,
                     self._raw_path.parent / "raw_tail.bin",
                     self._width, self._height)
+                # NV12 ring: grab copies gray directly into these (UV preset to
+                # 128); +4 slack over queue capacity so reuse can't catch up.
+                self._nv12_ring = [
+                    np.full((self._height * 3 // 2, self._width), 128, np.uint8)
+                    for _ in range(ENCODE_QUEUE_DEPTH + 4)]
+                self._ring_i = 0
                 enc_thread.start()
                 print(f"[grab{self._cam_index}] real-time NVENC encode (decoupled) -> {h264_path.name}", flush=True)
             except Exception as e:
@@ -193,12 +228,17 @@ class GrabThread(QThread):
         frame_n = 0
         timeout_n = 0
         first_frame_logged = False
+        t_wait = 0.0   # cumulative s blocked in RetrieveResult (per 1000 frames)
+        t_proc = 0.0   # cumulative s spent processing a frame (per 1000 frames)
 
         try:
             while self._running and self._camera.IsGrabbing():
                 try:
                     timeout = 200 if recording else 2000
+                    t0 = time.perf_counter()
                     result = self._camera.RetrieveResult(timeout, pylon.TimeoutHandling_ThrowException)
+                    t1 = time.perf_counter()
+                    t_wait += t1 - t0
                     if not result.GrabSucceeded():
                         print(f"[grab{self._cam_index}] grab failed: {result.ErrorCode} {result.ErrorDescription}", flush=True)
                         result.Release()
@@ -231,8 +271,15 @@ class GrabThread(QThread):
                     if recording and not first_frame_logged:
                         print(f"[grab{self._cam_index}] first frame received", flush=True)
                         first_frame_logged = True
-                    if recording and frame_n % 100 == 0:
-                        print(f"[grab{self._cam_index}] frames={frame_n} timeouts={timeout_n}", flush=True)
+                    t_proc += time.perf_counter() - t1
+                    if recording and frame_n % 1000 == 0:
+                        # wait >> proc and ~10 ms/frame -> loop keeps up (waits
+                        # for triggers); proc-bound or wait ~0 -> loop is the
+                        # bottleneck and a pool backlog is building.
+                        print(f"[grab{self._cam_index}] frames={frame_n} timeouts={timeout_n} "
+                              f"avg_wait={t_wait:.2f}ms avg_proc={t_proc:.2f}ms "
+                              f"qsize={enc_thread.queue.qsize() if enc_thread else 0}", flush=True)
+                        t_wait = t_proc = 0.0
                     now = time.perf_counter()
                     self._fps_times.append(now)
                     if len(self._fps_times) >= 2:
@@ -266,6 +313,8 @@ class GrabThread(QThread):
                     time.sleep(0.001)
         finally:
             print(f"[grab{self._cam_index}] exiting: frames={frame_n} timeouts={timeout_n} drops={self.drops}", flush=True)
+            if recording:
+                self._log_stream_stats()  # before StopGrabbing resets counters
             if enc_thread is not None:
                 # Drain: sentinel, then wait for the backlog (~1 s at full queue).
                 try:

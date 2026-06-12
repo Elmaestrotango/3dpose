@@ -86,6 +86,10 @@ def make_splash():
 
 
 def main():
+    # ~13 busy threads share the GIL during recording (6 grab + 6 encode + UI).
+    # The default 5 ms switch interval makes a GIL-holding thread stall the
+    # others for whole milliseconds; 1 ms keeps grab-loop latency bounded.
+    sys.setswitchinterval(0.001)
     log_path = _setup_logging()
 
     app = QApplication(sys.argv)
