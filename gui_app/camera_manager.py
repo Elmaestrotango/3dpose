@@ -98,7 +98,19 @@ class CameraManager(QObject):
                 avail = sg.GetNode(f"TypeIs{sym}Available")
                 if avail is None or avail.GetValue():
                     t.FromString(sym)
-            print(f"[cam{i+1}] GigE stream driver: {t.ToString()}", flush=True)
+            extra = ""
+            if t.ToString() == "SocketDriver":
+                # Max out the per-stream socket receive buffer (KB): more slack
+                # for the receive thread when encode threads contend for CPU.
+                try:
+                    sbs = sg.GetNode("SocketBufferSize")
+                    sbs_max = sg.GetNode("SocketBufferSize_Max")
+                    if sbs is not None and sbs_max is not None:
+                        sbs.SetValue(sbs_max.GetValue())
+                        extra = f" (SocketBufferSize={sbs.GetValue()} KB)"
+                except Exception:
+                    pass
+            print(f"[cam{i+1}] GigE stream driver: {t.ToString()}{extra}", flush=True)
         except Exception as e:
             print(f"[cam{i+1}] GigE driver selection skipped: {e}", flush=True)
 
