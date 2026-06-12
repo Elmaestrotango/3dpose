@@ -20,6 +20,11 @@ class RigProfile:
     quality: int = 21
     encode_parallel: int = 3
     realtime_encode: bool = True
+    # GigE receive driver: "socket" (user-space, robust packet resends — the
+    # proven path), "filter" (in-kernel pylon GigE Vision driver, less CPU but
+    # measured 2026-06-12 silently dropping ~23% of frames with default resend
+    # settings), or "auto" (leave pylon's default).
+    gige_driver: str = "socket"
     pfs_path: str = ""
     output_dir: str = ""
     board_config: str = ""
@@ -47,6 +52,7 @@ class RigProfile:
             quality=data.get("quality", 21),
             encode_parallel=data.get("encode_parallel", 3),
             realtime_encode=data.get("realtime_encode", True),
+            gige_driver=data.get("gige_driver", "socket"),
             pfs_path=_resolve(data.get("pfs_path", "")),
             output_dir=_resolve(data.get("output_dir", "")),
             board_config=_resolve(data.get("board_config", "")),

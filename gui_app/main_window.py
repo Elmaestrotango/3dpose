@@ -108,7 +108,7 @@ class MainWindow(QMainWindow):
     def _open_cameras(self):
         pfs = self._profile.pfs_path
         if pfs and Path(pfs).exists():
-            if self._camera_mgr.open_all(pfs):
+            if self._camera_mgr.open_all(pfs, gige_driver=self._profile.gige_driver):
                 n = self._camera_mgr.num_cameras
                 self._camera_grid.setup_grid(n)
                 self._camera_names = [f"cam{i+1}" for i in range(n)]

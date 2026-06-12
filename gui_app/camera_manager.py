@@ -45,7 +45,7 @@ class CameraManager(QObject):
         for gt in self._grab_threads:
             gt.set_keep_full(flag)
 
-    def open_all(self, pfs_path: str):
+    def open_all(self, pfs_path: str, gige_driver: str = "socket"):
         tlf = pylon.TlFactory.GetInstance()
         devices = tlf.EnumerateDevices()
         if len(devices) == 0:
@@ -62,7 +62,7 @@ class CameraManager(QObject):
                 # 1000 buffers = ~2.3 GB/cam at 1920x1200 (10 s of slack at
                 # 100 fps); ~13.8 GB across 6 cams, fine on the 64 GB machine.
                 cam.MaxNumBuffer.SetValue(1000)
-                self._select_gige_driver(i, cam)
+                self._select_gige_driver(i, cam, gige_driver)
             except Exception as e:
                 # Don't continue with a partial set: camera names are assigned by
                 # serial-number order, so a missing camera would silently shift
@@ -79,18 +79,25 @@ class CameraManager(QObject):
         return True
 
     @staticmethod
-    def _select_gige_driver(i: int, cam: pylon.InstantCamera):
-        """Prefer the in-kernel pylon GigE Vision (filter) driver over the
-        user-space socket driver — kernel packet reassembly costs far less host
-        CPU at 6x100 fps. No-op for non-GigE cameras or if unavailable."""
+    def _select_gige_driver(i: int, cam: pylon.InstantCamera, which: str = "socket"):
+        """Select the GigE receive driver per the profile's `gige_driver`.
+
+        "socket": user-space driver — costs more CPU but its packet resends
+        reliably recover lost packets (raw mode held 100 fps +-1 on it).
+        "filter": in-kernel pylon GigE Vision driver — far less host CPU, but
+        with default resend settings it silently dropped ~23% of frames
+        (~5,800 single-frame gaps/cam, 2026-06-12 test) under 6x100 fps load.
+        "auto": leave pylon's own default. No-op for non-GigE cameras."""
+        sym = {"socket": "SocketDriver", "filter": "WindowsFilterDriver"}.get(which)
         try:
             sg = cam.GetStreamGrabberNodeMap()
             t = sg.GetNode("Type")
             if t is None:
                 return
-            avail = sg.GetNode("TypeIsWindowsFilterDriverAvailable")
-            if avail is not None and avail.GetValue():
-                t.FromString("WindowsFilterDriver")
+            if sym is not None:
+                avail = sg.GetNode(f"TypeIs{sym}Available")
+                if avail is None or avail.GetValue():
+                    t.FromString(sym)
             print(f"[cam{i+1}] GigE stream driver: {t.ToString()}", flush=True)
         except Exception as e:
             print(f"[cam{i+1}] GigE driver selection skipped: {e}", flush=True)
