@@ -271,11 +271,13 @@ class MainWindow(QMainWindow):
         display_every = 1 if acq_type == "calibration" else 10
 
         rt = self._config.realtime_encode
-        print(f"[acq] start_acquisition({acq_type}) fps={fps} realtime={rt}: switching cameras to trigger mode", flush=True)
+        kick = self._config.realtime_kick
+        print(f"[acq] start_acquisition({acq_type}) fps={fps} realtime={rt} kick={kick}: switching cameras to trigger mode", flush=True)
         self._camera_mgr.start_acquisition(
             raw_paths, display_every=display_every,
             realtime=rt, width=self._config.frame_width,
-            height=self._config.frame_height, quality=self._config.quality)
+            height=self._config.frame_height, quality=self._config.quality,
+            realtime_kick=kick)
 
         print(f"[acq] opening teensy on {self._profile.serial_port}", flush=True)
         self._teensy = TeensyController(port=self._profile.serial_port)

@@ -14,6 +14,7 @@ class CameraManager(QObject):
         super().__init__()
         self._cameras: list[pylon.InstantCamera] = []
         self._grab_threads: list[GrabThread] = []
+        self._router = None  # SyncEncodeRouter in real-time kick-out mode
 
     @property
     def num_cameras(self) -> int:
@@ -178,7 +179,8 @@ class CameraManager(QObject):
         for i, cam in enumerate(self._cameras):
             rp = raw_paths[i] if raw_paths else None
             gt = GrabThread(i, cam, raw_path=rp, display_every=display_every,
-                            realtime=realtime, width=width, height=height, quality=quality)
+                            realtime=realtime, width=width, height=height,
+                            quality=quality, router=self._router)
             gt.start()
             self._grab_threads.append(gt)
 
@@ -191,8 +193,22 @@ class CameraManager(QObject):
 
     def start_acquisition(self, raw_paths: list[Path], display_every: int = 10,
                           realtime: bool = False, width: int = 0, height: int = 0,
-                          quality: int = 21):
+                          quality: int = 21, realtime_kick: bool = False):
         self._stop_grab_threads()
+        self._router = None
+        if realtime and realtime_kick:
+            # Shared router gates frames through the cross-camera coordinator so
+            # only frames every camera captured get encoded (already aligned, no
+            # post-hoc re-encode). Falls back to the decoupled path if NVENC init
+            # fails for any camera.
+            from gui_app.sync_encode import SyncEncodeRouter
+            router = SyncEncodeRouter(raw_paths, width, height, quality)
+            if router.available:
+                router.start()
+                self._router = router
+                print("[acq] real-time kick-out router active", flush=True)
+            else:
+                print("[acq] kick-out unavailable, using decoupled encode", flush=True)
         self._set_trigger_mode()
         self._start_grab_threads(raw_paths=raw_paths, display_every=display_every,
                                  realtime=realtime, width=width, height=height, quality=quality)
@@ -223,9 +239,15 @@ class CameraManager(QObject):
                           f"(GPU wedged?) — preview restart may be unstable, "
                           f"consider restarting the app", flush=True)
 
-        results = []
-        for gt in self._grab_threads:
-            results.append((gt.frame_count, gt.timestamps, gt.block_ids))
+        if self._router is not None:
+            # Kick-out mode: grab threads have stopped submitting; flush the
+            # coordinator and drain the shared encoders. Metadata (the released,
+            # already-common frames) comes from the router, not the grab threads.
+            results = self._router.stop()
+            self._router = None
+        else:
+            results = [(gt.frame_count, gt.timestamps, gt.block_ids)
+                       for gt in self._grab_threads]
         self._grab_threads.clear()
         return results
 

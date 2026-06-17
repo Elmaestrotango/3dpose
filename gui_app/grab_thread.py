@@ -104,7 +104,8 @@ class GrabThread(QThread):
     def __init__(self, cam_index: int, camera: pylon.InstantCamera,
                  raw_path: Path = None, display_every: int = 1,
                  downsample: int = 3, realtime: bool = False,
-                 width: int = 0, height: int = 0, quality: int = 21):
+                 width: int = 0, height: int = 0, quality: int = 21,
+                 router=None):
         super().__init__()
         self._cam_index = cam_index
         self._camera = camera
@@ -115,6 +116,10 @@ class GrabThread(QThread):
         self._width = width
         self._height = height
         self._quality = quality
+        # Real-time kick-out: when set, frames go to this shared router (which
+        # gates them through the cross-camera coordinator) instead of a private
+        # encoder. The router owns the encoders + the recorded metadata.
+        self._router = router
         self._running = False
         self._triggers_stopped = False
         self.frame_count = 0
@@ -180,8 +185,20 @@ class GrabThread(QThread):
         fd = None              # raw.bin descriptor (raw-to-disk mode / fallback)
         h264_fd = None         # H.264 elementary-stream descriptor
         enc_thread = None      # decoupled NVENC drain thread (real-time mode)
+        kick = recording and self._realtime and self._router is not None
 
-        if recording and self._realtime:
+        if kick:
+            # Frames go to the shared router; this thread keeps no encoder. The
+            # ring must outlast a frame's whole journey (held by the coordinator
+            # up to max_lag, then queued at the encoder) before its slot reuses.
+            ring_n = self._router.max_lag + ENCODE_QUEUE_DEPTH + 64
+            self._nv12_ring = [
+                np.full((self._height * 3 // 2, self._width), 128, np.uint8)
+                for _ in range(ring_n)]
+            self._ring_i = 0
+            print(f"[grab{self._cam_index}] real-time kick-out -> shared router "
+                  f"(ring={ring_n})", flush=True)
+        elif recording and self._realtime:
             try:
                 from gui_app import nvenc
                 enc = nvenc.create_h264_encoder(self._width, self._height, self._quality)
@@ -206,7 +223,7 @@ class GrabThread(QThread):
                 if h264_fd is not None:
                     os.close(h264_fd); h264_fd = None
 
-        if recording and enc_thread is None:
+        if recording and not kick and enc_thread is None:
             fd = os.open(str(self._raw_path), os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_BINARY)
 
         print(f"[grab{self._cam_index}] StartGrabbing (recording={recording})", flush=True)
@@ -251,17 +268,36 @@ class GrabThread(QThread):
                         self._snapshot_requested = False
 
                     if recording:
-                        if enc_thread is not None:
+                        if kick:
+                            # Copy gray into the next ring slot and submit to the
+                            # router; it records metadata for frames it RELEASES
+                            # (the common set), so this thread records none.
+                            buf = self._nv12_ring[self._ring_i]
+                            self._ring_i = (self._ring_i + 1) % len(self._nv12_ring)
+                            buf[:self._height, :] = img
+                            try:
+                                bid = result.BlockID
+                            except Exception:
+                                bid = -1
+                            self._router.submit(self._cam_index, bid,
+                                                result.TimeStamp * 1e-9, buf)
+                            self.frame_count += 1  # grabbed count (for logging)
+                        elif enc_thread is not None:
                             persisted = self._put_frame(enc_thread, img)
+                            if persisted:
+                                self.frame_count += 1
+                                self.timestamps.append(result.TimeStamp * 1e-9)
+                                # GigE Vision block ID = trigger ordinal: makes a
+                                # dropped frame a detectable, re-alignable gap
+                                # instead of a silent cross-camera desync.
+                                try:
+                                    self.block_ids.append(result.BlockID)
+                                except Exception:
+                                    self.block_ids.append(-1)
                         else:
                             os.write(fd, img)
-                            persisted = True
-                        if persisted:
                             self.frame_count += 1
                             self.timestamps.append(result.TimeStamp * 1e-9)
-                            # GigE Vision block ID = trigger ordinal: makes any
-                            # dropped frame a detectable, re-alignable gap
-                            # instead of a silent cross-camera desync.
                             try:
                                 self.block_ids.append(result.BlockID)
                             except Exception:
@@ -276,9 +312,11 @@ class GrabThread(QThread):
                         # wait >> proc and ~10 ms/frame -> loop keeps up (waits
                         # for triggers); proc-bound or wait ~0 -> loop is the
                         # bottleneck and a pool backlog is building.
+                        qd = enc_thread.queue.qsize() if enc_thread else (
+                            self._router.pending() if kick else 0)
                         print(f"[grab{self._cam_index}] frames={frame_n} timeouts={timeout_n} "
                               f"avg_wait={t_wait:.2f}ms avg_proc={t_proc:.2f}ms "
-                              f"qsize={enc_thread.queue.qsize() if enc_thread else 0}", flush=True)
+                              f"qsize={qd}", flush=True)
                         t_wait = t_proc = 0.0
                     now = time.perf_counter()
                     self._fps_times.append(now)

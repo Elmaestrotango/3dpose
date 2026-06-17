@@ -20,6 +20,10 @@ class RigProfile:
     quality: int = 21
     encode_parallel: int = 3
     realtime_encode: bool = True
+    # Real-time frame kick-out: gate frames through the cross-camera coordinator
+    # during capture so only frames every camera caught get encoded — videos come
+    # out already trigger-aligned, no post-hoc re-encode. Experimental; default off.
+    realtime_kick: bool = False
     # GigE receive driver: "socket" (user-space, robust packet resends — the
     # proven path), "filter" (in-kernel pylon GigE Vision driver, less CPU but
     # measured 2026-06-12 silently dropping ~23% of frames with default resend
@@ -52,6 +56,7 @@ class RigProfile:
             quality=data.get("quality", 21),
             encode_parallel=data.get("encode_parallel", 3),
             realtime_encode=data.get("realtime_encode", True),
+            realtime_kick=data.get("realtime_kick", False),
             gige_driver=data.get("gige_driver", "socket"),
             pfs_path=_resolve(data.get("pfs_path", "")),
             output_dir=_resolve(data.get("output_dir", "")),
@@ -90,6 +95,7 @@ class SessionConfig:
     quality: int = 21
     encode_parallel: int = 3
     realtime_encode: bool = True
+    realtime_kick: bool = False
 
     def __post_init__(self):
         if not self.date:
@@ -113,6 +119,7 @@ class SessionConfig:
             quality=profile.quality,
             encode_parallel=profile.encode_parallel,
             realtime_encode=profile.realtime_encode,
+            realtime_kick=profile.realtime_kick,
         )
         defaults.update(overrides)
         return cls(**defaults)

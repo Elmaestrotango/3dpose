@@ -44,6 +44,10 @@ class FrameSyncCoordinator:
         self.dropped = 0                      # frames kicked out (not common)
         self.forced = 0                       # frames dropped by max_lag forcing
 
+    def pending_depth(self) -> int:
+        """Max frames buffered awaiting a release decision (for monitoring)."""
+        return max((len(p) for p in self._pending), default=0)
+
     def _unwrap(self, cam: int, raw: int) -> int:
         if self._seen_any[cam] and raw < self._last_raw[cam] - (BLOCKID_WRAP // 2):
             self._wrap_off[cam] += BLOCKID_WRAP
