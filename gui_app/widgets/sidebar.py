@@ -276,6 +276,15 @@ class SidebarWidget(QWidget):
         # would still move the dropdown, desyncing it from the active profile.
         self._profile_combo.setEnabled(editable)
 
+    def set_busy(self, busy: bool):
+        """Disable all controls during a blocking background op (camera switch /
+        finishing). The status label stays legible so the user sees progress."""
+        for w in (self._profile_combo, self._dir_button, self._calibrate_toggle,
+                  self._record_toggle, self._run_calib_btn, self._snapshot_btn):
+            w.setEnabled(not busy)
+        for f in self._fields.values():
+            f.setEnabled(not busy)
+
     def set_status(self, text: str, color: str):
         self._status.setText(text)
         self._status.setStyleSheet(f"color: {color}; border: none; padding: 4px;")

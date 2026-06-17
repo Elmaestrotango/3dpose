@@ -175,6 +175,8 @@ Each rig has a YAML profile in `profiles/`. The profile defines everything speci
 | `frame_rate` | int | Trigger rate in Hz (typically 100) |
 | `quality` | int | NVENC QP parameter (0-51, lower = better quality, 21 is default) |
 | `realtime_encode` | bool | Encode H.264 on the GPU during capture (default `true`). `false` = raw-to-disk + post-hoc encode |
+| `realtime_kick` | bool | Real-time cross-camera frame kick-out (default `true`): only frames every camera caught are encoded, so videos come out trigger-aligned with no post-hoc re-encode. `false` = post-hoc block-ID alignment instead |
+| `kick_max_lag` | int | Kick-out coordinator buffer in frames (default 240). The NV12 ring scales with it — do not raise blindly (1000 starved capture) |
 | `encode_parallel` | int | Concurrent ffmpeg jobs at stop: `.h264`→mp4 remuxes (online) or raw→H.264 encodes (fallback). Default 3 |
 | `pfs_path` | string | Path to Basler .pfs file (relative or absolute) |
 | `output_dir` | string | Base data directory (relative or absolute) |
@@ -182,9 +184,10 @@ Each rig has a YAML profile in `profiles/`. The profile defines everything speci
 | `serial_port` | string | Teensy COM port (e.g., `COM3`) |
 | `trigger_pins` | list[int] | Teensy GPIO pins, one per camera (e.g., `[2, 4, 6, 8, 10, 12]`) |
 
-This repo ships two profiles: **`3dpose`** (online GPU encode — the default) and
-**`3dpose (raw)`** (`profiles/3dpose_raw.yaml`, the raw-to-disk fallback). Pick the
-latter from the dropdown if NVENC misbehaves or for a recording you can't risk.
+This repo ships two profiles: **`3dpose`** (real-time GPU encode with cross-camera frame
+kick-out — the default) and **`3dpose (raw)`** (`profiles/3dpose_raw.yaml`, the
+raw-to-disk fallback). Pick the latter from the dropdown if NVENC misbehaves or for a
+recording you can't risk. See **Frame alignment** below for what kick-out does.
 
 To create a new profile for a different rig:
 
@@ -325,6 +328,29 @@ gray bytes — measured ~1400 fps aggregate for 6×1920x1200 on an RTX 5080 (~2.
 Controlled by the `realtime_encode` profile field (default **true**). If PyNvVideoCodec
 or the CUDA runtime is unavailable, each camera transparently falls back to the
 raw-to-disk path below — no data is lost.
+
+### Frame alignment (GigE drops → trigger-aligned videos)
+
+At 6×100 fps over GigE the network occasionally drops a frame on one camera but not the
+others, so frame *i* is **not** the same trigger across cameras — and the drift
+accumulates (measured up to ~2 s of cross-camera skew over a 15-minute recording).
+Truncating each video to the shortest does **not** fix this; it only equalizes the
+counts. Every recorded frame is therefore tagged with its GigE **block ID** (trigger
+ordinal) in `blockids.npy`, and the videos are made truly trigger-aligned one of two ways:
+
+- **Real-time frame kick-out (default, `realtime_kick: true`).** A shared coordinator
+  (`gui_app/frame_sync.py`) releases a trigger to the encoders only once *all* cameras
+  have captured it; triggers any camera missed are dropped before encoding. The videos
+  come out equal-length and trigger-aligned **by construction — one encode, no post-hoc
+  pass.** `kick_max_lag` bounds how far a lagging camera (e.g. recovering lost packets
+  via resends) holds up the others before its late frames are sacrificed.
+- **Post-hoc block-ID alignment (`realtime_kick: false`).** Encode everything, then after
+  stop intersect the cameras' block IDs and re-encode each video down to the common
+  frames (`gui_app/alignment.py`). Immune to network jitter (keeps slightly more frames)
+  but pays a re-encode. The same logic is available as a CLI for old recordings:
+  `uv run 2_align.py <recording_dir> --replace`.
+
+Either way the per-camera videos end up identical length with identical block IDs.
 
 ### Raw capture + post-hoc encoding (fallback)
 

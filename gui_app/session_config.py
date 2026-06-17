@@ -147,15 +147,6 @@ class SessionConfig:
         """Trigger/encode frame rate for an acquisition type."""
         return self.calibration_frame_rate if acq_type == "calibration" else self.frame_rate
 
-    def video_filename(self, cam: str, acq_type: str) -> str:
-        return f"{self.date}-{self.session_id}-{cam}-{acq_type}.mp4"
-
-    def ensure_dirs(self, acq_type: str):
-        d = self.video_dir(acq_type)
-        for cam in self.camera_names:
-            (d / cam).mkdir(parents=True, exist_ok=True)
-        return d
-
     def save_metadata(self):
         now = datetime.now()
         meta = dict(

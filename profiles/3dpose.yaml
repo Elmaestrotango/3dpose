@@ -6,7 +6,9 @@ frame_rate: 100
 calibration_frame_rate: 30   # calibration captures at this rate (no benefit to 100 fps for a slowly-waved board)
 quality: 21
 encode_parallel: 3           # concurrent NVENC jobs (raw mode) / .h264->mp4 remux jobs (realtime mode)
-realtime_encode: true        # default: GPU H.264 encode during capture (no raw.bin, no post-hoc pass). Select "3dpose (raw)" to fall back.
+realtime_encode: true        # GPU H.264 encode during capture (no raw.bin, no post-hoc pass). Select "3dpose (raw)" to fall back.
+realtime_kick: true          # default: real-time cross-camera frame kick-out — only frames every camera caught are encoded, so videos come out trigger-aligned with no post-hoc re-encode.
+kick_max_lag: 240            # coordinator buffer (frames). DO NOT raise blindly: the NV12 ring scales with it; 1000 starved capture (24% loss, 2026-06-17). 240 runs clean.
 
 pfs_path: "configs/mono8_1920x1200.pfs"
 output_dir: "data"

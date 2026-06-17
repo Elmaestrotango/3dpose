@@ -86,6 +86,16 @@ class SyncEncodeRouter:
             if releases:
                 self._route(releases)
 
+    def abandon(self):
+        """Tear down WITHOUT draining (app quit mid-recording): close the output
+        fds so stream.h264 unlocks and can be deleted. Encoder threads are
+        daemon and die on process exit."""
+        for fd in self._fds:
+            try:
+                os.close(fd)
+            except Exception:
+                pass
+
     def stop(self):
         """Flush the coordinator, drain + join encoders, return per-camera
         (count, timestamps, block_ids)."""

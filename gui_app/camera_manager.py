@@ -267,3 +267,29 @@ class CameraManager(QObject):
             except Exception:
                 pass
         self._cameras.clear()
+
+    def abandon(self):
+        """Tear down capture immediately, WITHOUT draining encoders (for app
+        quit mid-session). Closes the kick-out router's output fds so the
+        half-baked stream files unlock and can be deleted."""
+        for gt in self._grab_threads:
+            gt.stop()
+        for gt in self._grab_threads:
+            gt.wait(3000)
+        self._grab_threads.clear()
+        if self._router is not None:
+            try:
+                self._router.abandon()
+            except Exception:
+                pass
+            self._router = None
+        for cam in self._cameras:
+            try:
+                cam.StopGrabbing()
+            except Exception:
+                pass
+            try:
+                cam.Close()
+            except Exception:
+                pass
+        self._cameras.clear()

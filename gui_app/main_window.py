@@ -6,13 +6,14 @@ from enum import Enum
 from pathlib import Path
 
 from PyQt5.QtWidgets import QMainWindow, QWidget, QHBoxLayout, QApplication, QMessageBox
-from PyQt5.QtCore import QTimer
-from PyQt5.QtGui import QPalette, QColor, QIcon
+from PyQt5.QtCore import QTimer, Qt
+from PyQt5.QtGui import QPalette, QColor, QIcon, QCursor
 
 from gui_app.camera_manager import CameraManager
 from gui_app.serial_controller import TeensyController
 from gui_app.encode_worker import EncodeWorker
 from gui_app.align_worker import AlignWorker
+from gui_app.ui_workers import CallableWorker
 from gui_app import alignment
 from gui_app.calibration_worker import CalibrationWorker
 from gui_app.hardware_check import HardwareCheckThread, format_report
@@ -57,6 +58,8 @@ class MainWindow(QMainWindow):
         self._calib_worker: CalibrationWorker | None = None
         self._config: SessionConfig | None = None
         self._video_dir: Path | None = None
+        self._busy = False                 # a blocking camera op is running
+        self._cam_op: CallableWorker | None = None
 
         self._camera_mgr = CameraManager()
         self._teensy = TeensyController()
@@ -110,17 +113,44 @@ class MainWindow(QMainWindow):
         self._run_hardware_check()
 
     def _open_cameras(self):
+        """Open cameras for the current profile (synchronous — startup only)."""
+        ok = self._open_cameras_bg()
+        self._apply_camera_open_result(ok)
+
+    def _open_cameras_bg(self) -> bool:
+        """Blocking open (run on a worker thread for live profile switches)."""
         pfs = self._profile.pfs_path
         if pfs and Path(pfs).exists():
-            if self._camera_mgr.open_all(pfs, gige_driver=self._profile.gige_driver):
-                n = self._camera_mgr.num_cameras
-                self._camera_grid.setup_grid(n)
-                self._camera_names = [f"cam{i+1}" for i in range(n)]
-                return
+            return self._camera_mgr.open_all(pfs, gige_driver=self._profile.gige_driver)
+        return False
+
+    def _apply_camera_open_result(self, ok):
+        if ok is True:
+            n = self._camera_mgr.num_cameras
+            self._camera_grid.setup_grid(n)
+            self._camera_names = [f"cam{i+1}" for i in range(n)]
+            return
         self._camera_grid.setup_grid(0)
         self._camera_names = []
-        QTimer.singleShot(100, lambda: QMessageBox.warning(
-            self, "Camera Error", "No cameras found or .pfs missing. Check connections and profile."))
+        # open_all already emits a specific error for a camera fault; only warn
+        # here for the plain "nothing opened" case (e.g. missing .pfs).
+        if not isinstance(ok, Exception):
+            QTimer.singleShot(100, lambda: QMessageBox.warning(
+                self, "Camera Error",
+                "No cameras found or .pfs missing. Check connections and profile."))
+
+    def _begin_busy(self, text: str):
+        self._busy = True
+        self._display_timer.stop()
+        self._sidebar.set_busy(True)
+        self._sidebar.set_status(text, "#ffaa00")
+        QApplication.setOverrideCursor(QCursor(Qt.WaitCursor))
+
+    def _end_busy(self):
+        QApplication.restoreOverrideCursor()
+        self._sidebar.set_busy(False)
+        self._busy = False
+        self._display_timer.start(33)
 
     def _size_to_screen(self):
         screen = QApplication.primaryScreen().availableGeometry()
@@ -150,12 +180,26 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "Hardware Check", msg)
 
     def _on_profile_changed(self, profile: RigProfile):
-        if self._state != State.IDLE:
+        if self._state != State.IDLE or self._busy:
             return
-        self._camera_mgr.close_all()
+        # close_all + open 6 cameras (+ .pfs load) is ~1-2 s of GigE round-trips;
+        # run it off the UI thread so the window doesn't go "not responding".
+        self._begin_busy("Switching cameras…")
         self._profile = profile
-        self._open_cameras()
+
+        def _switch():
+            self._camera_mgr.close_all()
+            return self._open_cameras_bg()
+
+        self._cam_op = CallableWorker(_switch)
+        self._cam_op.done.connect(self._on_profile_switch_done)
+        self._cam_op.start()
+
+    def _on_profile_switch_done(self, ok):
+        self._apply_camera_open_result(ok)
         self._size_to_screen()
+        self._end_busy()
+        self._sidebar.set_status("IDLE", "#888")
 
     def _apply_theme(self):
         app = QApplication.instance()
@@ -349,16 +393,25 @@ class MainWindow(QMainWindow):
         self._detector = None
         self._sidebar.hide_coverage()
 
-        # Collect and SAVE the captured data before touching the cameras again.
-        # Restoring preview can fail if a camera dropped off the bus mid-session;
-        # saving first guarantees the surviving cameras' recordings aren't lost.
-        cam_results = self._camera_mgr.stop_acquisition()
-        self._save_frametimes(cam_results)
-        self._config.save_metadata()
+        # Draining the encoders + reconfiguring 6 cameras back to preview is ~1 s
+        # of blocking work; run it off the UI thread so the window stays live.
+        self._begin_busy("Finishing…")
 
-        # Restore live preview (resilient to an offline camera).
-        self._camera_mgr.resume_preview()
+        def _finalize():
+            # SAVE the captured data before restoring preview — restoring can
+            # fail if a camera dropped off the bus mid-session, and saving first
+            # guarantees the surviving cameras' recordings aren't lost.
+            cam_results = self._camera_mgr.stop_acquisition()
+            self._save_frametimes(cam_results)
+            self._config.save_metadata()
+            self._camera_mgr.resume_preview()
 
+        self._cam_op = CallableWorker(_finalize)
+        self._cam_op.done.connect(self._on_acquisition_finalized)
+        self._cam_op.start()
+
+    def _on_acquisition_finalized(self, _result):
+        self._end_busy()
         self._state = State.ENCODING
         self._sidebar.set_status("ENCODING", "#ffaa00")
         self._sidebar.set_toggles_enabled(False)
@@ -583,30 +636,68 @@ class MainWindow(QMainWindow):
     def _on_camera_error(self, msg: str):
         QMessageBox.critical(self, "Error", msg)
 
+    def _workers_running(self) -> bool:
+        return any(w is not None and w.isRunning() for w in
+                   (self._encode_worker, self._align_worker, self._calib_worker))
+
     def closeEvent(self, event):
-        # Quitting mid-acquisition loses the recording's frametimes/finalization;
-        # quitting mid-encode orphans the ffmpeg jobs. Confirm first.
-        if self._state != State.IDLE:
+        # Quitting mid-session can't be finalized — confirm, then ABANDON the
+        # half-baked data rather than blocking the close on encode/align/solve
+        # workers (which is what made it freeze on "quit anyway").
+        busy = self._state != State.IDLE or self._busy or self._workers_running()
+        if busy:
             reply = QMessageBox.question(
-                self, "Acquisition in progress",
+                self, "Work in progress",
                 f"State is {self._state.value}. Quit anyway?\n\n"
-                "The current acquisition will NOT be finalized "
-                "(frametimes/videos may be incomplete).",
+                "The current session is not finished — its incomplete data "
+                "will be DELETED.",
                 QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
             if reply == QMessageBox.No:
                 event.ignore()
                 return
+
         self._display_timer.stop()
         self._stop_coverage_hud()
         if self._state in (State.CALIBRATING, State.RECORDING):
-            self._teensy.stop_triggers(self._profile.trigger_pins)
-            self._teensy.close()
-        self._camera_mgr.close_all()
-        if self._encode_worker and self._encode_worker.isRunning():
-            self._encode_worker.wait(5000)
-        align_worker = getattr(self, "_align_worker", None)
-        if align_worker and align_worker.isRunning():
-            align_worker.wait(120000)  # bounded re-encode; don't orphan ffmpeg
-        if self._calib_worker and self._calib_worker.isRunning():
-            self._calib_worker.wait(5000)
+            try:
+                self._teensy.stop_triggers(self._profile.trigger_pins)
+                self._teensy.close()
+            except Exception:
+                pass
+
+        if busy:
+            self._abandon_and_cleanup()
+        else:
+            self._camera_mgr.close_all()
         event.accept()
+
+    def _abandon_and_cleanup(self):
+        """Kill in-flight ffmpeg/solve subprocesses, tear down capture without
+        draining, and delete the incomplete session's data — so 'quit anyway'
+        returns immediately instead of waiting on workers."""
+        # Only the actively-written session's data is incomplete; a Solve
+        # (state IDLE) operates on already-complete videos, so don't delete those.
+        delete_data = self._state in (
+            State.RECORDING, State.CALIBRATING, State.ENCODING, State.ALIGNING)
+        # Kill child processes (ffmpeg remux/encode, the uv-run solve): unblocks
+        # the workers and unlocks output files so they can be removed.
+        try:
+            import psutil
+            for child in psutil.Process().children(recursive=True):
+                try:
+                    child.kill()
+                except Exception:
+                    pass
+        except Exception:
+            pass
+        try:
+            self._camera_mgr.abandon()
+        except Exception:
+            pass
+        for w in (self._cam_op, self._encode_worker, self._align_worker,
+                  self._calib_worker):
+            if w is not None and w.isRunning():
+                w.wait(3000)
+        if delete_data and self._video_dir and Path(self._video_dir).exists():
+            shutil.rmtree(self._video_dir, ignore_errors=True)
+            print(f"[quit] deleted incomplete session data: {self._video_dir}", flush=True)
