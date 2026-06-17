@@ -280,11 +280,11 @@ class SidebarWidget(QWidget):
         self._status.setText(text)
         self._status.setStyleSheet(f"color: {color}; border: none; padding: 4px;")
 
-    def show_progress(self, current: int, total: int):
+    def show_progress(self, current: int, total: int, label: str = "Encoding"):
         self._progress.setVisible(True)
         self._progress.setMaximum(total)
         self._progress.setValue(current)
-        self._progress.setFormat(f"Encoding {current}/{total}")
+        self._progress.setFormat(f"{label} {current}/{total}")
 
     def hide_progress(self):
         self._progress.setVisible(False)

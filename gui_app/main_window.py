@@ -12,6 +12,8 @@ from PyQt5.QtGui import QPalette, QColor, QIcon
 from gui_app.camera_manager import CameraManager
 from gui_app.serial_controller import TeensyController
 from gui_app.encode_worker import EncodeWorker
+from gui_app.align_worker import AlignWorker
+from gui_app import alignment
 from gui_app.calibration_worker import CalibrationWorker
 from gui_app.hardware_check import HardwareCheckThread, format_report
 from gui_app.coverage_worker import CoverageWorker
@@ -32,6 +34,7 @@ class State(Enum):
     CALIBRATING = "CALIBRATING"
     RECORDING = "RECORDING"
     ENCODING = "ENCODING"
+    ALIGNING = "ALIGNING"
 
 
 class MainWindow(QMainWindow):
@@ -50,6 +53,7 @@ class MainWindow(QMainWindow):
         self._detector = None
         self._coverage_worker: CoverageWorker | None = None
         self._encode_worker: EncodeWorker | None = None
+        self._align_worker: AlignWorker | None = None
         self._calib_worker: CalibrationWorker | None = None
         self._config: SessionConfig | None = None
         self._video_dir: Path | None = None
@@ -379,7 +383,7 @@ class MainWindow(QMainWindow):
         if not counts:
             return
         min_frames = min(counts)
-        frame_nums = np.arange(1, min_frames + 1, dtype=np.float64)
+        realtime = self._config.realtime_encode
 
         for i, (count, timestamps, block_ids) in enumerate(cam_results):
             if not timestamps:
@@ -387,16 +391,21 @@ class MainWindow(QMainWindow):
             cam = self._camera_names[i]
             cam_dir = self._video_dir / cam
 
-            ts_arr = np.array(timestamps[:min_frames])
+            # Realtime: the mp4 carries every encoded frame, so save FULL
+            # per-camera frametimes + blockids — auto-alignment then trims them
+            # to the frames every camera captured. Raw mode truncates raw.bin
+            # (below) to the min count for positional cross-cam consistency, so
+            # its frametimes/blockids are truncated to match.
+            n = len(timestamps) if realtime else min_frames
+            frame_nums = np.arange(1, n + 1, dtype=np.float64)
+            ts_arr = np.array(timestamps[:n])
             ts_arr -= ts_arr[0]
-
             np.save(cam_dir / "frametimes.npy", np.stack([frame_nums, ts_arr]))
-            # Full (untruncated) per-frame GigE block IDs: block ID = trigger
-            # ordinal, so dropped frames show as gaps and cross-camera alignment
-            # survives a drop. frametimes.npy keeps its (2, N) format untouched.
+            # Block ID = trigger ordinal; dropped frames show as gaps, so
+            # cross-camera alignment survives a drop (see gui_app/alignment.py).
             if block_ids:
-                np.save(cam_dir / "blockids.npy",
-                        np.asarray(block_ids, dtype=np.int64))
+                bids = np.asarray(block_ids, dtype=np.int64)
+                np.save(cam_dir / "blockids.npy", bids if realtime else bids[:n])
 
             raw_path = cam_dir / "raw.bin"
             if raw_path.exists():
@@ -409,10 +418,6 @@ class MainWindow(QMainWindow):
 
     def _on_encoding_done(self, results):
         self._sidebar.hide_progress()
-        self._sidebar.set_fields_editable(True)
-        self._sidebar.reset_toggles()
-        self._state = State.IDLE
-        self._sidebar.set_status("IDLE", "#888")
 
         frame_counts = [n for _, n, ok in results if ok]
         fps_vals = []
@@ -430,14 +435,66 @@ class MainWindow(QMainWindow):
         avg_fps = sum(fps_vals) / len(fps_vals) if fps_vals else 0
         min_frames = min(frame_counts) if frame_counts else 0
         max_frames = max(frame_counts) if frame_counts else 0
-
-        if min_frames == max_frames:
-            count_str = str(min_frames)
-        else:
-            count_str = f"{min_frames}-{max_frames}"
-
+        count_str = str(min_frames) if min_frames == max_frames else f"{min_frames}-{max_frames}"
         self.statusBar().showMessage(
-            f"{self._acq_type.title()} complete: {count_str} frames, {avg_fps:.1f} fps")
+            f"{self._acq_type.title()} encoded: {count_str} frames, {avg_fps:.1f} fps")
+
+        # Realtime mp4s can be unequal length / desynced if cameras dropped
+        # different frames — block-ID align them into equal-length, synchronized
+        # videos before going idle. No-loss recordings skip straight through.
+        if self._config.realtime_encode and self._start_alignment():
+            return
+        self._finish_to_idle()
+
+    def _start_alignment(self) -> bool:
+        """Start the align worker if cameras dropped different frames. Returns
+        True if alignment is now running (caller should defer the idle reset)."""
+        try:
+            _names, blocks, _videos = alignment.load_blockids(self._video_dir)
+        except Exception as e:
+            print(f"[align] skipped ({e})", flush=True)
+            return False
+        try:
+            if not alignment.needs_alignment(blocks):
+                return False  # loss-free: videos already equal-length + aligned
+        except Exception as e:
+            print(f"[align] check failed ({e})", flush=True)
+            return False
+
+        self._state = State.ALIGNING
+        self._sidebar.set_status("ALIGNING", "#ffaa00")
+        self._sidebar.set_toggles_enabled(False)
+        self.statusBar().showMessage("Aligning videos by trigger (re-encode)...")
+        self._align_worker = AlignWorker(
+            self._video_dir, self._acq_fps, self._config.quality,
+            parallel=self._config.encode_parallel)
+        self._align_worker.progress.connect(self._on_align_progress)
+        self._align_worker.finished_align.connect(self._on_align_done)
+        self._align_worker.start()
+        return True
+
+    def _on_align_progress(self, done: int, total: int, msg: str):
+        self._sidebar.show_progress(done, total, label="Aligning")
+        self.statusBar().showMessage(f"Aligning {done}/{total}: {msg}")
+
+    def _on_align_done(self, summary: dict):
+        self._sidebar.hide_progress()
+        if summary.get("error"):
+            self.statusBar().showMessage(
+                f"Alignment failed: {summary['error']} — videos left as-is")
+        elif summary.get("replaced"):
+            self.statusBar().showMessage(
+                f"Aligned: {summary['common_frames']} synchronized frames per camera")
+        elif summary.get("warnings"):
+            self.statusBar().showMessage(
+                "Alignment finished with warnings — see log; originals kept")
+        self._finish_to_idle()
+
+    def _finish_to_idle(self):
+        self._sidebar.set_fields_editable(True)
+        self._sidebar.reset_toggles()
+        self._state = State.IDLE
+        self._sidebar.set_status("IDLE", "#888")
 
     def _on_run_calibration(self):
         if self._state != State.IDLE:
@@ -545,6 +602,9 @@ class MainWindow(QMainWindow):
         self._camera_mgr.close_all()
         if self._encode_worker and self._encode_worker.isRunning():
             self._encode_worker.wait(5000)
+        align_worker = getattr(self, "_align_worker", None)
+        if align_worker and align_worker.isRunning():
+            align_worker.wait(120000)  # bounded re-encode; don't orphan ffmpeg
         if self._calib_worker and self._calib_worker.isRunning():
             self._calib_worker.wait(5000)
         event.accept()

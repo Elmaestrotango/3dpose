@@ -1,0 +1,229 @@
+"""Block-ID alignment core, shared by the GUI (align_worker) and 2_align.py.
+
+At 6x100 fps over GigE the host/network occasionally drops a frame, so frame
+*i* is not the same trigger across cameras. Each camera's ``blockids.npy``
+records the GigE block ID (trigger ordinal) of every recorded frame; the block
+IDs common to ALL cameras are the triggers every camera captured, and the
+hardware trigger fires all cameras simultaneously — so those frames are a
+synchronized, equal-length set.
+
+Imports are limited to numpy + (lazily) cv2 / imageio-ffmpeg so this module is
+importable both in the GUI venv and under ``uv run 2_align.py`` (isolated env).
+"""
+import json
+import os
+import subprocess
+import threading
+from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
+
+import numpy as np
+
+
+def camera_dirs(rec_dir: Path) -> list[Path]:
+    return sorted(d for d in Path(rec_dir).iterdir()
+                  if d.is_dir() and d.name.startswith("cam"))
+
+
+def video_for(cam_dir: Path):
+    mp4s = [f for f in cam_dir.iterdir()
+            if f.suffix == ".mp4" and "recording" in f.name]
+    if not mp4s:
+        mp4s = [f for f in cam_dir.iterdir() if f.suffix == ".mp4"]
+    return mp4s[0] if mp4s else None
+
+
+def load_blockids(rec_dir: Path):
+    """Return (cam_names, [blockids], [video paths]). Raises if any missing."""
+    cam_dirs = camera_dirs(rec_dir)
+    if not cam_dirs:
+        raise FileNotFoundError(f"No cam*/ directories in {rec_dir}")
+    names, blocks, videos = [], [], []
+    for cd in cam_dirs:
+        bpath = cd / "blockids.npy"
+        if not bpath.exists():
+            raise FileNotFoundError(
+                f"{bpath} missing — recording predates block-ID logging, "
+                "cannot be block-ID aligned.")
+        b = np.load(bpath).astype(np.int64)
+        if b.ndim != 1 or (b.size > 1 and np.any(np.diff(b) <= 0)):
+            raise ValueError(f"{bpath}: block IDs not strictly increasing")
+        names.append(cd.name)
+        blocks.append(b)
+        videos.append(video_for(cd))
+    return names, blocks, videos
+
+
+def compute_alignment(blocks: list[np.ndarray]):
+    """Common block IDs across all cameras + each camera's frame indices.
+
+    frame_index[c, k] = position in camera c's video of common_ids[k].
+    """
+    common = blocks[0]
+    for b in blocks[1:]:
+        common = np.intersect1d(common, b, assume_unique=True)
+    frame_index = np.empty((len(blocks), common.size), dtype=np.int64)
+    for c, b in enumerate(blocks):
+        pos = np.searchsorted(b, common)
+        if pos.size and np.any(b[pos] != common):
+            raise RuntimeError(f"camera {c}: block-ID index mismatch")
+        frame_index[c] = pos
+    return common, frame_index
+
+
+def needs_alignment(blocks: list[np.ndarray]) -> bool:
+    """True iff some camera holds a frame another camera is missing."""
+    common, _ = compute_alignment(blocks)
+    return any(b.size > common.size for b in blocks)
+
+
+def _ffmpeg_exe() -> str:
+    from imageio_ffmpeg import get_ffmpeg_exe
+    return get_ffmpeg_exe()
+
+
+def extract_aligned(video: Path, frame_idx: np.ndarray, dst: Path,
+                    fps: int, quality: int) -> int:
+    """Re-encode only the selected frame indices, in order, into dst (gray)."""
+    import cv2
+    keep = set(int(i) for i in frame_idx)
+    cap = cv2.VideoCapture(str(video))
+    w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    last = int(frame_idx[-1]) if frame_idx.size else -1
+    startupinfo = None
+    if os.name == "nt":
+        startupinfo = subprocess.STARTUPINFO()
+        startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+    cmd = [
+        _ffmpeg_exe(), "-y",
+        "-f", "rawvideo", "-vcodec", "rawvideo",
+        "-pix_fmt", "gray", "-s", f"{w}x{h}", "-r", str(fps), "-i", "-",
+        "-c:v", "h264_nvenc", "-pix_fmt", "yuv420p",
+        "-preset", "fast", "-qp", str(quality), "-bf:v", "0", "-gpu", "0",
+        "-loglevel", "error", str(dst),
+    ]
+    proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, startupinfo=startupinfo)
+    n = written = 0
+    try:
+        while n <= last:
+            ok, frame = cap.read()
+            if not ok:
+                break
+            if n in keep:
+                if frame.ndim == 3:
+                    frame = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+                proc.stdin.write(np.ascontiguousarray(frame).tobytes())
+                written += 1
+            n += 1
+    finally:
+        proc.stdin.close()
+        proc.wait()
+        cap.release()
+    return written
+
+
+def _rewrite_metadata(cam_dir: Path, cam_blockids: np.ndarray,
+                      frame_idx: np.ndarray, common: np.ndarray, fps: int):
+    """Replace blockids.npy + frametimes.npy with the aligned (common) set."""
+    np.save(cam_dir / "blockids.npy", common.astype(np.int64))
+    ft_path = cam_dir / "frametimes.npy"
+    m = common.size
+    frame_nums = np.arange(1, m + 1, dtype=np.float64)
+    ts = None
+    if ft_path.exists():
+        ft = np.load(ft_path)
+        # Original frametimes line up with the camera's own frames only when it
+        # was saved untruncated (realtime path). Otherwise synthesize from the
+        # uniform hardware trigger.
+        if ft.ndim == 2 and ft.shape[1] == cam_blockids.size:
+            ts = ft[1][frame_idx].astype(np.float64)
+            ts = ts - ts[0]
+    if ts is None:
+        ts = (common - common[0]).astype(np.float64) / float(fps)
+    np.save(ft_path, np.stack([frame_nums, ts]))
+
+
+def align_recording(rec_dir, fps: int = 100, quality: int = 21,
+                    replace: bool = False, parallel: int = 3,
+                    progress=None) -> dict:
+    """Align a recording by block ID.
+
+    Always writes ``aligned/alignment.{npz,json}`` (the lossless index). When
+    ``replace`` and some camera has extra frames, re-encodes each camera's mp4
+    down to the common frames and atomically replaces the original, rewriting
+    that camera's blockids.npy + frametimes.npy to match.
+
+    ``progress(done, total, msg)`` is called as cameras complete (thread-safe).
+    Returns a summary dict.
+    """
+    rec_dir = Path(rec_dir)
+    names, blocks, videos = load_blockids(rec_dir)
+    common, frame_index = compute_alignment(blocks)
+    full_span = int(max(int(b[-1]) for b in blocks)
+                    - min(int(b[0]) for b in blocks) + 1)
+    need = any(b.size > common.size for b in blocks)
+
+    out = rec_dir / "aligned"
+    out.mkdir(exist_ok=True)
+    np.savez(out / "alignment.npz", common_block_ids=common,
+             frame_index=frame_index, camera_names=np.array(names))
+    manifest = dict(
+        recording=str(rec_dir), camera_names=names, trigger_span=full_span,
+        common_frames=int(common.size), replaced=bool(replace and need),
+        per_camera={nm: dict(recorded=int(b.size),
+                             dropped=int(full_span - b.size))
+                    for nm, b in zip(names, blocks)},
+    )
+    with open(out / "alignment.json", "w") as f:
+        json.dump(manifest, f, indent=2)
+
+    summary = dict(common_frames=int(common.size), trigger_span=full_span,
+                   needed=need, replaced=False, camera_names=names,
+                   per_camera=manifest["per_camera"], warnings=[])
+
+    total = len(names)
+    if not need:
+        if progress:
+            progress(total, total, "already aligned")
+        return summary
+    if not replace:
+        return summary  # index written; videos left as-is
+
+    lock = threading.Lock()
+    done = [0]
+
+    def _one(c):
+        nm, vid = names[c], videos[c]
+        if vid is None:
+            with lock:
+                summary["warnings"].append(f"{nm}: no video, skipped")
+                done[0] += 1
+                if progress:
+                    progress(done[0], total, f"{nm} skipped (no video)")
+            return
+        cam_dir = vid.parent
+        tmp = cam_dir / "aligned_tmp.mp4"
+        written = extract_aligned(vid, frame_index[c], tmp, fps, quality)
+        if written != common.size:
+            tmp.unlink(missing_ok=True)
+            with lock:
+                summary["warnings"].append(
+                    f"{nm}: extracted {written}/{common.size}, original KEPT")
+                done[0] += 1
+                if progress:
+                    progress(done[0], total, f"{nm} FAILED, kept original")
+            return
+        _rewrite_metadata(cam_dir, blocks[c], frame_index[c], common, fps)
+        os.replace(tmp, vid)  # atomic; original disjoint mp4 replaced
+        with lock:
+            done[0] += 1
+            if progress:
+                progress(done[0], total, f"{nm} aligned")
+
+    workers = max(1, min(parallel or total, total))
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        list(pool.map(_one, range(total)))
+
+    summary["replaced"] = not summary["warnings"]
+    return summary
