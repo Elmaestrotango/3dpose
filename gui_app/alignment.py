@@ -19,6 +19,35 @@ from pathlib import Path
 
 import numpy as np
 
+# GigE Vision 16-bit block IDs cycle through 1..65535 (0 is reserved "no block
+# id"), so they wrap 65535 -> 1 every 65535 triggers unless extended 64-bit IDs
+# are enabled. camera_manager tries to enable the 64-bit mode; this is the
+# software safety net that unwraps a stream that wrapped anyway (and recovers
+# recordings made before the 64-bit mode was set).
+BLOCKID_WRAP = 65535
+
+
+def _unwrap_blockids(b: np.ndarray, period: int = BLOCKID_WRAP) -> np.ndarray:
+    """Undo 16-bit block-ID wrap-around so IDs are globally monotonic.
+
+    All cameras are hardware-triggered together and start at block ID 1, so they
+    wrap at the same trigger; unwrapping each stream independently yields trigger
+    ordinals that stay consistent across cameras. A wrap is a large negative step
+    (~ -(period-1)); a small decrease means genuinely corrupt/reordered data.
+    """
+    b = b.astype(np.int64)
+    if b.size < 2:
+        return b
+    d = np.diff(b)
+    wrap_at = d < -(period // 2)
+    if wrap_at.any():
+        offsets = np.concatenate([[0], np.cumsum(wrap_at.astype(np.int64))]) * period
+        b = b + offsets
+    if np.any(np.diff(b) <= 0):
+        raise ValueError("block IDs not monotonic even after wrap-unwrap "
+                         "(corrupt or reordered)")
+    return b
+
 
 def camera_dirs(rec_dir: Path) -> list[Path]:
     return sorted(d for d in Path(rec_dir).iterdir()
@@ -45,9 +74,10 @@ def load_blockids(rec_dir: Path):
             raise FileNotFoundError(
                 f"{bpath} missing — recording predates block-ID logging, "
                 "cannot be block-ID aligned.")
-        b = np.load(bpath).astype(np.int64)
-        if b.ndim != 1 or (b.size > 1 and np.any(np.diff(b) <= 0)):
-            raise ValueError(f"{bpath}: block IDs not strictly increasing")
+        b = np.load(bpath)
+        if b.ndim != 1:
+            raise ValueError(f"{bpath}: expected 1-D block IDs, got {b.shape}")
+        b = _unwrap_blockids(b)  # undo 16-bit wrap so IDs are globally monotonic
         names.append(cd.name)
         blocks.append(b)
         videos.append(video_for(cd))

@@ -62,6 +62,7 @@ class CameraManager(QObject):
                 # 1000 buffers = ~2.3 GB/cam at 1920x1200 (10 s of slack at
                 # 100 fps); ~13.8 GB across 6 cams, fine on the 64 GB machine.
                 cam.MaxNumBuffer.SetValue(1000)
+                self._enable_extended_block_ids(i, cam)
                 self._select_gige_driver(i, cam, gige_driver)
             except Exception as e:
                 # Don't continue with a partial set: camera names are assigned by
@@ -77,6 +78,32 @@ class CameraManager(QObject):
         self._set_freerun_mode()
         self._start_grab_threads()
         return True
+
+    @staticmethod
+    def _enable_extended_block_ids(i: int, cam: pylon.InstantCamera):
+        """Use 64-bit GVSP block IDs so the trigger ordinal doesn't wrap at
+        65535 (~11 min at 100 fps). alignment._unwrap_blockids is the software
+        fallback if the camera/driver can't honor this."""
+        ok = False
+        try:
+            nm = cam.GetNodeMap()
+            cam_node = nm.GetNode("GevGVSPExtendedIDMode")
+            if cam_node is not None:
+                cam_node.FromString("On")
+                ok = True
+        except Exception as e:
+            print(f"[cam{i+1}] GevGVSPExtendedIDMode unavailable: {e}", flush=True)
+        try:
+            sg = cam.GetStreamGrabberNodeMap()
+            sg_node = sg.GetNode("UseExtendedIdIfAvailable")
+            if sg_node is not None:
+                sg_node.SetValue(True)
+                ok = True
+        except Exception as e:
+            print(f"[cam{i+1}] UseExtendedIdIfAvailable unavailable: {e}", flush=True)
+        print(f"[cam{i+1}] extended (64-bit) block IDs: "
+              f"{'enabled' if ok else 'UNAVAILABLE — relying on software unwrap'}",
+              flush=True)
 
     @staticmethod
     def _select_gige_driver(i: int, cam: pylon.InstantCamera, which: str = "socket"):
