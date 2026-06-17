@@ -13,9 +13,10 @@ quality: 21
 encode_parallel: 3
 realtime_encode: true
 realtime_kick: true          # <-- real-time cross-camera frame kick-out
-kick_max_lag: 1000           # tolerate up to ~10 s of cross-camera lag (Eth5
-                             # resend recovery) before force-dropping late frames;
-                             # ~2.9 GB/cam of ring. Lower to 240 to cap RAM.
+kick_max_lag: 240            # DO NOT raise blindly: the NV12 ring scales with
+                             # this (~1.2 GB/cam at 240). 1000 pushed ~40 GB total
+                             # -> memory pressure -> grab loops underran -> 24%
+                             # loss (2026-06-17). 240 ran clean (underrun=0).
 
 pfs_path: "configs/mono8_1920x1200.pfs"
 output_dir: "data"
