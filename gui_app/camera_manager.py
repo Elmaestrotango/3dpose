@@ -193,7 +193,8 @@ class CameraManager(QObject):
 
     def start_acquisition(self, raw_paths: list[Path], display_every: int = 10,
                           realtime: bool = False, width: int = 0, height: int = 0,
-                          quality: int = 21, realtime_kick: bool = False):
+                          quality: int = 21, realtime_kick: bool = False,
+                          kick_max_lag: int = 240):
         self._stop_grab_threads()
         self._router = None
         if realtime and realtime_kick:
@@ -202,7 +203,8 @@ class CameraManager(QObject):
             # post-hoc re-encode). Falls back to the decoupled path if NVENC init
             # fails for any camera.
             from gui_app.sync_encode import SyncEncodeRouter
-            router = SyncEncodeRouter(raw_paths, width, height, quality)
+            router = SyncEncodeRouter(raw_paths, width, height, quality,
+                                      max_lag=kick_max_lag)
             if router.available:
                 router.start()
                 self._router = router

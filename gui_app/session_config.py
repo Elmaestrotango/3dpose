@@ -24,6 +24,11 @@ class RigProfile:
     # during capture so only frames every camera caught get encoded — videos come
     # out already trigger-aligned, no post-hoc re-encode. Experimental; default off.
     realtime_kick: bool = False
+    # Kick-out coordinator buffer depth (frames). A camera may lag the others by
+    # this many frames (e.g. while recovering lost packets via resends) before
+    # its missing triggers are force-dropped to keep the pipeline flowing. Higher
+    # = fewer late frames sacrificed, but more RAM held (ring scales with it).
+    kick_max_lag: int = 240
     # GigE receive driver: "socket" (user-space, robust packet resends — the
     # proven path), "filter" (in-kernel pylon GigE Vision driver, less CPU but
     # measured 2026-06-12 silently dropping ~23% of frames with default resend
@@ -57,6 +62,7 @@ class RigProfile:
             encode_parallel=data.get("encode_parallel", 3),
             realtime_encode=data.get("realtime_encode", True),
             realtime_kick=data.get("realtime_kick", False),
+            kick_max_lag=data.get("kick_max_lag", 240),
             gige_driver=data.get("gige_driver", "socket"),
             pfs_path=_resolve(data.get("pfs_path", "")),
             output_dir=_resolve(data.get("output_dir", "")),
@@ -96,6 +102,7 @@ class SessionConfig:
     encode_parallel: int = 3
     realtime_encode: bool = True
     realtime_kick: bool = False
+    kick_max_lag: int = 240
 
     def __post_init__(self):
         if not self.date:
@@ -120,6 +127,7 @@ class SessionConfig:
             encode_parallel=profile.encode_parallel,
             realtime_encode=profile.realtime_encode,
             realtime_kick=profile.realtime_kick,
+            kick_max_lag=profile.kick_max_lag,
         )
         defaults.update(overrides)
         return cls(**defaults)
