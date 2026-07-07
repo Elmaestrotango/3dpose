@@ -1,14 +1,12 @@
 # /// script
-# requires-python = ">=3.10,<3.12"
+# requires-python = ">=3.10"
 # dependencies = [
-#     "sleap-anipose>=0.1.8",
 #     "numpy<2",
-#     "imageio-ffmpeg",
 #     "pyyaml>=6.0",
 #     "opencv-contrib-python>=4.6",
 # ]
 # ///
-"""Multi-view camera calibration using sleap-anipose.
+"""Multi-view camera calibration using ArUco marker corners directly.
 
 Run with: uv run 1_calibrate.py <session_dir> --board-config <board.yaml>
 
@@ -16,392 +14,353 @@ The session directory should contain a calibration/ subfolder with per-camera
 video subdirectories (cam1/, cam2/, ...) produced by the Panopticon GUI.
 
 Outputs calibration.toml into the calibration directory.
-
-Calibration strategy (3 passes):
-  Pass 1 — Subsample each video to max_frames, run sleap-anipose.
-  Pass 2 — If pass 1 fails (disconnected camera graph), run a parallel
-            pre-scan on the full videos to find frames where the board is
-            visible, build subsampled videos from those frames, and retry.
-            Cameras with 0 detections are auto-excluded.
-  Pass 3 — If pass 2 still fails (isolated cameras despite detections),
-            exclude cameras that cannot be paired and retry.
 """
 import argparse
 import os
-import shutil
-import subprocess
 import sys
-from concurrent.futures import ProcessPoolExecutor
+from collections import defaultdict
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
 from pathlib import Path
 
 import cv2
-
-# --- Legacy ChArUco shim (installed BEFORE importing sleap_anipose) ----------
-# The physical 3dpose board predates the OpenCV 4.6 ChArUco layout change; the
-# >=4.7 CharucoDetector matches the wrong markers and finds 0 corners on it
-# unless the board is put in "legacy" mode (the coverage HUD already does this,
-# see gui_app/board_detector.py). sleap-anipose exposes no legacy flag, so we
-# wrap the CharucoBoard constructor it calls. Installed before the sleap_anipose
-# import so the wrapper is in place no matter how aniposelib references the
-# class; gated by _LEGACY_CHARUCO, which main() sets from the board config's
-# `board_legacy` field.
-_LEGACY_CHARUCO = False
-if hasattr(cv2.aruco, "CharucoBoard"):
-    _orig_charuco_board = cv2.aruco.CharucoBoard
-
-    def _charuco_board(*args, **kwargs):
-        board = _orig_charuco_board(*args, **kwargs)
-        if _LEGACY_CHARUCO:
-            try:
-                board.setLegacyPattern(True)
-            except Exception:
-                pass
-        return board
-
-    cv2.aruco.CharucoBoard = _charuco_board
-# -----------------------------------------------------------------------------
-
 import numpy as np
 import yaml
-import sleap_anipose as slap
-from imageio_ffmpeg import get_ffmpeg_exe
-
-FFMPEG = get_ffmpeg_exe()
-
-DEFAULT_MAX_FRAMES = 500
-PRESCAN_MAX_DETECTIONS = 400
 
 
 # ---------------------------------------------------------------------------
-# Video helpers
+# Board setup
 # ---------------------------------------------------------------------------
 
-def subsample_video(src, dst, max_frames):
-    """Uniform temporal subsample using ffmpeg fps filter."""
-    src, dst = Path(src), Path(dst)
-    probe = subprocess.run(
-        [FFMPEG, "-i", str(src)], capture_output=True, text=True,
-    )
-    duration = None
-    src_fps = 100.0
-    for line in probe.stderr.split("\n"):
-        if "Duration:" in line:
-            parts = line.split("Duration:")[1].split(",")[0].strip()
-            h, m, s = parts.split(":")
-            duration = float(h) * 3600 + float(m) * 60 + float(s)
-        if "fps" in line and "Video:" in line:
-            for token in line.split(","):
-                token = token.strip()
-                if token.endswith("fps"):
-                    try:
-                        src_fps = float(token.replace("fps", "").strip())
-                    except ValueError:
-                        pass
-
-    if duration is None or duration <= 0:
-        shutil.copy2(src, dst)
-        return -1
-
-    target_fps = max_frames / duration
-    if target_fps >= src_fps:
-        shutil.copy2(src, dst)
-        return int(src_fps * duration)
-
-    subprocess.run(
-        [FFMPEG, "-y", "-i", str(src),
-         "-vf", "fps={:.4f}".format(target_fps),
-         "-an", str(dst)],
-        capture_output=True,
-    )
-    return max_frames
-
-
-def extract_frames_by_index(src, dst, frame_indices):
-    """Extract specific frames from a video into a new video."""
-    src, dst = Path(src), Path(dst)
-    if not frame_indices:
-        return 0
-
-    cap = cv2.VideoCapture(str(src))
-    w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-    h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-    fps = cap.get(cv2.CAP_PROP_FPS) or 100.0
-
-    cmd = [
-        FFMPEG, "-y", "-f", "rawvideo", "-vcodec", "rawvideo",
-        "-pix_fmt", "bgr24", "-s", "{}x{}".format(w, h),
-        "-r", "{:.2f}".format(fps), "-i", "-",
-        "-c:v", "libx264", "-pix_fmt", "yuv420p",
-        "-preset", "fast", "-crf", "23",
-        "-loglevel", "error", str(dst),
-    ]
-    proc = subprocess.Popen(cmd, stdin=subprocess.PIPE)
-
-    sorted_indices = sorted(set(frame_indices))
-    idx_set = set(sorted_indices)
-    frame_num = 0
-    written = 0
-    max_idx = sorted_indices[-1]
-
-    while frame_num <= max_idx:
-        ret, frame = cap.read()
-        if not ret:
-            break
-        if frame_num in idx_set:
-            proc.stdin.write(frame.tobytes())
-            written += 1
-        frame_num += 1
-
-    proc.stdin.close()
-    proc.wait()
-    cap.release()
-    return written
-
-
-# ---------------------------------------------------------------------------
-# Parallel board pre-scan
-# ---------------------------------------------------------------------------
-
-def _prescan_single_camera(args_tuple):
-    """Detect ChArUco boards in a single camera's video. Runs in a worker."""
-    video_path, board_x, board_y, marker_bits, dict_size = args_tuple
+def create_board_and_dict(cfg):
     aruco = cv2.aruco
-
-    dict_name = "DICT_{0}X{0}_{1}".format(marker_bits, dict_size)
+    bits = cfg.get("marker_bits", 4)
+    dsz = cfg.get("dict_size", 1000)
+    dict_name = "DICT_{}X{}_{}".format(bits, bits, dsz)
     aruco_dict = aruco.getPredefinedDictionary(
         getattr(aruco, dict_name, aruco.DICT_4X4_1000))
 
-    # New (>=4.7) ArucoDetector API with a pre-4.7 fallback. We only count
-    # markers (len(ids) >= 4) to match the calibration-eligibility gate, so no
-    # CharucoBoard is needed here.
-    if hasattr(aruco, "ArucoDetector"):
-        _detector = aruco.ArucoDetector(aruco_dict, aruco.DetectorParameters())
-        def _detect(gray):
-            return _detector.detectMarkers(gray)[1]
+    bx, by = cfg["board_x"], cfg["board_y"]
+    sq, mk = float(cfg["square_length"]), float(cfg["marker_length"])
+    legacy = cfg.get("board_legacy", False)
+
+    if hasattr(aruco, "CharucoBoard") and not hasattr(aruco, "CharucoBoard_create"):
+        board = aruco.CharucoBoard((bx, by), sq, mk, aruco_dict)
     else:
-        _params = aruco.DetectorParameters_create()
+        board = aruco.CharucoBoard_create(bx, by, sq, mk, aruco_dict)
+    if legacy and hasattr(board, "setLegacyPattern"):
+        board.setLegacyPattern(True)
+
+    return board, aruco_dict
+
+
+def get_marker_obj_points(board):
+    """Return {marker_id: ndarray(4,3)} — each marker's 4 corner 3D positions."""
+    ids = board.getIds().ravel()
+    all_obj = board.getObjPoints()
+    return {int(mid): np.asarray(pts, dtype=np.float32)
+            for mid, pts in zip(ids, all_obj)}
+
+
+# ---------------------------------------------------------------------------
+# Detection (parallelized across cameras)
+# ---------------------------------------------------------------------------
+
+def _detect_one_camera(args_tuple):
+    """Detect ArUco markers in a camera's video. Runs in a worker process.
+    Processes every `skip`-th frame; after a detection, the next `burst` frames
+    are also processed to capture co-visible clusters."""
+    video_path, board_cfg = args_tuple
+    skip = board_cfg.get("_skip", 3)
+    burst = max(1, skip)
+    aruco = cv2.aruco
+    bits = board_cfg.get("marker_bits", 4)
+    dsz = board_cfg.get("dict_size", 1000)
+    dict_name = "DICT_{}X{}_{}".format(bits, bits, dsz)
+    aruco_dict = aruco.getPredefinedDictionary(
+        getattr(aruco, dict_name, aruco.DICT_4X4_1000))
+
+    if hasattr(aruco, "ArucoDetector"):
+        det = aruco.ArucoDetector(aruco_dict, aruco.DetectorParameters())
         def _detect(gray):
-            return aruco.detectMarkers(gray, aruco_dict, parameters=_params)[1]
+            return det.detectMarkers(gray)[:2]
+    else:
+        params = aruco.DetectorParameters_create()
+        def _detect(gray):
+            c, i, _ = aruco.detectMarkers(gray, aruco_dict, parameters=params)
+            return c, i
 
     cap = cv2.VideoCapture(str(video_path))
     total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-    detected_frames = []
-    frame_num = 0
+    w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
 
+    # Pre-allocate lists; store corners as contiguous float32 arrays
+    frames_with_det = []
+    all_corners = []
+    all_ids = []
+
+    frame_n = 0
+    go = 0  # burst counter
     while True:
         ret, frame = cap.read()
         if not ret:
             break
+        if frame_n % skip != 0 and go <= 0:
+            frame_n += 1
+            continue
+        go = max(0, go - 1)
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        ids = _detect(gray)
-        if ids is not None and len(ids) >= 4:
-            detected_frames.append(frame_num)
-        frame_num += 1
-
+        corners, ids = _detect(gray)
+        if ids is not None and len(ids) >= 3:
+            frames_with_det.append(frame_n)
+            all_corners.append(
+                np.array([c.reshape(4, 2) for c in corners], dtype=np.float32))
+            all_ids.append(ids.ravel().astype(np.int32))
+            go = burst
+        frame_n += 1
     cap.release()
-    cam_name = Path(video_path).parent.parent.name
-    return cam_name, detected_frames, total
+
+    cam_name = Path(video_path).parent.name
+    return cam_name, frames_with_det, all_corners, all_ids, total, (w, h)
 
 
-def parallel_prescan(cam_dirs, board_params, excluded=()):
-    """Detect board frames across all cameras in parallel."""
+def detect_all_cameras(cam_dirs, board_cfg, excluded):
+    """Run marker detection on all cameras in parallel."""
     tasks = []
     for cam_dir in cam_dirs:
         if cam_dir.name in excluded:
             continue
-        mp4s = [f for f in cam_dir.iterdir()
-                if f.is_file() and f.suffix == ".mp4" and "calibration" in f.name]
+        mp4s = sorted(f for f in cam_dir.iterdir()
+                      if f.is_file() and f.suffix == ".mp4"
+                      and "calibration" in f.name)
         if not mp4s:
             continue
-        tasks.append((
-            str(mp4s[0]),
-            board_params["board_x"], board_params["board_y"],
-            board_params.get("marker_bits", 4),
-            board_params.get("dict_size", 1000),
-        ))
+        tasks.append((str(mp4s[0]), board_cfg))
 
-    n_workers = min(len(tasks), os.cpu_count() or 4)
     results = {}
-    with ProcessPoolExecutor(max_workers=n_workers) as pool:
-        for cam_name, frames, total in pool.map(_prescan_single_camera, tasks):
-            results[cam_name] = frames
-            print("  {}: {}/{} frames with board".format(
-                cam_name, len(frames), total))
-
-    return results
-
-
-def find_shared_frames(prescan_results, min_cameras=2, max_frames=PRESCAN_MAX_DETECTIONS):
-    """Find frames where the board is visible in >= min_cameras simultaneously."""
-    all_cams = list(prescan_results.keys())
-    if len(all_cams) < min_cameras:
-        return {}, set()
-
-    frame_counts = {}
-    for cam, frames in prescan_results.items():
-        for f in frames:
-            if f not in frame_counts:
-                frame_counts[f] = set()
-            frame_counts[f].add(cam)
-
-    shared = {f: cams for f, cams in frame_counts.items()
-              if len(cams) >= min_cameras}
-
-    if not shared:
-        return {}, set()
-
-    selected = sorted(shared.keys())
-    if len(selected) > max_frames:
-        step = len(selected) / max_frames
-        selected = [selected[int(i * step)] for i in range(max_frames)]
-
-    selected_set = set(selected)
-    per_cam_frames = {}
-    for cam in all_cams:
-        cam_frames = [f for f in prescan_results[cam] if f in selected_set]
-        per_cam_frames[cam] = cam_frames
-
-    zero_cams = {c for c, frames in per_cam_frames.items() if not frames}
-    return per_cam_frames, zero_cams
+    sizes = {}
+    for task in tasks:
+        cam, fns, corners, ids, total, sz = _detect_one_camera(task)
+        results[cam] = (fns, corners, ids)
+        sizes[cam] = sz
+        n_markers = sum(len(i) for i in ids)
+        avg = n_markers / len(fns) if fns else 0
+        print("  {}: {}/{} frames with markers (avg {:.1f}/frame)".format(
+            cam, len(fns), total, avg), flush=True)
+    return results, sizes
 
 
 # ---------------------------------------------------------------------------
-# Calibration helpers
+# Correspondences: vectorized marker-corner → 3D/2D point arrays
 # ---------------------------------------------------------------------------
 
-def prepare_calibration_videos(cam_dirs, max_frames, use_all_frames=False):
-    """Subsample or link calibration videos for each camera."""
-    for cam_dir in cam_dirs:
-        mp4s = [f for f in cam_dir.iterdir()
-                if f.is_file() and f.suffix == ".mp4" and "calibration" in f.name]
-        if not mp4s:
+def _build_pts(corners, ids, marker_obj):
+    """Build (obj_pts, img_pts) for one frame. Returns None pair if empty."""
+    mask = np.isin(ids, list(marker_obj.keys()))
+    valid_ids = ids[mask]
+    valid_corners = corners[mask]  # (M, 4, 2)
+    if len(valid_ids) == 0:
+        return None, None
+    obj = np.stack([marker_obj[int(m)] for m in valid_ids])  # (M, 4, 3)
+    return (obj.reshape(-1, 1, 3).astype(np.float32),
+            valid_corners.reshape(-1, 1, 2).astype(np.float32))
+
+
+# ---------------------------------------------------------------------------
+# Intrinsic calibration
+# ---------------------------------------------------------------------------
+
+def calibrate_intrinsics(fns, corners_list, ids_list, marker_obj, image_size,
+                         min_markers=3, max_frames=50):
+    obj_all, img_all = [], []
+    for corners, ids in zip(corners_list, ids_list):
+        if len(ids) < min_markers:
             continue
-        img_dir = cam_dir / "calibration_images"
-        img_dir.mkdir(exist_ok=True)
-        dst = img_dir / mp4s[0].name
-
-        if use_all_frames:
-            if dst.exists() or dst.is_symlink():
-                dst.unlink()
-            try:
-                dst.symlink_to(mp4s[0].resolve())
-            except OSError:
-                shutil.copy2(mp4s[0], dst)
-            print("  {}: using ALL frames".format(cam_dir.name))
-        elif (not dst.exists()
-              or dst.stat().st_mtime < mp4s[0].stat().st_mtime):
-            # (Re)build when missing OR stale — a re-recorded calibration video
-            # must not be solved against the previous recording's cached subsample.
-            n = subsample_video(mp4s[0], dst, max_frames)
-            print("  {}: subsampled to {} frames".format(cam_dir.name, n))
-        else:
-            print("  {}: using existing subsampled video".format(cam_dir.name))
-
-
-def prepare_prescan_videos(cam_dirs, per_cam_frames):
-    """Extract only board-detected frames into calibration_images/."""
-    for cam_dir in cam_dirs:
-        cam = cam_dir.name
-        if cam not in per_cam_frames or not per_cam_frames[cam]:
+        obj, img = _build_pts(corners, ids, marker_obj)
+        if obj is None:
             continue
-        mp4s = [f for f in cam_dir.iterdir()
-                if f.is_file() and f.suffix == ".mp4" and "calibration" in f.name]
-        if not mp4s:
+        obj_all.append(obj)
+        img_all.append(img)
+
+    if len(obj_all) < 5:
+        return None
+
+    if len(obj_all) > max_frames:
+        step = len(obj_all) / max_frames
+        indices = [int(i * step) for i in range(max_frames)]
+        obj_all = [obj_all[i] for i in indices]
+        img_all = [img_all[i] for i in indices]
+
+    rms, K, dist, rvecs, tvecs = cv2.calibrateCamera(
+        obj_all, img_all, image_size, None, None)
+    return rms, K, dist, len(obj_all)
+
+
+# ---------------------------------------------------------------------------
+# Pairwise stereo calibration
+# ---------------------------------------------------------------------------
+
+def calibrate_pair(data_a, data_b, marker_obj, K_a, d_a, K_b, d_b,
+                   image_size, min_markers=3, min_frames=3):
+    fns_a, corners_a, ids_a = data_a
+    fns_b, corners_b, ids_b = data_b
+
+    # Index by frame number for fast lookup
+    idx_a = {}
+    for i, fn in enumerate(fns_a):
+        idx_a[fn] = i
+    idx_b = {}
+    for i, fn in enumerate(fns_b):
+        idx_b[fn] = i
+
+    shared = sorted(set(fns_a) & set(fns_b))
+
+    obj_list, img_a_list, img_b_list = [], [], []
+    for fn in shared:
+        ia, ib = idx_a[fn], idx_b[fn]
+        ca, ida = corners_a[ia], ids_a[ia]
+        cb, idb = corners_b[ib], ids_b[ib]
+
+        common = np.intersect1d(ida, idb)
+        common = common[np.isin(common, list(marker_obj.keys()))]
+        if len(common) < min_markers:
             continue
-        img_dir = cam_dir / "calibration_images"
-        img_dir.mkdir(exist_ok=True)
-        dst = img_dir / mp4s[0].name
-        if dst.exists() or dst.is_symlink():
-            dst.unlink()
-        n = extract_frames_by_index(mp4s[0], dst, per_cam_frames[cam])
-        print("  {}: extracted {} board frames".format(cam, n))
+
+        # Vectorized gather: for each common marker, find its index in each camera
+        idx_in_a = np.searchsorted(np.sort(ida), common)
+        sort_order_a = np.argsort(ida)
+        idx_in_a = sort_order_a[idx_in_a]
+
+        idx_in_b = np.searchsorted(np.sort(idb), common)
+        sort_order_b = np.argsort(idb)
+        idx_in_b = sort_order_b[idx_in_b]
+
+        obj = np.stack([marker_obj[int(m)] for m in common])  # (M, 4, 3)
+        obj_list.append(obj.reshape(-1, 1, 3).astype(np.float32))
+        img_a_list.append(ca[idx_in_a].reshape(-1, 1, 2).astype(np.float32))
+        img_b_list.append(cb[idx_in_b].reshape(-1, 1, 2).astype(np.float32))
+
+    if len(obj_list) < min_frames:
+        return None
+
+    # Cap frames to keep stereoCalibrate fast
+    if len(obj_list) > 30:
+        step = len(obj_list) / 30
+        idx = [int(i * step) for i in range(30)]
+        obj_list = [obj_list[i] for i in idx]
+        img_a_list = [img_a_list[i] for i in idx]
+        img_b_list = [img_b_list[i] for i in idx]
+
+    rms, _, _, _, _, R, T, _, _ = cv2.stereoCalibrate(
+        obj_list, img_a_list, img_b_list,
+        K_a, d_a, K_b, d_b, image_size,
+        flags=cv2.CALIB_FIX_INTRINSIC)
+    return R, T, rms, len(obj_list)
 
 
-def run_calibration(calib_dir, board_toml, excluded, calib_fname,
-                    metadata_fname, histogram_path, reproj_path):
-    """Run sleap-anipose calibration. Returns (cgroup, metadata) or raises."""
-    try:
-        result = slap.calibrate(
-            session=str(calib_dir),
-            board=str(board_toml),
-            excluded_views=excluded,
-            calib_fname=str(calib_fname),
-            metadata_fname=str(metadata_fname),
-            histogram_path=str(histogram_path),
-            reproj_path=str(reproj_path),
-        )
-    except (ValueError, TypeError) as e:
-        if Path(calib_fname).exists():
-            print("  (metadata generation failed: {}, but calibration.toml "
-                  "was written successfully)".format(e))
-            return True, None
-        raise
-    if not result or (hasattr(result, '__len__') and len(result) < 2):
-        raise RuntimeError("Calibration returned empty result")
-    if isinstance(result, tuple):
-        return result[0], result[1]
-    return result, None
+# ---------------------------------------------------------------------------
+# Global extrinsics via spanning tree
+# ---------------------------------------------------------------------------
+
+def build_graph(cam_names, pairwise):
+    """Check connectivity and build minimum-error spanning tree (Prim's)."""
+    adj = defaultdict(list)
+    for (a, b), (_, _, rms, _) in pairwise.items():
+        adj[a].append((b, rms))
+        adj[b].append((a, rms))
+
+    visited = {cam_names[0]}
+    queue = [cam_names[0]]
+    while queue:
+        node = queue.pop(0)
+        for nb, _ in adj[node]:
+            if nb not in visited:
+                visited.add(nb)
+                queue.append(nb)
+
+    if len(visited) < len(cam_names):
+        return None, set(cam_names) - visited
+
+    in_tree = {cam_names[0]}
+    edges = []
+    while len(in_tree) < len(cam_names):
+        best = None
+        for node in in_tree:
+            for nb, rms in adj[node]:
+                if nb not in in_tree and (best is None or rms < best[2]):
+                    best = (node, nb, rms)
+        if best is None:
+            break
+        edges.append((best[0], best[1]))
+        in_tree.add(best[1])
+    return edges, None
 
 
-def is_graph_error(error_msg):
-    """Check if the error is a disconnected camera graph problem."""
-    msg = str(error_msg).lower()
-    return any(s in msg for s in (
-        "calibration graph", "could not build", "could not be paired",
-        "group numbers", "not enough", "unpack",
-    ))
+def chain_extrinsics(cam_names, tree_edges, pairwise, ref_cam):
+    """Chain pairwise R,T along spanning tree into global poses."""
+    g_R = {ref_cam: np.eye(3, dtype=np.float64)}
+    g_t = {ref_cam: np.zeros((3, 1), dtype=np.float64)}
+
+    adj = defaultdict(list)
+    for a, b in tree_edges:
+        adj[a].append(b)
+        adj[b].append(a)
+
+    queue, visited = [ref_cam], {ref_cam}
+    while queue:
+        node = queue.pop(0)
+        for nb in adj[node]:
+            if nb in visited:
+                continue
+            visited.add(nb)
+            queue.append(nb)
+
+            if (node, nb) in pairwise:
+                R_ab, T_ab = pairwise[(node, nb)][:2]
+            else:
+                R_ba, T_ba = pairwise[(nb, node)][:2]
+                R_ab, T_ab = R_ba.T, -R_ba.T @ T_ba
+
+            g_R[nb] = R_ab @ g_R[node]
+            g_t[nb] = R_ab @ g_t[node] + T_ab
+
+    out = {}
+    for cam in cam_names:
+        rvec, _ = cv2.Rodrigues(g_R[cam])
+        out[cam] = (rvec.ravel(), g_t[cam].ravel())
+    return out
 
 
-def _fatal_calibration_error(error_msg):
-    """Print a calibration error and exit."""
-    msg = error_msg.lower()
-    if "singular" in msg or "linalg" in msg:
-        print("\nERROR: Calibration solve failed (singular matrix).",
-              file=sys.stderr)
-        print("One or more cameras may have too few detections or "
-              "insufficient viewing angles.", file=sys.stderr)
-    else:
-        print("\nERROR: Calibration failed: {}".format(error_msg),
-              file=sys.stderr)
-    sys.exit(1)
+# ---------------------------------------------------------------------------
+# Output (aniposelib-compatible calibration.toml)
+# ---------------------------------------------------------------------------
 
-
-def check_calibration_quality(calib_dir, metadata):
-    """Check calibration results and return warnings."""
-    warnings = []
-    try:
-        if not hasattr(metadata, "attrs") and not hasattr(metadata, "keys"):
-            return warnings
-    except Exception:
-        return warnings
-
-    cam_dirs = sorted(
-        d for d in calib_dir.iterdir()
-        if d.is_dir() and d.name.startswith("cam")
-    )
-    try:
-        import h5py
-        metadata_path = calib_dir / "calibration_metadata.h5"
-        if metadata_path.exists():
-            with h5py.File(metadata_path, "r") as f:
-                for cam_dir in cam_dirs:
-                    cam = cam_dir.name
-                    if cam in f:
-                        detections = f[cam]
-                        n_detected = sum(
-                            1 for key in detections
-                            if np.any(np.isfinite(detections[key][()]))
-                        ) if len(detections) > 0 else 0
-                        if n_detected == 0:
-                            warnings.append(
-                                "{}: 0 board detections".format(cam))
-                        elif n_detected < 10:
-                            warnings.append(
-                                "{}: only {} board detections (10+ recommended)".format(
-                                    cam, n_detected))
-    except Exception:
-        pass
-    return warnings
+def write_calibration_toml(path, cam_names, intrinsics, extrinsics, sizes):
+    lines = []
+    for i, cam in enumerate(cam_names):
+        K, dist = intrinsics[cam]
+        rvec, tvec = extrinsics[cam]
+        w, h = sizes[cam]
+        d = dist.ravel()
+        if len(d) < 5:
+            d = np.concatenate([d, np.zeros(5 - len(d))])
+        lines.append("[cam_{}]".format(i))
+        lines.append('name = "{}"'.format(cam))
+        lines.append("size = [ {}, {},]".format(w, h))
+        lines.append("matrix = [ [ {}, 0.0, {},], [ 0.0, {}, {},], [ 0.0, 0.0, 1.0,],]".format(
+            repr(K[0, 0]), repr(K[0, 2]), repr(K[1, 1]), repr(K[1, 2])))
+        lines.append("distortions = [ {}, {}, {}, {}, {},]".format(
+            repr(float(d[0])), repr(float(d[1])), repr(float(d[2])),
+            repr(float(d[3])), repr(float(d[4]))))
+        lines.append("rotation = [ {}, {}, {},]".format(
+            repr(float(rvec[0])), repr(float(rvec[1])), repr(float(rvec[2]))))
+        lines.append("translation = [ {}, {}, {},]".format(
+            repr(float(tvec[0])), repr(float(tvec[1])), repr(float(tvec[2]))))
+        lines.append("")
+    lines.append("[metadata]")
+    lines.append("")
+    with open(path, "w") as f:
+        f.write("\n".join(lines))
 
 
 # ---------------------------------------------------------------------------
@@ -410,174 +369,131 @@ def check_calibration_quality(calib_dir, metadata):
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Run multi-view calibration on a session's calibration videos.",
-    )
-    parser.add_argument(
-        "session_dir", type=Path,
-        help="Path to session directory (contains calibration/ with cam1/, cam2/, ...)",
-    )
-    parser.add_argument(
-        "--board-config", type=Path, required=True,
-        help="Path to board YAML (e.g. configs/boards/charuco_8x8_15mm.yaml)",
-    )
-    parser.add_argument(
-        "--excluded-views", nargs="*", default=[],
-        help="Camera names to exclude from calibration (e.g. cam5 cam6)",
-    )
-    parser.add_argument(
-        "--max-frames", type=int, default=None,
-        help="Max frames per camera for calibration (default: from board config or {})".format(
-            DEFAULT_MAX_FRAMES),
-    )
-    parser.add_argument(
-        "--no-fallback", action="store_true",
-        help="Disable automatic fallback on graph failure",
-    )
+        description="Multi-view calibration using ArUco marker corners.")
+    parser.add_argument("session_dir", type=Path)
+    parser.add_argument("--board-config", type=Path, required=True)
+    parser.add_argument("--excluded-views", nargs="*", default=[])
+    parser.add_argument("--ref-camera", type=str, default="cam1")
+    parser.add_argument("--skip", type=int, default=3,
+                        help="Process every Nth frame (default 3). Lower = more "
+                             "detections but slower.")
     args = parser.parse_args()
 
     with open(args.board_config) as f:
-        board = yaml.safe_load(f)
-    board_x = board["board_x"]
-    board_y = board["board_y"]
-    square_length = board["square_length"]
-    marker_length = board["marker_length"]
-    marker_bits = board.get("marker_bits", 4)
-    dict_size = board.get("dict_size", 1000)
-    max_frames = args.max_frames or board.get("max_frames", DEFAULT_MAX_FRAMES)
-    global _LEGACY_CHARUCO
-    _LEGACY_CHARUCO = bool(board.get("board_legacy", False))
-    print("Board config: {}".format(args.board_config))
-    print("  {}x{}, square={}mm, marker={}mm, legacy={}".format(
-        board_x, board_y, square_length, marker_length, _LEGACY_CHARUCO))
+        board_cfg = yaml.safe_load(f)
+
+    sys.stdout.reconfigure(line_buffering=True)
+    print("Board: {}x{}, sq={}, mk={}, legacy={}".format(
+        board_cfg["board_x"], board_cfg["board_y"],
+        board_cfg["square_length"], board_cfg["marker_length"],
+        board_cfg.get("board_legacy", False)))
+
+    board, _ = create_board_and_dict(board_cfg)
+    marker_obj = get_marker_obj_points(board)
+    print("  {} markers, IDs: {}".format(
+        len(marker_obj), sorted(marker_obj.keys())))
 
     calib_dir = args.session_dir / "calibration"
     if not calib_dir.exists():
-        raise FileNotFoundError(
-            "Calibration directory not found: {}".format(calib_dir))
-
-    cam_dirs = sorted(
-        d for d in calib_dir.iterdir()
-        if d.is_dir() and d.name.startswith("cam")
-    )
-    if not cam_dirs:
-        print("ERROR: No camera directories (cam1/, cam2/, ...) found.",
+        print("ERROR: calibration/ not found in {}".format(args.session_dir),
               file=sys.stderr)
         sys.exit(1)
 
-    board_toml = calib_dir / "board.toml"
-    board_img = calib_dir / "board.jpg"
-    slap.draw_board(
-        board_name=str(board_img),
-        board_x=board_x, board_y=board_y,
-        square_length=square_length, marker_length=marker_length,
-        marker_bits=marker_bits, dict_size=dict_size,
-        img_width=1440, img_height=1440,
-        save=str(board_toml),
-    )
-    print("Board TOML: {}".format(board_toml))
+    cam_dirs = sorted(d for d in calib_dir.iterdir()
+                      if d.is_dir() and d.name.startswith("cam"))
+    non_cam = {d.name for d in calib_dir.iterdir()
+               if d.is_dir() and not d.name.startswith("cam")}
+    excluded = set(args.excluded_views) | non_cam
 
-    non_cam_dirs = [d.name for d in calib_dir.iterdir()
-                    if d.is_dir() and not d.name.startswith("cam")]
-    excluded = tuple(list(args.excluded_views) + non_cam_dirs)
+    # --- Detect ---
+    board_cfg["_skip"] = args.skip
+    print("\nDetecting markers (parallel, skip={})...".format(args.skip))
+    all_dets, all_sizes = detect_all_cameras(cam_dirs, board_cfg, excluded)
 
-    calib_fname = calib_dir / "calibration.toml"
-    metadata_fname = calib_dir / "calibration_metadata.h5"
-    histogram_path = calib_dir / "reprojection_error_histogram.png"
-    reproj_path = calib_dir / "reprojections"
+    active = sorted(c for c in all_dets if len(all_dets[c][0]) >= 5)
+    dropped = sorted(set(all_dets) - set(active))
+    if dropped:
+        print("  Dropping (<5 detections): {}".format(", ".join(dropped)))
+    if len(active) < 2:
+        print("ERROR: fewer than 2 cameras with detections", file=sys.stderr)
+        sys.exit(1)
 
-    # --- Pass 1: subsampled videos ---
-    print("\n--- Pass 1: subsampled ({} frames) ---".format(max_frames))
-    prepare_calibration_videos(cam_dirs, max_frames)
+    # --- Intrinsics (parallel — cv2 releases the GIL) ---
+    print("\nIntrinsics...")
+    def _intrinsic_job(cam):
+        fns, corners, ids = all_dets[cam]
+        return cam, calibrate_intrinsics(fns, corners, ids, marker_obj,
+                                         all_sizes[cam])
 
-    cgroup = None
-    metadata = None
-    try:
-        cgroup, metadata = run_calibration(
-            calib_dir, board_toml, excluded,
-            calib_fname, metadata_fname, histogram_path, reproj_path)
-    except Exception as e:
-        error_msg = str(e)
-        if not (is_graph_error(error_msg) and not args.no_fallback):
-            _fatal_calibration_error(error_msg)
+    intrinsics = {}
+    with ThreadPoolExecutor(max_workers=len(active)) as pool:
+        for cam, result in pool.map(_intrinsic_job, active):
+            if result is None:
+                print("  {}: FAILED".format(cam))
+                continue
+            rms, K, dist, n = result
+            intrinsics[cam] = (K, dist)
+            print("  {}: RMS={:.3f}px  fx={:.0f}  ({} frames)".format(
+                cam, rms, K[0, 0], n))
 
-        # --- Pass 2: parallel pre-scan + smart subsample ---
-        print("\nSubsampled calibration failed: {}".format(error_msg))
-        print("\n--- Pass 2: parallel board pre-scan on full videos ---")
+    active = [c for c in active if c in intrinsics]
+    if len(active) < 2:
+        print("ERROR: fewer than 2 cameras with valid intrinsics",
+              file=sys.stderr)
+        sys.exit(1)
 
-        board_params = {
-            "board_x": board_x, "board_y": board_y,
-            "marker_bits": marker_bits, "dict_size": dict_size,
-        }
-        prescan = parallel_prescan(cam_dirs, board_params, excluded)
+    # --- Pairwise stereo (parallel — cv2 releases the GIL) ---
+    print("\nPairwise stereo...")
+    pairs = [(active[i], active[j])
+             for i in range(len(active)) for j in range(i + 1, len(active))]
 
-        per_cam_frames, zero_cams = find_shared_frames(
-            prescan, min_cameras=2, max_frames=PRESCAN_MAX_DETECTIONS)
+    def _stereo_job(pair):
+        ca, cb = pair
+        Ka, da = intrinsics[ca]
+        Kb, db = intrinsics[cb]
+        result = calibrate_pair(
+            all_dets[ca], all_dets[cb], marker_obj,
+            Ka, da, Kb, db, all_sizes[ca])
+        return ca, cb, result
 
-        if zero_cams:
-            print("\n  Cameras with 0 shared detections: {}".format(
-                ", ".join(sorted(zero_cams))))
+    pairwise = {}
+    with ThreadPoolExecutor(max_workers=min(len(pairs), 8)) as pool:
+        for ca, cb, result in pool.map(_stereo_job, pairs):
+            if result is None:
+                continue
+            R, T, rms, n = result
+            pairwise[(ca, cb)] = (R, T, rms, n)
+            print("  {}-{}: RMS={:.3f}  {} frames".format(ca, cb, rms, n))
 
-        cams_with_frames = {c for c, f in per_cam_frames.items() if f}
-        if len(cams_with_frames) < 2:
-            print("\nERROR: Fewer than 2 cameras share board-visible frames.",
-                  file=sys.stderr)
+    if not pairwise:
+        print("ERROR: no camera pairs with co-detections", file=sys.stderr)
+        sys.exit(1)
+
+    # --- Global extrinsics ---
+    print("\nCamera graph...")
+    tree, missing = build_graph(active, pairwise)
+    if tree is None:
+        print("  Disconnected — isolated: {}".format(
+            ", ".join(sorted(missing))))
+        active = [c for c in active if c not in missing]
+        if len(active) < 2:
+            print("ERROR: too few connected cameras", file=sys.stderr)
             sys.exit(1)
+        tree, _ = build_graph(active, pairwise)
 
-        auto_excluded = tuple(list(excluded) + sorted(zero_cams))
-        total_shared = sum(len(f) for f in per_cam_frames.values())
-        print("\n  Extracting {} shared board frames across {} cameras".format(
-            total_shared, len(cams_with_frames)))
+    ref = args.ref_camera if args.ref_camera in active else active[0]
+    print("  ref={}, tree: {}".format(
+        ref, " ".join("{}->{}".format(a, b) for a, b in tree)))
 
-        prepare_prescan_videos(cam_dirs, per_cam_frames)
+    extrinsics = chain_extrinsics(active, tree, pairwise, ref)
 
-        try:
-            cgroup, metadata = run_calibration(
-                calib_dir, board_toml, auto_excluded,
-                calib_fname, metadata_fname, histogram_path, reproj_path)
-        except Exception as e2:
-            error_msg2 = str(e2)
-            if not is_graph_error(error_msg2):
-                _fatal_calibration_error(error_msg2)
-
-            # --- Pass 3: exclude isolated cameras ---
-            print("\nPass 2 calibration failed: {}".format(error_msg2))
-            remaining = [d.name for d in cam_dirs
-                         if d.name not in auto_excluded
-                         and d.name in cams_with_frames]
-            if len(remaining) < 2:
-                print("\nERROR: Too few cameras remain for calibration.",
-                      file=sys.stderr)
-                sys.exit(1)
-
-            print("\n--- Pass 3: retrying with {} cameras ---".format(
-                len(remaining)))
-            print("  Cameras: {}".format(", ".join(sorted(remaining))))
-            all_excluded = tuple(
-                d.name for d in cam_dirs if d.name not in remaining
-            ) + tuple(non_cam_dirs)
-            try:
-                cgroup, metadata = run_calibration(
-                    calib_dir, board_toml, all_excluded,
-                    calib_fname, metadata_fname, histogram_path, reproj_path)
-            except Exception as e3:
-                print("\nERROR: Calibration failed: {}".format(e3),
-                      file=sys.stderr)
-                sys.exit(1)
-
-    warnings = check_calibration_quality(calib_dir, metadata)
+    # --- Write ---
+    out = calib_dir / "calibration.toml"
+    write_calibration_toml(out, active, intrinsics, extrinsics, all_sizes)
 
     print("\nCalibration complete.")
-    print("  calibration.toml:  {}".format(calib_fname))
-    print("  metadata:          {}".format(metadata_fname))
-    print("  histogram:         {}".format(histogram_path))
-    print("  reprojections:     {}".format(reproj_path))
-
-    if warnings:
-        print("\nWARNINGS:")
-        for w in warnings:
-            print("  - {}".format(w))
-        print("\nCalibration completed with warnings. Review the reprojection "
-              "error histogram.", file=sys.stderr)
+    print("  {}".format(out))
+    print("  Cameras: {}".format(" ".join(active)))
 
 
 if __name__ == "__main__":

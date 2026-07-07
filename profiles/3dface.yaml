@@ -7,10 +7,12 @@ calibration_frame_rate: 30
 quality: 21
 encode_parallel: 3
 realtime_encode: true
+realtime_kick: true
+kick_max_lag: 240
 
 pfs_path: "configs/mono8_mono.pfs"
 output_dir: "data"
-board_config: "configs/boards/charuco_8x8_15mm.yaml"
+board_config: "configs/boards/charuco_5x5_3dface.yaml"
 
 serial_port: COM3
 trigger_pins: [2, 4, 6, 8, 10, 12]

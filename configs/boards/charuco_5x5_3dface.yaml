@@ -1,0 +1,8 @@
+board_x: 5
+board_y: 5
+square_length: 0.5    # mm
+marker_length: 0.4    # mm
+marker_bits: 4
+dict_size: 1000
+board_legacy: true    # printed before OpenCV 4.6 layout change
+max_frames: 500

@@ -494,10 +494,13 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage(
             f"{self._acq_type.title()} encoded: {count_str} frames, {avg_fps:.1f} fps")
 
-        # Realtime mp4s can be unequal length / desynced if cameras dropped
-        # different frames — block-ID align them into equal-length, synchronized
-        # videos before going idle. No-loss recordings skip straight through.
-        if self._config.realtime_encode and self._start_alignment():
+        # With realtime_kick the coordinator already guarantees every camera
+        # encodes the same triggers — no post-hoc alignment needed. Without
+        # kick-out, cameras may have dropped different frames independently, so
+        # block-ID alignment re-encodes to the common subset.
+        if (self._config.realtime_encode
+                and not self._config.realtime_kick
+                and self._start_alignment()):
             return
         self._finish_to_idle()
 
