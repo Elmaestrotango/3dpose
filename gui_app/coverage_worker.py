@@ -30,8 +30,9 @@ class CoverageWorker(QThread):
             preview = self._camera_mgr.latest_frames
             frames = [f if f is not None else (preview[i] if i < len(preview) else None)
                       for i, f in enumerate(full)]
+            fc = self._camera_mgr.frame_counts
             try:
-                self._detector.update(frames)
+                self._detector.update(frames, frame_counts=fc)
             except Exception as e:
                 print(f"[hud] detection error: {e}", flush=True)
             self.updated.emit()

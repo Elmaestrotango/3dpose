@@ -36,6 +36,10 @@ class CameraManager(QObject):
     def latest_full_frames(self) -> list:
         return [gt.latest_full_frame for gt in self._grab_threads]
 
+    @property
+    def frame_counts(self) -> list[int]:
+        return [gt.frame_count for gt in self._grab_threads]
+
     def request_snapshots(self):
         """Ask every camera to stash its next full-resolution frame."""
         for gt in self._grab_threads:

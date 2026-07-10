@@ -82,16 +82,13 @@ class _CharucoEngine:
 class BoardDetector:
     def __init__(self, n_cams, board_config_path,
                  glow_threshold=4, edge_threshold=5,
-                 optimal_shared=50, min_edge=10, min_per_cam_shared=20,
+                 optimal_shared=200, min_edge=40, min_per_cam_shared=100,
                  glow_decay_s=0.4):
         self.n = int(n_cams)
-        self.glow_threshold = glow_threshold      # corners to "glow" a node
-        # Corners needed (on BOTH cams in a tick) to count toward a pair edge.
-        # Kept low because detection runs on the downsampled (÷3) preview, where
-        # off-angle / distant cameras clear fewer corners than at full res.
+        self.glow_threshold = glow_threshold
         self.edge_threshold = edge_threshold
-        self.optimal_shared = optimal_shared      # edge width maxes out here
-        self.min_edge = min_edge                  # edge counts as a graph link here
+        self.optimal_shared = optimal_shared
+        self.min_edge = min_edge
         self.min_per_cam_shared = min_per_cam_shared
         self.glow_decay_s = glow_decay_s
         with open(board_config_path) as f:
@@ -111,11 +108,14 @@ class BoardDetector:
         self.per_cam_covis = np.zeros(n, dtype=int)
         self.ready = False
         self._last = time.perf_counter()
+        self.codet_frames = []
 
-    def update(self, frames):
-        """Run one detection tick over the list of per-camera preview frames."""
+    def update(self, frames, frame_counts=None):
+        """Run one detection tick. If frame_counts (per-camera recorded frame
+        indices) is provided, co-detection frame numbers are saved for the
+        calibration script to use instead of re-scanning every frame."""
         if self.ready:
-            return self  # frozen once coverage is complete
+            return self
         now = time.perf_counter()
         dt = max(0.0, now - self._last)
         self._last = now
@@ -137,6 +137,9 @@ class BoardDetector:
                 for b in range(a + 1, len(seen)):
                     self.shared[seen[a], seen[b]] += 1
                     self.shared[seen[b], seen[a]] += 1
+            if frame_counts is not None:
+                self.codet_frames.append(
+                    {i: frame_counts[i] for i in seen})
 
         self._update_ready()
         return self

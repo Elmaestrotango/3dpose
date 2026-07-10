@@ -4,6 +4,7 @@
 #     "numpy<2",
 #     "pyyaml>=6.0",
 #     "opencv-contrib-python>=4.6",
+#     "matplotlib>=3.5",
 # ]
 # ///
 """Multi-view camera calibration using ArUco marker corners directly.
@@ -66,12 +67,10 @@ def get_marker_obj_points(board):
 # ---------------------------------------------------------------------------
 
 def _detect_one_camera(args_tuple):
-    """Detect ArUco markers in a camera's video. Runs in a worker process.
-    Processes every `skip`-th frame; after a detection, the next `burst` frames
-    are also processed to capture co-visible clusters."""
-    video_path, board_cfg = args_tuple
-    skip = board_cfg.get("_skip", 3)
-    burst = max(1, skip)
+    """Detect ArUco markers in a camera's video.
+    If target_frames is provided, only those frame numbers are decoded and
+    checked (fast seek). Otherwise every skip-th frame is processed."""
+    video_path, board_cfg, target_frames = args_tuple
     aruco = cv2.aruco
     bits = board_cfg.get("marker_bits", 4)
     dsz = board_cfg.get("dict_size", 1000)
@@ -94,38 +93,64 @@ def _detect_one_camera(args_tuple):
     w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
 
-    # Pre-allocate lists; store corners as contiguous float32 arrays
     frames_with_det = []
     all_corners = []
     all_ids = []
 
-    frame_n = 0
-    go = 0  # burst counter
-    while True:
-        ret, frame = cap.read()
-        if not ret:
-            break
-        if frame_n % skip != 0 and go <= 0:
+    if target_frames is not None:
+        # Fast path: only decode the frames the HUD flagged as co-detections
+        for fn in sorted(target_frames):
+            cap.set(cv2.CAP_PROP_POS_FRAMES, fn)
+            ret, frame = cap.read()
+            if not ret:
+                continue
+            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+            corners, ids = _detect(gray)
+            if ids is not None and len(ids) >= 3:
+                frames_with_det.append(fn)
+                all_corners.append(
+                    np.array([c.reshape(4, 2) for c in corners], dtype=np.float32))
+                all_ids.append(ids.ravel().astype(np.int32))
+    else:
+        # Full scan with skip + burst
+        skip = board_cfg.get("_skip", 3)
+        burst = max(1, skip)
+        frame_n = 0
+        go = 0
+        while True:
+            ret, frame = cap.read()
+            if not ret:
+                break
+            if frame_n % skip != 0 and go <= 0:
+                frame_n += 1
+                continue
+            go = max(0, go - 1)
+            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+            corners, ids = _detect(gray)
+            if ids is not None and len(ids) >= 3:
+                frames_with_det.append(frame_n)
+                all_corners.append(
+                    np.array([c.reshape(4, 2) for c in corners], dtype=np.float32))
+                all_ids.append(ids.ravel().astype(np.int32))
+                go = burst
             frame_n += 1
-            continue
-        go = max(0, go - 1)
-        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        corners, ids = _detect(gray)
-        if ids is not None and len(ids) >= 3:
-            frames_with_det.append(frame_n)
-            all_corners.append(
-                np.array([c.reshape(4, 2) for c in corners], dtype=np.float32))
-            all_ids.append(ids.ravel().astype(np.int32))
-            go = burst
-        frame_n += 1
     cap.release()
 
     cam_name = Path(video_path).parent.name
     return cam_name, frames_with_det, all_corners, all_ids, total, (w, h)
 
 
-def detect_all_cameras(cam_dirs, board_cfg, excluded):
-    """Run marker detection on all cameras in parallel."""
+def detect_all_cameras(cam_dirs, board_cfg, excluded, codet_path=None):
+    """Run marker detection on all cameras. If codet_path points to a
+    codet_frames.json (saved by the coverage HUD), only those frames are
+    decoded — much faster than scanning the full video."""
+    codet = None
+    if codet_path and codet_path.exists():
+        import json
+        with open(codet_path) as f:
+            codet = json.load(f)
+        print("  Using co-detection hints ({} cameras)".format(len(codet)))
+
     tasks = []
     for cam_dir in cam_dirs:
         if cam_dir.name in excluded:
@@ -135,7 +160,10 @@ def detect_all_cameras(cam_dirs, board_cfg, excluded):
                       and "calibration" in f.name)
         if not mp4s:
             continue
-        tasks.append((str(mp4s[0]), board_cfg))
+        target = None
+        if codet and cam_dir.name in codet:
+            target = codet[cam_dir.name]
+        tasks.append((str(mp4s[0]), board_cfg, target))
 
     results = {}
     sizes = {}
@@ -171,7 +199,7 @@ def _build_pts(corners, ids, marker_obj):
 # ---------------------------------------------------------------------------
 
 def calibrate_intrinsics(fns, corners_list, ids_list, marker_obj, image_size,
-                         min_markers=3, max_frames=50):
+                         min_markers=3, max_frames=30, min_frames=20):
     obj_all, img_all = [], []
     for corners, ids in zip(corners_list, ids_list):
         if len(ids) < min_markers:
@@ -182,7 +210,7 @@ def calibrate_intrinsics(fns, corners_list, ids_list, marker_obj, image_size,
         obj_all.append(obj)
         img_all.append(img)
 
-    if len(obj_all) < 5:
+    if len(obj_all) < min_frames:
         return None
 
     if len(obj_all) > max_frames:
@@ -191,8 +219,11 @@ def calibrate_intrinsics(fns, corners_list, ids_list, marker_obj, image_size,
         obj_all = [obj_all[i] for i in indices]
         img_all = [img_all[i] for i in indices]
 
+    flags = (cv2.CALIB_FIX_ASPECT_RATIO    # fx == fy
+             | cv2.CALIB_FIX_K3            # don't fit k3 (overfits with few points)
+             | cv2.CALIB_ZERO_TANGENT_DIST) # p1=p2=0 (negligible for machine-vision lenses)
     rms, K, dist, rvecs, tvecs = cv2.calibrateCamera(
-        obj_all, img_all, image_size, None, None)
+        obj_all, img_all, image_size, None, None, flags=flags)
     return rms, K, dist, len(obj_all)
 
 
@@ -332,6 +363,67 @@ def chain_extrinsics(cam_names, tree_edges, pairwise, ref_cam):
 
 
 # ---------------------------------------------------------------------------
+# Reprojection error histogram
+# ---------------------------------------------------------------------------
+
+def compute_reprojection_errors(all_dets, active_cams, intrinsics, extrinsics,
+                                marker_obj):
+    """Compute per-camera reprojection errors across all detected frames."""
+    per_cam_errors = {}
+    for cam in active_cams:
+        fns, corners_list, ids_list = all_dets[cam]
+        K, dist = intrinsics[cam]
+        rvec_global, tvec_global = extrinsics[cam]
+        R_global, _ = cv2.Rodrigues(rvec_global)
+
+        errors = []
+        for corners, ids in zip(corners_list, ids_list):
+            obj, img = _build_pts(corners, ids, marker_obj)
+            if obj is None:
+                continue
+            obj_3d = obj.reshape(-1, 3)
+            img_2d = img.reshape(-1, 2)
+            projected, _ = cv2.projectPoints(
+                obj_3d, rvec_global, tvec_global, K, dist)
+            projected = projected.reshape(-1, 2)
+            err = np.linalg.norm(projected - img_2d, axis=1)
+            errors.extend(err.tolist())
+        per_cam_errors[cam] = np.array(errors)
+    return per_cam_errors
+
+
+def save_reprojection_histogram(path, pair_rms):
+    """Save a pairwise stereo RMS bar chart as PNG."""
+    try:
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+    except ImportError:
+        print("  matplotlib not available, skipping histogram")
+        return
+
+    labels = sorted(pair_rms.keys())
+    values = [pair_rms[k] for k in labels]
+    if not values:
+        return
+
+    fig, ax = plt.subplots(figsize=(max(6, len(labels) * 0.8), 4))
+    colors = ["#4CAF50" if v < 10 else "#FF9800" if v < 20 else "#F44336"
+              for v in values]
+    ax.bar(range(len(labels)), values, color=colors)
+    ax.set_xticks(range(len(labels)))
+    ax.set_xticklabels(labels, rotation=45, ha="right", fontsize=8)
+    ax.set_ylabel("Stereo RMS (px)")
+    ax.set_title("Pairwise calibration quality")
+    ax.axhline(10, color="gray", linestyle="--", alpha=0.5, label="good (<10px)")
+    ax.legend(fontsize=8)
+    fig.tight_layout()
+    fig.savefig(str(path), dpi=120)
+    plt.close(fig)
+    print("  Histogram: {}".format(path))
+
+
+# ---------------------------------------------------------------------------
 # Output (aniposelib-compatible calibration.toml)
 # ---------------------------------------------------------------------------
 
@@ -407,8 +499,13 @@ def main():
 
     # --- Detect ---
     board_cfg["_skip"] = args.skip
-    print("\nDetecting markers (parallel, skip={})...".format(args.skip))
-    all_dets, all_sizes = detect_all_cameras(cam_dirs, board_cfg, excluded)
+    codet_path = calib_dir / "codet_frames.json"
+    if codet_path.exists():
+        print("\nDetecting markers (co-detection hints)...")
+    else:
+        print("\nDetecting markers (full scan, skip={})...".format(args.skip))
+    all_dets, all_sizes = detect_all_cameras(
+        cam_dirs, board_cfg, excluded, codet_path=codet_path)
 
     active = sorted(c for c in all_dets if len(all_dets[c][0]) >= 5)
     dropped = sorted(set(all_dets) - set(active))
@@ -487,6 +584,28 @@ def main():
 
     extrinsics = chain_extrinsics(active, tree, pairwise, ref)
 
+    # --- Quality summary + histogram ---
+    print("\nPairwise quality:")
+    pair_rms = {}
+    warnings = []
+    for (ca, cb), (_, _, rms, n) in sorted(pairwise.items()):
+        pair_rms["{}-{}".format(ca, cb)] = rms
+        print("  {}-{}: RMS={:.1f}px  ({} frames)".format(ca, cb, rms, n))
+        if rms > 20:
+            warnings.append("{}-{}: high stereo RMS ({:.1f}px)".format(
+                ca, cb, rms))
+
+    # Per-camera intrinsics quality
+    for cam in active:
+        K, dist = intrinsics[cam]
+        fns = all_dets[cam][0]
+        if len(fns) < 30:
+            warnings.append("{}: only {} detection frames (30+ recommended)".format(
+                cam, len(fns)))
+
+    hist_path = calib_dir / "reprojection_error_histogram.png"
+    save_reprojection_histogram(hist_path, pair_rms)
+
     # --- Write ---
     out = calib_dir / "calibration.toml"
     write_calibration_toml(out, active, intrinsics, extrinsics, all_sizes)
@@ -494,6 +613,12 @@ def main():
     print("\nCalibration complete.")
     print("  {}".format(out))
     print("  Cameras: {}".format(" ".join(active)))
+    if warnings:
+        print("\nWARNINGS:")
+        for w in warnings:
+            print("  - {}".format(w))
+        print("\n  Consider recording calibration longer with the board "
+              "visible to more cameras simultaneously.", file=sys.stderr)
 
 
 if __name__ == "__main__":

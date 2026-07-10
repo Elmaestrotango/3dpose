@@ -390,6 +390,8 @@ class MainWindow(QMainWindow):
         self._teensy.close()
 
         self._stop_coverage_hud()
+        if self._detector is not None and self._detector.codet_frames:
+            self._save_codet_frames(self._detector.codet_frames)
         self._detector = None
         self._sidebar.hide_coverage()
 
@@ -432,6 +434,24 @@ class MainWindow(QMainWindow):
         self._encode_worker.progress.connect(self._sidebar.show_progress)
         self._encode_worker.finished_all.connect(self._on_encoding_done)
         self._encode_worker.start()
+
+    def _save_codet_frames(self, codet_frames: list[dict[int, int]]):
+        """Save co-detection frame indices so 1_calibrate.py can skip full-video
+        scanning and only process frames where the board was co-visible."""
+        if not self._video_dir:
+            return
+        import json
+        per_cam = {}
+        for tick in codet_frames:
+            for cam_idx, frame_n in tick.items():
+                name = self._camera_names[cam_idx]
+                per_cam.setdefault(name, set()).add(frame_n)
+        out = {cam: sorted(fns) for cam, fns in per_cam.items()}
+        path = self._video_dir / "codet_frames.json"
+        with open(path, "w") as f:
+            json.dump(out, f)
+        print(f"[hud] saved {sum(len(v) for v in out.values())} co-detection "
+              f"frame indices to {path.name}", flush=True)
 
     def _save_frametimes(self, cam_results: list[tuple[int, list[float], list[int]]]):
         counts = [len(ts) for _, ts, _ in cam_results if ts]
