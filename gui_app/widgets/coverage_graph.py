@@ -24,7 +24,7 @@ class CoverageGraphWidget(QWidget):
         self._shared = None
         self._per_cam = None
         self._optimal = 50
-        self._target = 40
+        self._target = 100   # placeholder until a BoardDetector snapshot arrives (see update_from)
         self._ready = False
 
     def setup(self, n_cams: int):
@@ -42,7 +42,7 @@ class CoverageGraphWidget(QWidget):
         self._shared = np.asarray(det.shared, dtype=int).copy()
         self._per_cam = np.asarray(det.per_cam_covis, dtype=int).copy()
         self._optimal = det.optimal_shared or 1
-        self._target = getattr(det, "min_per_cam_shared", 40)
+        self._target = getattr(det, "min_per_cam_shared", 100)
         self._ready = bool(det.ready)
         self.update()
 

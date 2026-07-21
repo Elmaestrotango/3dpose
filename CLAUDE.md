@@ -22,7 +22,18 @@ Rig-validated fixes layered on top of the original PR (all on master):
 - **`coverage_worker.py`** runs detection off the UI thread at ~30 Hz on full-res
   frames (`GrabThread.set_keep_full`).
 - **`encode_parallel`** profile field (default 3) caps concurrent NVENC jobs.
-- READY target `min_per_cam_shared = 20` (~2× the ~10-frame sleap-anipose floor).
+- READY thresholds (`board_detector.py` constructor defaults): `min_per_cam_shared = 100`
+  co-visible frames/cam, `min_edge = 40` graph-connectivity, `optimal_shared = 200`
+  edge-width max — raised hard on 2026-07-09 (`acac97e`) after 20 proved far too lenient
+  and let under-covered cameras produce degenerate intrinsics (fx≠fy, extreme distortion).
+  Shared by both rigs and tuned on 3dface; **if the 6-cam 3dpose rig can't reach 100
+  co-visible/cam, dial these back** (they're constructor defaults, not yet profile fields).
+- `1_calibrate.py` (post-`acac97e`) constrains intrinsics (`CALIB_FIX_ASPECT_RATIO` /
+  `FIX_K3` / `ZERO_TANGENT_DIST`), requires ≥20 frames/cam, caps intrinsics+stereo at 30
+  frames, and writes `reprojection_error_histogram.png` (matplotlib — a PEP 723 inline dep
+  auto-installed by `uv run`; guarded/skipped if absent). The HUD saves `codet_frames.json`
+  on calibration stop so the script seeks to co-detection frames instead of scanning full
+  videos.
 
 3dface mirror of `gui_app/` is deferred — this rig only runs 3dpose for now.
 
