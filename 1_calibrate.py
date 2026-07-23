@@ -62,15 +62,22 @@ def get_marker_obj_points(board):
             for mid, pts in zip(ids, all_obj)}
 
 
+def get_charuco_obj_points(board):
+    """Return {corner_id: ndarray(3,)} — each charuco corner's 3D position."""
+    pts = board.getChessboardCorners()
+    return {i: pts[i].ravel().astype(np.float32) for i in range(len(pts))}
+
+
 # ---------------------------------------------------------------------------
 # Detection (parallelized across cameras)
 # ---------------------------------------------------------------------------
 
 def _detect_one_camera(args_tuple):
-    """Detect ArUco markers in a camera's video.
-    If target_frames is provided, only those frame numbers are decoded and
-    checked (fast seek). Otherwise every skip-th frame is processed."""
+    """Detect CharuCo corners in a camera's video.
+    If target_frames is provided, only those frame numbers are decoded
+    (sequential grab-skip). Otherwise every skip-th frame is processed."""
     video_path, board_cfg, target_frames = args_tuple
+    cv2.setNumThreads(2)
     aruco = cv2.aruco
     bits = board_cfg.get("marker_bits", 4)
     dsz = board_cfg.get("dict_size", 1000)
@@ -78,15 +85,37 @@ def _detect_one_camera(args_tuple):
     aruco_dict = aruco.getPredefinedDictionary(
         getattr(aruco, dict_name, aruco.DICT_4X4_1000))
 
-    if hasattr(aruco, "ArucoDetector"):
-        det = aruco.ArucoDetector(aruco_dict, aruco.DetectorParameters())
-        def _detect(gray):
-            return det.detectMarkers(gray)[:2]
+    bx, by = board_cfg["board_x"], board_cfg["board_y"]
+    sq = float(board_cfg["square_length"])
+    mk = float(board_cfg["marker_length"])
+    legacy = board_cfg.get("board_legacy", False)
+    if hasattr(aruco, "CharucoBoard") and not hasattr(aruco, "CharucoBoard_create"):
+        board = aruco.CharucoBoard((bx, by), sq, mk, aruco_dict)
     else:
-        params = aruco.DetectorParameters_create()
-        def _detect(gray):
-            c, i, _ = aruco.detectMarkers(gray, aruco_dict, parameters=params)
+        board = aruco.CharucoBoard_create(bx, by, sq, mk, aruco_dict)
+    if legacy and hasattr(board, "setLegacyPattern"):
+        board.setLegacyPattern(True)
+
+    if hasattr(aruco, "ArucoDetector"):
+        _adet = aruco.ArucoDetector(aruco_dict, aruco.DetectorParameters())
+        def _detect_markers(gray):
+            return _adet.detectMarkers(gray)[:2]
+    else:
+        _params = aruco.DetectorParameters_create()
+        def _detect_markers(gray):
+            c, i, _ = aruco.detectMarkers(gray, aruco_dict, parameters=_params)
             return c, i
+
+    min_corners = board_cfg.get("_min_charuco", 6)
+
+    def _detect(gray):
+        mc, mi = _detect_markers(gray)
+        if mi is None or len(mi) < 2:
+            return None, None
+        ret, cc, ci = aruco.interpolateCornersCharuco(mc, mi, gray, board)
+        if ci is None or len(ci) < min_corners:
+            return None, None
+        return cc.reshape(-1, 2), ci.ravel()
 
     cap = cv2.VideoCapture(str(video_path))
     total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
@@ -98,21 +127,25 @@ def _detect_one_camera(args_tuple):
     all_ids = []
 
     if target_frames is not None:
-        # Fast path: only decode the frames the HUD flagged as co-detections
-        for fn in sorted(target_frames):
-            cap.set(cv2.CAP_PROP_POS_FRAMES, fn)
-            ret, frame = cap.read()
-            if not ret:
-                continue
-            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-            corners, ids = _detect(gray)
-            if ids is not None and len(ids) >= 3:
-                frames_with_det.append(fn)
-                all_corners.append(
-                    np.array([c.reshape(4, 2) for c in corners], dtype=np.float32))
-                all_ids.append(ids.ravel().astype(np.int32))
+        targets = set(target_frames)
+        last_target = max(targets)
+        frame_n = 0
+        while frame_n <= last_target:
+            if frame_n in targets:
+                ret, frame = cap.read()
+                if not ret:
+                    break
+                gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+                corners, ids = _detect(gray)
+                if ids is not None:
+                    frames_with_det.append(frame_n)
+                    all_corners.append(corners.astype(np.float32))
+                    all_ids.append(ids.astype(np.int32))
+            else:
+                if not cap.grab():
+                    break
+            frame_n += 1
     else:
-        # Full scan with skip + burst
         skip = board_cfg.get("_skip", 3)
         burst = max(1, skip)
         frame_n = 0
@@ -127,11 +160,10 @@ def _detect_one_camera(args_tuple):
             go = max(0, go - 1)
             gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
             corners, ids = _detect(gray)
-            if ids is not None and len(ids) >= 3:
+            if ids is not None:
                 frames_with_det.append(frame_n)
-                all_corners.append(
-                    np.array([c.reshape(4, 2) for c in corners], dtype=np.float32))
-                all_ids.append(ids.ravel().astype(np.int32))
+                all_corners.append(corners.astype(np.float32))
+                all_ids.append(ids.astype(np.int32))
                 go = burst
             frame_n += 1
     cap.release()
@@ -167,14 +199,15 @@ def detect_all_cameras(cam_dirs, board_cfg, excluded, codet_path=None):
 
     results = {}
     sizes = {}
-    for task in tasks:
-        cam, fns, corners, ids, total, sz = _detect_one_camera(task)
-        results[cam] = (fns, corners, ids)
-        sizes[cam] = sz
-        n_markers = sum(len(i) for i in ids)
-        avg = n_markers / len(fns) if fns else 0
-        print("  {}: {}/{} frames with markers (avg {:.1f}/frame)".format(
-            cam, len(fns), total, avg), flush=True)
+    with ProcessPoolExecutor(max_workers=len(tasks)) as pool:
+        for cam, fns, corners, ids, total, sz in pool.map(
+                _detect_one_camera, tasks):
+            results[cam] = (fns, corners, ids)
+            sizes[cam] = sz
+            n_corners = sum(len(i) for i in ids)
+            avg = n_corners / len(fns) if fns else 0
+            print("  {}: {}/{} frames with corners (avg {:.1f}/frame)".format(
+                cam, len(fns), total, avg), flush=True)
     return results, sizes
 
 
@@ -198,8 +231,57 @@ def _build_pts(corners, ids, marker_obj):
 # Intrinsic calibration
 # ---------------------------------------------------------------------------
 
+def _poses_from_pts(obj_list, img_list, K, dist_coeffs):
+    """Run solvePnP per frame -> (rvec, tvec, mean_reproj_err, n_markers) or None."""
+    poses = []
+    for obj, img in zip(obj_list, img_list):
+        obj_3d = obj.reshape(-1, 3)
+        img_2d = img.reshape(-1, 2)
+        ok, rvec, tvec = cv2.solvePnP(obj_3d, img_2d, K, dist_coeffs)
+        if not ok:
+            poses.append(None)
+            continue
+        projected, _ = cv2.projectPoints(obj_3d, rvec, tvec, K, dist_coeffs)
+        err = np.linalg.norm(projected.reshape(-1, 2) - img_2d, axis=1).mean()
+        poses.append((rvec.ravel(), tvec.ravel(), err, obj_3d.shape[0]))
+    return poses
+
+
+def _pose_diverse_sample(poses, k, reproj_percentile=90):
+    """Select k indices maximising 6-D pose diversity after quality filtering.
+
+    Drops frames whose solvePnP reprojection error exceeds the given percentile,
+    then farthest-point samples in normalised [rvec, tvec] space so the selected
+    subset spans the full range of board orientations and positions.
+    """
+    valid = [(i, p) for i, p in enumerate(poses) if p is not None]
+    if len(valid) <= k:
+        return [i for i, _ in valid]
+
+    errors = np.array([p[2] for _, p in valid])
+    cutoff = np.percentile(errors, reproj_percentile)
+    filtered = [(i, p) for i, p in valid if p[2] <= cutoff]
+    if len(filtered) <= k:
+        return [i for i, _ in filtered]
+
+    feats = np.array([np.concatenate([p[0], p[1]]) for _, p in filtered])
+    stds = feats.std(axis=0)
+    stds[stds < 1e-12] = 1.0
+    normed = feats / stds
+
+    sel = [0]
+    min_d = np.full(len(filtered), np.inf)
+    for _ in range(k - 1):
+        d = np.linalg.norm(normed - normed[sel[-1]], axis=1)
+        min_d = np.minimum(min_d, d)
+        min_d[sel] = -1
+        sel.append(int(np.argmax(min_d)))
+
+    return sorted(filtered[s][0] for s in sel)
+
+
 def calibrate_intrinsics(fns, corners_list, ids_list, marker_obj, image_size,
-                         min_markers=3, max_frames=30, min_frames=20):
+                         min_markers=6, max_frames=60, min_frames=20):
     obj_all, img_all = [], []
     for corners, ids in zip(corners_list, ids_list):
         if len(ids) < min_markers:
@@ -214,14 +296,17 @@ def calibrate_intrinsics(fns, corners_list, ids_list, marker_obj, image_size,
         return None
 
     if len(obj_all) > max_frames:
-        step = len(obj_all) / max_frames
-        indices = [int(i * step) for i in range(max_frames)]
+        w, h = image_size
+        K_rough = np.array([[w, 0, w * 0.5], [0, w, h * 0.5], [0, 0, 1]],
+                           dtype=np.float64)
+        poses = _poses_from_pts(obj_all, img_all, K_rough, np.zeros(5))
+        indices = _pose_diverse_sample(poses, max_frames)
         obj_all = [obj_all[i] for i in indices]
         img_all = [img_all[i] for i in indices]
 
-    flags = (cv2.CALIB_FIX_ASPECT_RATIO    # fx == fy
-             | cv2.CALIB_FIX_K3            # don't fit k3 (overfits with few points)
-             | cv2.CALIB_ZERO_TANGENT_DIST) # p1=p2=0 (negligible for machine-vision lenses)
+    flags = (cv2.CALIB_FIX_ASPECT_RATIO
+             | cv2.CALIB_FIX_K3
+             | cv2.CALIB_ZERO_TANGENT_DIST)
     rms, K, dist, rvecs, tvecs = cv2.calibrateCamera(
         obj_all, img_all, image_size, None, None, flags=flags)
     return rms, K, dist, len(obj_all)
@@ -232,7 +317,7 @@ def calibrate_intrinsics(fns, corners_list, ids_list, marker_obj, image_size,
 # ---------------------------------------------------------------------------
 
 def calibrate_pair(data_a, data_b, marker_obj, K_a, d_a, K_b, d_b,
-                   image_size, min_markers=3, min_frames=3):
+                   image_size, min_markers=6, min_frames=3):
     fns_a, corners_a, ids_a = data_a
     fns_b, corners_b, ids_b = data_b
 
@@ -274,10 +359,9 @@ def calibrate_pair(data_a, data_b, marker_obj, K_a, d_a, K_b, d_b,
     if len(obj_list) < min_frames:
         return None
 
-    # Cap frames to keep stereoCalibrate fast
     if len(obj_list) > 30:
-        step = len(obj_list) / 30
-        idx = [int(i * step) for i in range(30)]
+        poses = _poses_from_pts(obj_list, img_a_list, K_a, d_a)
+        idx = _pose_diverse_sample(poses, 30)
         obj_list = [obj_list[i] for i in idx]
         img_a_list = [img_a_list[i] for i in idx]
         img_b_list = [img_b_list[i] for i in idx]
@@ -481,9 +565,8 @@ def main():
         board_cfg.get("board_legacy", False)))
 
     board, _ = create_board_and_dict(board_cfg)
-    marker_obj = get_marker_obj_points(board)
-    print("  {} markers, IDs: {}".format(
-        len(marker_obj), sorted(marker_obj.keys())))
+    marker_obj = get_charuco_obj_points(board)
+    print("  {} charuco corners".format(len(marker_obj)))
 
     calib_dir = args.session_dir / "calibration"
     if not calib_dir.exists():
