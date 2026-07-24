@@ -524,7 +524,8 @@ def write_calibration_toml(path, cam_names, intrinsics, extrinsics, sizes):
         lines.append('name = "{}"'.format(cam))
         lines.append("size = [ {}, {},]".format(w, h))
         lines.append("matrix = [ [ {}, 0.0, {},], [ 0.0, {}, {},], [ 0.0, 0.0, 1.0,],]".format(
-            repr(K[0, 0]), repr(K[0, 2]), repr(K[1, 1]), repr(K[1, 2])))
+            repr(float(K[0, 0])), repr(float(K[0, 2])),
+            repr(float(K[1, 1])), repr(float(K[1, 2]))))
         lines.append("distortions = [ {}, {}, {}, {}, {},]".format(
             repr(float(d[0])), repr(float(d[1])), repr(float(d[2])),
             repr(float(d[3])), repr(float(d[4]))))
