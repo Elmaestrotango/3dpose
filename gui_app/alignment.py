@@ -130,7 +130,8 @@ def extract_aligned(video: Path, frame_idx: np.ndarray, dst: Path,
         "-f", "rawvideo", "-vcodec", "rawvideo",
         "-pix_fmt", "gray", "-s", f"{w}x{h}", "-r", str(fps), "-i", "-",
         "-c:v", "h264_nvenc", "-pix_fmt", "yuv420p",
-        "-preset", "fast", "-qp", str(quality), "-bf:v", "0", "-gpu", "0",
+        "-preset", "fast", "-qp", str(quality), "-g", str(fps),
+        "-bf:v", "0", "-gpu", "0",
         "-loglevel", "error", str(dst),
     ]
     proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, startupinfo=startupinfo)

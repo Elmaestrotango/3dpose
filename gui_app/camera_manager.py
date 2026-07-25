@@ -178,13 +178,14 @@ class CameraManager(QObject):
                 print(f"[cam{i+1}] trigger config failed (camera offline?): {e}", flush=True)
 
     def _start_grab_threads(self, raw_paths=None, display_every=1,
-                            realtime=False, width=0, height=0, quality=21):
+                            realtime=False, width=0, height=0, quality=21,
+                            fps=100):
         self._stop_grab_threads()
         for i, cam in enumerate(self._cameras):
             rp = raw_paths[i] if raw_paths else None
             gt = GrabThread(i, cam, raw_path=rp, display_every=display_every,
                             realtime=realtime, width=width, height=height,
-                            quality=quality, router=self._router)
+                            quality=quality, fps=fps, router=self._router)
             gt.start()
             self._grab_threads.append(gt)
 
@@ -197,7 +198,8 @@ class CameraManager(QObject):
 
     def start_acquisition(self, raw_paths: list[Path], display_every: int = 10,
                           realtime: bool = False, width: int = 0, height: int = 0,
-                          quality: int = 21, realtime_kick: bool = False,
+                          quality: int = 21, fps: int = 100,
+                          realtime_kick: bool = False,
                           kick_max_lag: int = 240):
         self._stop_grab_threads()
         self._router = None
@@ -208,7 +210,7 @@ class CameraManager(QObject):
             # fails for any camera.
             from gui_app.sync_encode import SyncEncodeRouter
             router = SyncEncodeRouter(raw_paths, width, height, quality,
-                                      max_lag=kick_max_lag)
+                                      fps=fps, max_lag=kick_max_lag)
             if router.available:
                 router.start()
                 self._router = router
@@ -217,7 +219,8 @@ class CameraManager(QObject):
                 print("[acq] kick-out unavailable, using decoupled encode", flush=True)
         self._set_trigger_mode()
         self._start_grab_threads(raw_paths=raw_paths, display_every=display_every,
-                                 realtime=realtime, width=width, height=height, quality=quality)
+                                 realtime=realtime, width=width, height=height, quality=quality,
+                                 fps=fps)
 
     def stop_acquisition(self) -> list[tuple[int, list[float], list[int]]]:
         """Stop the grab threads and return each camera's

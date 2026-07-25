@@ -105,7 +105,7 @@ class GrabThread(QThread):
                  raw_path: Path = None, display_every: int = 1,
                  downsample: int = 3, realtime: bool = False,
                  width: int = 0, height: int = 0, quality: int = 21,
-                 router=None):
+                 fps: int = 100, router=None):
         super().__init__()
         self._cam_index = cam_index
         self._camera = camera
@@ -116,6 +116,7 @@ class GrabThread(QThread):
         self._width = width
         self._height = height
         self._quality = quality
+        self._fps = fps
         # Real-time kick-out: when set, frames go to this shared router (which
         # gates them through the cross-camera coordinator) instead of a private
         # encoder. The router owns the encoders + the recorded metadata.
@@ -201,7 +202,7 @@ class GrabThread(QThread):
         elif recording and self._realtime:
             try:
                 from gui_app import nvenc
-                enc = nvenc.create_h264_encoder(self._width, self._height, self._quality)
+                enc = nvenc.create_h264_encoder(self._width, self._height, self._quality, fps=self._fps)
                 h264_path = self._raw_path.parent / "stream.h264"
                 h264_fd = os.open(str(h264_path), os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_BINARY)
                 enc_thread = _EncoderThread(

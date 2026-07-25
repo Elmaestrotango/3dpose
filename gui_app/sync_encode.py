@@ -24,7 +24,7 @@ from gui_app.grab_thread import _EncoderThread
 
 class SyncEncodeRouter:
     def __init__(self, raw_paths, width: int, height: int, quality: int,
-                 max_lag: int = 240):
+                 fps: int = 100, max_lag: int = 240):
         self._n = len(raw_paths)
         self._w, self._h, self._q = width, height, quality
         self.max_lag = max_lag  # grab threads read this to size their NV12 ring
@@ -39,7 +39,7 @@ class SyncEncodeRouter:
 
         try:
             for i, rp in enumerate(raw_paths):
-                enc = nvenc.create_h264_encoder(width, height, quality)
+                enc = nvenc.create_h264_encoder(width, height, quality, fps=fps)
                 h264_path = Path(rp).parent / "stream.h264"
                 fd = os.open(str(h264_path),
                              os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_BINARY)

@@ -94,6 +94,7 @@ def _encode_raw(args):
         "-pix_fmt", "yuv420p",
         "-preset", "fast",
         "-qp", str(quality),
+        "-g", str(fps),
         "-bf:v", "0", "-gpu", "0",
         "-loglevel", "warning",
         mp4_path,

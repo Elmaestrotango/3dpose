@@ -54,6 +54,7 @@ def load_error() -> str:
 
 
 def create_h264_encoder(width: int, height: int, qp: int,
+                        fps: int = 100,
                         preset: str = "P3", tuning: str = "low_latency"):
     """Create an NVENC H.264 encoder for NV12 input (CPU input buffer).
 
@@ -66,8 +67,11 @@ def create_h264_encoder(width: int, height: int, qp: int,
     # Tolerate older/newer builds that may not accept every kwarg — but say so:
     # a reduced kwarg set silently changes rate control (constqp -> driver
     # default), i.e. different output quality than the profile asked for.
+    gop = str(fps)
     last_err = None
     for n, kw in enumerate((
+            dict(codec="h264", preset=preset, tuning_info=tuning, rc="constqp", qp=str(qp),
+                 gopLength=gop, idrPeriod=gop),
             dict(codec="h264", preset=preset, tuning_info=tuning, rc="constqp", qp=str(qp)),
             dict(codec="h264", preset=preset, tuning_info=tuning),
             dict(codec="h264"))):

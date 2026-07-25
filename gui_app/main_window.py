@@ -321,7 +321,7 @@ class MainWindow(QMainWindow):
             raw_paths, display_every=display_every,
             realtime=rt, width=self._config.frame_width,
             height=self._config.frame_height, quality=self._config.quality,
-            realtime_kick=kick, kick_max_lag=self._config.kick_max_lag)
+            fps=fps, realtime_kick=kick, kick_max_lag=self._config.kick_max_lag)
 
         print(f"[acq] opening teensy on {self._profile.serial_port}", flush=True)
         self._teensy = TeensyController(port=self._profile.serial_port)
