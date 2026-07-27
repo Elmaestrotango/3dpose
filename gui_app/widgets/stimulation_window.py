@@ -1169,6 +1169,10 @@ class StimulationWindow(QDialog):
             QMessageBox.critical(self, "Upload failed", msg)
             return
         self._uploaded_ino = ino
+        # Retake the port straight away. Reopening resets the board, so letting
+        # the next Record do it would put that flash back into the experiment;
+        # here it lands during Apply, alongside the reset avrdude already did.
+        self._get_serial()
         if self._test_after_upload:
             self._test_after_upload = False
             self._begin_test()

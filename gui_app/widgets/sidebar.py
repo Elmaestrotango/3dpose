@@ -5,12 +5,17 @@ from PyQt5.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QFormLayout, QLineEdit, QLabel,
     QProgressBar, QFrame, QPushButton, QFileDialog, QSlider, QComboBox,
 )
-from PyQt5.QtCore import Qt, pyqtSignal
+from PyQt5.QtCore import Qt, pyqtSignal, QSettings
 from PyQt5.QtGui import QFont, QColor
 
 from gui_app.widgets.toggle_switch import ToggleSwitch
 from gui_app.widgets.coverage_graph import CoverageGraphWidget
 from gui_app.session_config import RigProfile, REPO_ROOT
+
+# Per-machine UI state. The profiles themselves are shared with the 3dface rig
+# via git, so which one is "default" can't live in the repo — it's a property of
+# the machine, not the codebase.
+_SETTINGS = QSettings("Salk", "Panopticon")
 
 
 class SidebarWidget(QWidget):
@@ -255,11 +260,34 @@ class SidebarWidget(QWidget):
     def _on_profile_changed(self, index: int):
         if 0 <= index < len(self._profiles):
             profile = self._profiles[index]
-            if profile.output_dir:
-                self._output_dir = profile.output_dir
-                self._dir_button.setText(self._truncate_path(self._output_dir))
-                self._dir_button.setToolTip(self._output_dir)
+            self._apply_profile_dir(profile)
+            _SETTINGS.setValue("profile_name", profile.name)
             self.profile_changed.emit(profile)
+
+    def _apply_profile_dir(self, profile: RigProfile):
+        if profile.output_dir:
+            self._output_dir = profile.output_dir
+            self._dir_button.setText(self._truncate_path(self._output_dir))
+            self._dir_button.setToolTip(self._output_dir)
+
+    def select_profile(self, name: str) -> bool:
+        """Select a profile by name without re-emitting profile_changed.
+
+        Used at startup to restore the last one used on this machine.
+        """
+        for i, profile in enumerate(self._profiles):
+            if profile.name == name:
+                self._profile_combo.blockSignals(True)
+                self._profile_combo.setCurrentIndex(i)
+                self._profile_combo.blockSignals(False)
+                self._apply_profile_dir(profile)
+                return True
+        return False
+
+    @staticmethod
+    def remembered_profile() -> str:
+        """Name of the profile last selected on this machine ("" if none)."""
+        return _SETTINGS.value("profile_name", "", type=str)
 
     @property
     def current_profile(self) -> RigProfile:

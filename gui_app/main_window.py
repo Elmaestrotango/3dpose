@@ -100,23 +100,29 @@ class MainWindow(QMainWindow):
         self._display_timer.timeout.connect(self._refresh_displays)
         self._display_timer.start(33)
 
-        # Find best profile (first with valid pfs), block signals during selection
+        # Prefer whatever profile this machine used last — the profile list is
+        # shared with the 3dface rig, so alphabetical order picks the wrong one
+        # here. Fall back to the first profile whose .pfs actually exists.
         self._profile = self._sidebar.current_profile
-        for i, prof in enumerate(self._sidebar._profiles):
-            if prof.pfs_path and Path(prof.pfs_path).exists():
-                self._sidebar._profile_combo.blockSignals(True)
-                self._sidebar._profile_combo.setCurrentIndex(i)
-                self._sidebar._profile_combo.blockSignals(False)
-                self._profile = prof
-                if prof.output_dir:
-                    self._sidebar._output_dir = prof.output_dir
-                    self._sidebar._dir_button.setText(self._sidebar._truncate_path(prof.output_dir))
-                    self._sidebar._dir_button.setToolTip(prof.output_dir)
-                break
+        if self._sidebar.select_profile(self._sidebar.remembered_profile()):
+            self._profile = self._sidebar.current_profile
+        else:
+            for prof in self._sidebar._profiles:
+                if prof.pfs_path and Path(prof.pfs_path).exists():
+                    self._sidebar.select_profile(prof.name)
+                    self._profile = prof
+                    break
+        print(f"[acq] profile: {self._profile.name}", flush=True)
+
         self._open_cameras()
         self._size_to_screen()
         self._sidebar.set_status("IDLE", "#888")
         self._run_hardware_check()
+        # Take the serial port now rather than on the first Record. Opening it
+        # resets the Arduino, and during the reset + bootloader every pin floats
+        # — which fires a connected laser. Doing it at launch keeps that flash
+        # out of the experiment. Deferred one tick so the window paints first.
+        QTimer.singleShot(0, self._warm_serial)
 
     def _open_cameras(self):
         """Open cameras for the current profile (synchronous — startup only)."""
@@ -409,7 +415,16 @@ class MainWindow(QMainWindow):
             self._stim_end_timer = None
 
     # ── shared trigger-board link ─────────────────────────────────────────────
-    def _teensy_connection(self) -> TeensyController | None:
+    def _warm_serial(self):
+        """Claim the port at startup so the board's reset lands here.
+
+        Non-fatal: a single attempt, and the lazy path retries properly later.
+        """
+        if self._teensy_connection(retries=1) is None:
+            print(f"[acq] trigger board not reachable on {self._profile.serial_port} "
+                  f"at startup; will retry on first use", flush=True)
+
+    def _teensy_connection(self, retries: int = 10) -> TeensyController | None:
         """The one serial link to the trigger board, kept open for the session.
 
         Opening the port resets the Arduino, and during the reset + bootloader
@@ -424,7 +439,7 @@ class MainWindow(QMainWindow):
             self._teensy = TeensyController(port=self._profile.serial_port)
         if not self._teensy.is_open:
             print(f"[acq] opening teensy on {self._profile.serial_port}", flush=True)
-            if not self._teensy.open():
+            if not self._teensy.open(retries=retries):
                 return None
         return self._teensy
 
