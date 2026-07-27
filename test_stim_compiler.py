@@ -5,10 +5,19 @@ mis-resolved start silently produces no chains, a cycle used to hang the walker
 forever, and a pulse width at or above the period once compiled to a pin that
 never fired. Each of those cost a debugging session, so they are pinned here.
 
-Pure-Python only (no Qt, no serial, no arduino-cli), so it runs anywhere:
+No Qt, no serial, no arduino-cli, so it runs anywhere:
     python test_stim_compiler.py
+
+The per-frame trace tests (10-13) additionally need numpy and skip without it;
+`uv run python test_stim_compiler.py` runs the full set.
 """
 from gui_app import stim_compiler as sc
+
+try:
+    import numpy  # noqa: F401
+    _HAS_NUMPY = True
+except ImportError:                       # keeps 1-9 runnable on a bare python
+    _HAS_NUMPY = False
 
 
 def B(bid, dur=1.0, pin=53, freq=10.0, pw=10.0, start=False, end=False):
@@ -190,6 +199,93 @@ def test_ready_ack():
     print("9) RDY ack emitted from both setup and loop config paths: PASS")
 
 
+# ── per-frame trace (gui_app/stim_trace.py) ──────────────────────────────────
+# Same paradigm semantics, evaluated over time instead of compiled to C. If
+# these two drift apart the trace silently mislabels which frames were stimulated.
+
+def test_trace_locate():
+    from gui_app.stim_trace import locate
+    steps = [{"duration_s": 3.0}, {"duration_s": 3.0}]
+
+    # non-looping: runs once, then the chain is done
+    assert locate(steps, None, 0.0) == (0, 0.0)
+    assert locate(steps, None, 2.999)[0] == 0
+    assert locate(steps, None, 3.0) == (1, 0.0)
+    assert locate(steps, None, 6.0) == (None, None)
+
+    # looping back to 0: repeats forever
+    assert locate(steps, 0, 6.0) == (0, 0.0)
+    assert locate(steps, 0, 7.5) == (0, 1.5)
+    assert locate(steps, 0, 9.0) == (1, 0.0)
+    assert locate(steps, 0, 6000.0) == (0, 0.0)
+
+    # lead-in then loop: step 0 runs once, then 1<->2 cycle
+    three = [{"duration_s": 10.0}, {"duration_s": 2.0}, {"duration_s": 3.0}]
+    assert locate(three, 1, 5.0) == (0, 5.0)      # still in the lead-in
+    assert locate(three, 1, 10.0) == (1, 0.0)
+    assert locate(three, 1, 15.0) == (1, 0.0)     # one cycle later, not back to 0
+    assert locate(three, 1, 13.0) == (2, 1.0)
+    print("10) trace step location incl. loop + lead-in: PASS")
+
+
+def test_trace_ttl_matches_firmware():
+    from gui_app.stim_trace import ttl_level
+    off = {"freq_hz": 0.0, "pulse_width_ms": 10.0}
+    assert ttl_level(off, 0.0) == 0 and ttl_level(off, 1.234) == 0
+    const = {"freq_hz": 10.0, "pulse_width_ms": 100.0}      # pw == period
+    assert ttl_level(const, 0.0) == 1 and ttl_level(const, 4.9) == 1
+    train = {"freq_hz": 10.0, "pulse_width_ms": 10.0}       # 10 ms pulse per 100 ms
+    assert ttl_level(train, 0.0) == 1, "pulse must lead the period, as the sketch does"
+    assert ttl_level(train, 0.005) == 1
+    assert ttl_level(train, 0.015) == 0
+    assert ttl_level(train, 0.100) == 1                     # next period
+    print("11) trace TTL level agrees with the sketch's waveform: PASS")
+
+
+def test_trace_rows_use_blockids_not_frame_index():
+    """Dropped frames must shift time, or every later frame is mislabelled."""
+    import numpy as np
+    from gui_app.stim_trace import build_rows
+    paradigm = {"chains": [{
+        "loops": True, "loops_back_to_step": 0,
+        "steps": [
+            {"pin": 53, "freq_hz": 10.0, "pulse_width_ms": 10.0,
+             "duration_s": 3.0, "mode": "10% duty"},
+            {"pin": 53, "freq_hz": 0.0, "pulse_width_ms": 0.0,
+             "duration_s": 3.0, "mode": "off (pin LOW)"},
+        ]}]}
+
+    # contiguous: blockid 1..600 -> t 0..5.99, flipping at exactly 3 s
+    fields, rows = build_rows(paradigm, np.arange(1, 601), 100.0)
+    assert rows[0]["t_s"] == 0.0 and rows[0]["any_active"] == 1
+    assert rows[299]["any_active"] == 1 and rows[300]["any_active"] == 0
+    assert "pin53_ttl" in fields
+
+    # drop 100 triggers mid-recording: the frame *after* the gap must jump 1 s
+    b = np.concatenate([np.arange(1, 101), np.arange(201, 301)])
+    _f, rows = build_rows(paradigm, b, 100.0)
+    assert rows[99]["t_s"] == 0.99
+    assert rows[100]["t_s"] == 2.00, "gap ignored — trace would drift by 1 s"
+    assert rows[100]["frame"] == 100 and rows[100]["blockid"] == 201
+    print("12) trace maps frames via block IDs, so drops shift time: PASS")
+
+
+def test_trace_unwraps_16bit_blockids():
+    """Recordings past ~11 min wrap at 65535; without unwrapping, time restarts."""
+    import numpy as np
+    from gui_app.stim_trace import build_rows
+    paradigm = {"chains": [{
+        "loops": False, "loops_back_to_step": None,
+        "steps": [{"pin": 53, "freq_hz": 20.0, "pulse_width_ms": 20.0,
+                   "duration_s": 1e6, "mode": "40% duty"}]}]}
+    b = np.concatenate([np.arange(65530, 65536), np.arange(1, 7)])
+    _f, rows = build_rows(paradigm, b, 100.0)
+    times = [r["t_s"] for r in rows]
+    assert times == sorted(times), f"time went backwards across the wrap: {times}"
+    assert abs(times[-1] - times[0] - 0.11) < 1e-6
+    print("13) trace unwraps 16-bit block-ID rollover: PASS")
+
+
 def main():
     test_start_resolution()
     test_chain_extraction_terminates()
@@ -200,6 +296,14 @@ def main():
     test_describe()
     test_generated_sketch_is_wellformed()
     test_ready_ack()
+    if _HAS_NUMPY:
+        test_trace_locate()
+        test_trace_ttl_matches_firmware()
+        test_trace_rows_use_blockids_not_frame_index()
+        test_trace_unwraps_16bit_blockids()
+    else:
+        print("10-13) per-frame trace tests SKIPPED — no numpy in this "
+              "interpreter; rerun with `uv run python test_stim_compiler.py`")
     print("\nALL STIM COMPILER TESTS PASS")
 
 

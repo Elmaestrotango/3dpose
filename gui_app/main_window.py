@@ -16,6 +16,7 @@ from gui_app.encode_worker import EncodeWorker
 from gui_app.align_worker import AlignWorker
 from gui_app.ui_workers import CallableWorker
 from gui_app import alignment
+from gui_app import stim_trace
 from gui_app.calibration_worker import CalibrationWorker
 from gui_app.hardware_check import HardwareCheckThread, format_report
 from gui_app.coverage_worker import CoverageWorker
@@ -385,6 +386,22 @@ class MainWindow(QMainWindow):
             # Provenance must never take the recording down with it.
             print(f"[stim] could not save paradigm: {e}", flush=True)
 
+    def _write_stim_trace(self):
+        """Emit the per-frame stimulus trace beside the videos.
+
+        Makes the frame -> stimulation mapping explicit in the data instead of
+        something every downstream analysis has to re-derive from the paradigm.
+        """
+        if self._video_dir is None:
+            return
+        try:
+            out, msg = stim_trace.write_trace(self._video_dir, self._acq_fps or 100)
+            print(f"[stim] trace: {msg}" if out else f"[stim] no trace: {msg}",
+                  flush=True)
+        except Exception as e:
+            # Never let bookkeeping take down the save path.
+            print(f"[stim] could not write trace: {e}", flush=True)
+
     def _arm_stim_autostop(self):
         """Stop the recording when the paradigm's 'Ending' block finishes.
 
@@ -517,6 +534,7 @@ class MainWindow(QMainWindow):
             cam_results = self._camera_mgr.stop_acquisition()
             self._save_frametimes(cam_results)
             self._config.save_metadata()
+            self._write_stim_trace()   # needs blockids, so after _save_frametimes
             self._camera_mgr.resume_preview()
 
         self._cam_op = CallableWorker(_finalize)

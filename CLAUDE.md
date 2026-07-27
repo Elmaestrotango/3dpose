@@ -84,6 +84,29 @@ time, firmware SHA-256, `matches_uploaded_firmware`) and **`stim_paradigm.ino`**
 `matches_uploaded_firmware: null` means nothing was uploaded that GUI session —
 the board's contents are unknown, not wrong.
 
+### Per-frame stimulus trace
+
+`gui_app/stim_trace.py` writes **`stim_trace.csv`** beside the videos at stop
+(`_write_stim_trace`), one row per recorded frame: `frame, blockid, t_s,
+any_active`, per-chain step/active/freq/pw, and a modelled `pin<N>_ttl`.
+`3_stim_trace.py` regenerates it for older recordings (`--all` for a whole tree).
+
+The mapping is exact because one Arduino drives both: the sketch sets
+`FRAME_START` and calls `initStim()` microseconds apart, so stim t=0 *is* trigger
+t=0, no host clock involved. Two things that must not be simplified away:
+- **`t = (unwrapped_blockid - 1) / fps`, never frame index.** Cameras drop frames
+  independently, so frame *i* is not trigger *i*; using the index silently drifts
+  the whole trace after the first gap.
+- **Block IDs wrap at 65535** (~11 min at 100 fps) unless the camera negotiated
+  64-bit IDs — reuse `alignment._unwrap_blockids`.
+
+**It is derived, not observed.** It says what the paradigm should have delivered
+given the uploaded firmware; it cannot know the laser was keyed on, the interlock
+in, or the beam unblocked. For a real witness put the laser's sync LED in a
+camera's field of view — but note that at 100 fps with a ~2 ms exposure you
+resolve block envelopes, not individual pulses (a 20 Hz train aliases). Per-pulse
+ground truth needs a photodiode on a spare Arduino input.
+
 ### Laser safety and the reset window (RESOLVED on the rig 2026-07-27)
 
 `allStimLow()` runs first thing in `setup()`, but there is a window it cannot
@@ -176,8 +199,11 @@ safety and all stim. Kept only for the legacy `acquire.py` path.
 Plain scripts, no pytest — run directly:
 - `python test_stim_compiler.py` — stim graph → sketch. Start resolution,
   cycle-safe chain extraction, integer µs encoding, safe-pin boot order, pin
-  conflicts, end/test durations, generated-sketch structure, the RDY ack. Pure
-  Python, runs anywhere. **Run this after touching `stim_compiler.py`.**
+  conflicts, end/test durations, generated-sketch structure, the RDY ack, and the
+  per-frame trace (loop arithmetic, block-ID mapping, 16-bit unwrap). Tests 1-9
+  run on a bare python; 10-13 need numpy and skip without it, so prefer
+  `uv run python test_stim_compiler.py`. **Run after touching `stim_compiler.py`
+  or `stim_trace.py`.**
 - `python test_serial_handshake.py` — the four trigger-board handshake outcomes
   (confirmed / retry-after-reset / legacy firmware / regression). Stubs pyserial,
   so it needs no COM port. **Run this after touching `serial_controller.py`** —
