@@ -84,7 +84,7 @@ time, firmware SHA-256, `matches_uploaded_firmware`) and **`stim_paradigm.ino`**
 `matches_uploaded_firmware: null` means nothing was uploaded that GUI session —
 the board's contents are unknown, not wrong.
 
-### Laser safety and the reset window (OPEN ITEM as of 2026-07-26)
+### Laser safety and the reset window (RESOLVED on the rig 2026-07-27)
 
 `allStimLow()` runs first thing in `setup()`, but there is a window it cannot
 cover: **during MCU reset and the ~1–2 s bootloader wait every GPIO is high-Z**,
@@ -101,14 +101,23 @@ recording — the board ignored the config and emitted zero triggers
 board to `setup()` with a cleared serial RX buffer. A comment in
 `serial_controller.open()` marks it so nobody retries.
 
-**What replaced it (2026-07-27): one long-lived connection + an RDY ack.** The
-reset isn't defeated, it's *relocated*. `main_window` owns a single
-`TeensyController` (`_teensy_connection()`), opened on first use and held until
-quit — `_stop_acquisition` no longer closes it. So the board resets at GUI launch
-and on Apply (arduino-cli must reset to reach the bootloader), never at the start
-of a recording. Apply calls `release_serial_port()` to hand COM3 to arduino-cli
-and it reopens on demand; the stim editor's Test borrows the same link rather
+**What replaced it (2026-07-27): one long-lived connection + an RDY ack.
+Verified flash-free on the rig.** The reset isn't defeated, it's *relocated*.
+`main_window` owns a single `TeensyController` (`_teensy_connection()`), claimed
+at startup by `_warm_serial()` and held until quit — `_stop_acquisition` no
+longer closes it. So the board resets at GUI launch and on Apply (arduino-cli
+must reset to reach the bootloader), **never at the start of a recording**.
+
+Both of those must stay eager. Opening the port lazily is not enough: first use
+*is* the first Record, so the flash merely moves to recording #1 (observed
+2026-07-27). Likewise Apply calls `release_serial_port()` for arduino-cli and
+must reclaim the port in `_on_upload_done` — otherwise the next Record reopens it
+and the flash comes back. The stim editor's Test borrows the same link rather
 than opening its own.
+
+**A pulldown resistor turned out not to be needed**, and would not have worked
+anyway (see below). The remaining flashes at launch and Apply are outside the
+experiment and accepted. Fit the interlock if you want a hard gate.
 
 Because a start command can now land in `loop()`'s reconfigure branch instead of
 a freshly-reset `setup()`, **every start is confirmed**. The sketch prints
@@ -141,16 +150,17 @@ it). This covers every case software cannot: record reset, Apply reset, power-up
 unplugged cable. Measure pin-to-GND with the board held in reset; if an internal
 pullup in the driver holds the divider above ~0.8 V, drop to 2.2 kΩ.
 
-**Measured on the rig 2026-07-27: a pulldown may not be viable here.** The CNI
-PSU-III's MOD input has an internal pullup far stronger than 6.8 kΩ — shorting
-MOD to ground kills the beam, but 6.8 kΩ across it does nothing. Beating a pullup
-that stiff needs a low enough pulldown that the Arduino would exceed its 20 mA
-per-pin limit driving high (220 Ω ≈ 23 mA). Get `V_open` and `I_short` on the MOD
-input before fitting anything; if `I_short` is more than a few mA, no safe
-resistor exists and the options are the PSU's **interlock** (pulling it stops the
-laser) or a normally-closed relay across MOD/GND held open by a dedicated pin
-with a 10 kΩ gate pulldown — that resistor works because a MOSFET gate really is
-high-impedance, unlike this MOD input.
+**Measured on the rig 2026-07-27: a pulldown does NOT work here — don't retry
+it.** The CNI PSU-III's MOD input has an internal pullup far stronger than
+6.8 kΩ. Shorting MOD to ground kills the beam, but 6.8 kΩ across it does nothing.
+Beating a pullup that stiff needs a resistor low enough that the Arduino would
+exceed its 20 mA per-pin limit driving high (220 Ω ≈ 23 mA), so there is no safe
+value. The software fix above is what actually solved it.
+
+If a hard gate is ever wanted, the options are the PSU's **interlock** (pulling
+it stops the laser) or a normally-closed relay across MOD/GND held open by a
+dedicated pin with a 10 kΩ gate pulldown — that resistor works because a MOSFET
+gate really is high-impedance, unlike this MOD input.
 
 The PSU-III's rear toggles are TTL/Analog and CUR/R1/R2. There is **no TTL−
 position**, so inverting the polarity to exploit the pullup is not available.
