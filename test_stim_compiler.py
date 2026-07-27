@@ -176,6 +176,20 @@ def test_generated_sketch_is_wellformed():
     print("8) generated sketch structure + camera protocol intact: PASS")
 
 
+def test_ready_ack():
+    """The host gates recording on this ack, so both config paths must emit it."""
+    ino = sc.compile_ino([B("A", 5)], [], [53])
+    assert 'Serial.print(F("RDY "));' in ino
+    setup = ino.split("void setup()")[1].split("// ===== LOOP")[0]
+    loop = ino.split("void loop()")[1]
+    for name, body in (("setup", setup), ("loop", loop)):
+        assert "announceReady();" in body, f"no ack from the {name} config path"
+        # Must precede FRAME_START or the ~1 ms print skews the first frame.
+        assert body.index("announceReady();") < body.index("FRAME_START = micros();"), \
+            f"{name}: ack printed after the timing reference is taken"
+    print("9) RDY ack emitted from both setup and loop config paths: PASS")
+
+
 def main():
     test_start_resolution()
     test_chain_extraction_terminates()
@@ -185,6 +199,7 @@ def main():
     test_durations()
     test_describe()
     test_generated_sketch_is_wellformed()
+    test_ready_ack()
     print("\nALL STIM COMPILER TESTS PASS")
 
 

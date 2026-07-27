@@ -310,6 +310,17 @@ void camsHigh() {{
   interrupts();
 }}
 
+// Handshake ack. The host blocks on this before letting the cameras roll: a
+// mis-parsed config otherwise looks identical to a good start and yields a
+// recording with no triggers at all (happened 2026-07-26). Emitted from BOTH
+// setup() and the loop() reconfigure branch, so it confirms either path.
+void announceReady() {{
+  Serial.print(F("RDY "));
+  Serial.print(N_CAMS);
+  Serial.print(' ');
+  Serial.println((long)FPS_OUT);
+}}
+
 // ===== STIM HELPERS =====
 // pinMode first, then LOW: writing LOW to a pin still configured as INPUT only
 // disables the pullup and leaves it floating -- which is what turns the laser on.
@@ -413,6 +424,7 @@ void setup() {{
   FRAME_PERIOD = (FPS_OUT > 0) ? (unsigned long)(1e6f / FPS_OUT) : 0xFFFFFFFFUL;
   delay(500);
   while (Serial.available()) Serial.parseFloat();
+  announceReady();       // before FRAME_START so the ~1 ms print can't skew it
   FRAME_START = micros();
   if (NUM_CHAINS > 0 && FPS_OUT > 0) initStim();
 }}
@@ -428,6 +440,7 @@ void loop() {{
     FRAME_PERIOD = (FPS_OUT > 0) ? (unsigned long)(1e6f / FPS_OUT) : 0xFFFFFFFFUL;
     delay(500);
     while (Serial.available()) Serial.parseFloat();
+    announceReady();
     FRAME_START = micros();
     if (NUM_CHAINS > 0 && FPS_OUT > 0) initStim();
   }}

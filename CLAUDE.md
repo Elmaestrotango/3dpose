@@ -98,25 +98,64 @@ must reset to reach the bootloader), and once at power-up.
 recording — the board ignored the config and emitted zero triggers
 (`Total_Packet_Count: 0` on all six cameras; 15 s "recorded", empty
 `stream.h264`, 0 frames encoded). **The reset is load-bearing**: it returns the
-board to `setup()` with a cleared serial RX buffer. Reverted; a comment in
+board to `setup()` with a cleared serial RX buffer. A comment in
 `serial_controller.open()` marks it so nobody retries.
+
+**What replaced it (2026-07-27): one long-lived connection + an RDY ack.** The
+reset isn't defeated, it's *relocated*. `main_window` owns a single
+`TeensyController` (`_teensy_connection()`), opened on first use and held until
+quit — `_stop_acquisition` no longer closes it. So the board resets at GUI launch
+and on Apply (arduino-cli must reset to reach the bootloader), never at the start
+of a recording. Apply calls `release_serial_port()` to hand COM3 to arduino-cli
+and it reopens on demand; the stim editor's Test borrows the same link rather
+than opening its own.
+
+Because a start command can now land in `loop()`'s reconfigure branch instead of
+a freshly-reset `setup()`, **every start is confirmed**. The sketch prints
+`RDY <n_cams> <fps>` from both config paths (`announceReady()`), and
+`start_triggers()` returns a bool:
+
+1. ack on the open connection → proceed, no reset, no flash
+2. no ack → close/reopen (forcing a reset) and retry
+3. still no ack, and this board has *never* acked → assume pre-RDY firmware
+   (stock `trigger.ino`) and proceed; it was just reset, which is exactly the old
+   behaviour, so camera-only rigs are unaffected
+4. still no ack, but the board *has* acked before → real fault, return False;
+   `_start_acquisition` rolls the cameras back and refuses rather than recording
+   an empty session
+
+That 3-vs-4 distinction is the whole safety property — conflating them either
+locks legacy firmware out of recording or lets the zero-trigger bug through
+again. `test_serial_handshake.py` pins all four branches.
+
+The config command is now newline-terminated, which ends the sketch's final
+`parseFloat()` immediately instead of burning its 1 s timeout.
+
+Quitting always sends `stop_triggers` if the port is open (not just mid-
+acquisition), so closing the GUI can never leave a paradigm or laser running.
 
 **The fix is hardware: a 10 kΩ pulldown from the stim pin to GND** — in parallel
 with the driver input, never in series (a bare wire would clamp the pin at 0 V so
 it could never fire, and would pull ~200 mA through the output driver and destroy
 it). This covers every case software cannot: record reset, Apply reset, power-up,
 unplugged cable. Measure pin-to-GND with the board held in reset; if an internal
-pullup in the driver holds the divider above ~0.8 V, drop to 2.2 kΩ (5 mA at 1 kΩ
-is still well inside the AVR's 20 mA budget). **Not yet fitted.**
+pullup in the driver holds the divider above ~0.8 V, drop to 2.2 kΩ.
 
-If the reset ever does need to move (open the port once at startup / after Apply
-and keep it open), it needs a firmware **ack** first — the sketch echoing what it
-parsed and `start_triggers` verifying before the cameras roll. `loop()`'s
-reconfigure branch is exactly what failed above, and under a persistent
-connection it would fail on the *second* recording of a session rather than the
-first, which is a worse failure mode. The generated sketch is currently mute
-(the diagnostics from `trigger.ino` were dropped because Python never reads),
-which is why that failure was unfalsifiable from the log.
+**Measured on the rig 2026-07-27: a pulldown may not be viable here.** The CNI
+PSU-III's MOD input has an internal pullup far stronger than 6.8 kΩ — shorting
+MOD to ground kills the beam, but 6.8 kΩ across it does nothing. Beating a pullup
+that stiff needs a low enough pulldown that the Arduino would exceed its 20 mA
+per-pin limit driving high (220 Ω ≈ 23 mA). Get `V_open` and `I_short` on the MOD
+input before fitting anything; if `I_short` is more than a few mA, no safe
+resistor exists and the options are the PSU's **interlock** (pulling it stops the
+laser) or a normally-closed relay across MOD/GND held open by a dedicated pin
+with a 10 kΩ gate pulldown — that resistor works because a MOSFET gate really is
+high-impedance, unlike this MOD input.
+
+The PSU-III's rear toggles are TTL/Analog and CUR/R1/R2. There is **no TTL−
+position**, so inverting the polarity to exploit the pullup is not available.
+Stay on TTL: analog mode maps 0–5 V onto output power, which would make stim
+power depend on the Arduino's exact rail voltage.
 
 `campy/campy/trigger/trigger.ino` is **superseded** and no longer what the board
 runs. It has no `stim_safe_pins` boot guard, so re-flashing it drops the laser
@@ -127,8 +166,12 @@ safety and all stim. Kept only for the legacy `acquire.py` path.
 Plain scripts, no pytest — run directly:
 - `python test_stim_compiler.py` — stim graph → sketch. Start resolution,
   cycle-safe chain extraction, integer µs encoding, safe-pin boot order, pin
-  conflicts, end/test durations, generated-sketch structure. Pure Python, runs
-  anywhere. **Run this after touching `stim_compiler.py`.**
+  conflicts, end/test durations, generated-sketch structure, the RDY ack. Pure
+  Python, runs anywhere. **Run this after touching `stim_compiler.py`.**
+- `python test_serial_handshake.py` — the four trigger-board handshake outcomes
+  (confirmed / retry-after-reset / legacy firmware / regression). Stubs pyserial,
+  so it needs no COM port. **Run this after touching `serial_controller.py`** —
+  it is the guard against silently recording zero frames.
 - `python test_frame_sync.py` — kick-out coordinator == post-hoc intersection.
 - `python test_sync_router.py` — encoder router smoke test (needs NVENC).
 

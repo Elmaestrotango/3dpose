@@ -329,20 +329,21 @@ class MainWindow(QMainWindow):
             height=self._config.frame_height, quality=self._config.quality,
             fps=fps, realtime_kick=kick, kick_max_lag=self._config.kick_max_lag)
 
-        print(f"[acq] opening teensy on {self._profile.serial_port}", flush=True)
-        self._teensy = TeensyController(port=self._profile.serial_port)
-        if not self._teensy.open():
-            # Roll back: cameras are already grabbing in trigger mode — without
-            # this they'd be stuck (no triggers, no preview, toggle checked).
-            self._camera_mgr.stop_acquisition()
-            self._camera_mgr.resume_preview()
-            self._sidebar.reset_toggles()
-            self._on_camera_error(
+        teensy = self._teensy_connection()
+        if teensy is None:
+            self._rollback_acquisition(
                 f"Could not open serial port {self._profile.serial_port}.\n"
                 "Close Arduino Serial Monitor / other apps holding the port and retry.")
             return
         print(f"[acq] sending start_triggers pins={self._profile.trigger_pins} fps={fps}", flush=True)
-        self._teensy.start_triggers(self._profile.trigger_pins, fps)
+        if not teensy.start_triggers(self._profile.trigger_pins, fps):
+            # The board never confirmed the config, even after a forced reset.
+            # Recording now would produce a full-length session with no frames.
+            self._rollback_acquisition(
+                "The trigger board did not acknowledge the start command, so no "
+                "triggers would be sent.\n\nCheck the Arduino is connected and "
+                "running the Panopticon sketch, then retry.")
+            return
         print(f"[acq] start_acquisition done", flush=True)
 
         self._sidebar.set_fields_editable(False)
@@ -407,6 +408,40 @@ class MainWindow(QMainWindow):
             self._stim_end_timer.stop()
             self._stim_end_timer = None
 
+    # ── shared trigger-board link ─────────────────────────────────────────────
+    def _teensy_connection(self) -> TeensyController | None:
+        """The one serial link to the trigger board, kept open for the session.
+
+        Opening the port resets the Arduino, and during the reset + bootloader
+        every pin floats — long enough for a connected laser to fire. Holding
+        the connection open means that only happens at first use and on upload,
+        never at the start of a recording.
+        """
+        if self._teensy is not None and self._teensy.port != self._profile.serial_port:
+            self._teensy.close()          # profile switched to a different port
+            self._teensy = None
+        if self._teensy is None:
+            self._teensy = TeensyController(port=self._profile.serial_port)
+        if not self._teensy.is_open:
+            print(f"[acq] opening teensy on {self._profile.serial_port}", flush=True)
+            if not self._teensy.open():
+                return None
+        return self._teensy
+
+    def release_serial_port(self):
+        """Hand COM3 back so arduino-cli can upload; it reopens on next use."""
+        if self._teensy is not None and self._teensy.is_open:
+            print("[acq] releasing serial port for upload", flush=True)
+            self._teensy.close()
+
+    def _rollback_acquisition(self, message: str):
+        """Undo a half-started acquisition. The cameras are already grabbing in
+        trigger mode, so without this they sit waiting for triggers forever."""
+        self._camera_mgr.stop_acquisition()
+        self._camera_mgr.resume_preview()
+        self._sidebar.reset_toggles()
+        self._on_camera_error(message)
+
     def _start_coverage_hud(self):
         """Spin up the live ChArUco coverage graph for this calibration run."""
         self._detector = None
@@ -446,8 +481,9 @@ class MainWindow(QMainWindow):
 
     def _stop_acquisition(self):
         self._cancel_stim_autostop()
+        # Stop the triggers but KEEP the port open: reopening it would reset the
+        # board at the start of the next recording and flash a connected laser.
         self._teensy.stop_triggers(self._profile.trigger_pins)
-        self._teensy.close()
 
         self._stop_coverage_hud()
         if self._detector is not None and self._detector.codet_frames:
@@ -724,6 +760,8 @@ class MainWindow(QMainWindow):
                 get_fps=lambda: self._profile.frame_rate,
                 is_busy=lambda: self._state in (State.RECORDING, State.CALIBRATING),
                 get_safe_pins=lambda: self._profile.stim_safe_pins,
+                get_serial=self._teensy_connection,
+                release_serial=self.release_serial_port,
                 parent=self,
             )
         self._stim_window.show()
@@ -754,12 +792,16 @@ class MainWindow(QMainWindow):
 
         self._display_timer.stop()
         self._stop_coverage_hud()
-        if self._state in (State.CALIBRATING, State.RECORDING):
-            try:
-                self._teensy.stop_triggers(self._profile.trigger_pins)
+        # Always stand the board down, not just mid-acquisition: stop_triggers
+        # drives the stim pins LOW as well as the camera pins, so quitting can
+        # never leave a paradigm — or a laser — running.
+        try:
+            if self._teensy is not None:
+                if self._teensy.is_open:
+                    self._teensy.stop_triggers(self._profile.trigger_pins)
                 self._teensy.close()
-            except Exception:
-                pass
+        except Exception:
+            pass
 
         if busy:
             self._abandon_and_cleanup()

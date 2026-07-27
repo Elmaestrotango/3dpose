@@ -806,6 +806,8 @@ class StimulationWindow(QDialog):
                  is_busy: Callable[[], bool] = lambda: False,
                  get_safe_pins: Callable[[], list] = lambda: list(
                      stim_compiler.DEFAULT_SAFE_LOW_PINS),
+                 get_serial: Callable[[], object] = lambda: None,
+                 release_serial: Callable[[], None] = lambda: None,
                  parent=None):
         super().__init__(parent)
         self._get_port       = get_port
@@ -813,6 +815,9 @@ class StimulationWindow(QDialog):
         self._get_fps        = get_fps
         self._is_busy        = is_busy
         self._get_safe_pins  = get_safe_pins
+        self._get_serial     = get_serial
+        self._release_serial = release_serial
+        self._test_owns_serial = False
         self._selected_block: BlockItem | None   = None
         self._upload_worker:  _UploadWorker | None = None
         # The .ino last successfully uploaded, so Test can tell when the canvas
@@ -1146,6 +1151,8 @@ class StimulationWindow(QDialog):
         self._apply_btn.setEnabled(False)
         self._test_btn.setEnabled(False)
         self._set_status("Compiling + uploading… (~30 s)")
+        # arduino-cli needs COM3 to itself; the main window reopens it on demand.
+        self._release_serial()
         self._upload_worker = _UploadWorker(ino, self._get_port())
         self._upload_worker.done.connect(self._on_upload_done)
         self._upload_worker.start()
@@ -1206,18 +1213,33 @@ class StimulationWindow(QDialog):
 
     def _begin_test(self):
         port = self._get_port()
-        self._test_serial = TeensyController(port=port)
-        if not self._test_serial.open():
-            self._test_serial = None
-            self._set_status(f"Could not open {port}.", error=True)
-            QMessageBox.critical(
-                self, "Serial port",
-                f"Could not open {port}.\nClose the Arduino Serial Monitor or any "
-                f"other app holding it.")
-            return
+        # Prefer the main window's shared link so we don't reset the board (and
+        # flash the laser) just to run a test; fall back to our own connection
+        # when the editor is used standalone.
+        shared = self._get_serial()
+        if shared is not None:
+            self._test_serial, self._test_owns_serial = shared, False
+        else:
+            self._test_serial = TeensyController(port=port)
+            self._test_owns_serial = True
+            if not self._test_serial.open():
+                self._test_serial = None
+                self._set_status(f"Could not open {port}.", error=True)
+                QMessageBox.critical(
+                    self, "Serial port",
+                    f"Could not open {port}.\nClose the Arduino Serial Monitor or "
+                    f"any other app holding it.")
+                return
         # Zero camera pins: the sketch's cam loops iterate over nothing, so the
         # paradigm runs on its own with no TTLs going out to the cameras.
-        self._test_serial.start_triggers([], int(self._get_fps()))
+        if not self._test_serial.start_triggers([], int(self._get_fps())):
+            self._end_test("Board did not acknowledge the test command.")
+            QMessageBox.critical(
+                self, "No response",
+                "The trigger board did not acknowledge the start command, so the "
+                "paradigm would not run.\n\nCheck the Arduino is connected and "
+                "running the Panopticon sketch.")
+            return
         dur = stim_compiler.test_duration_s(*self._canvas.get_workflow())
         # Absolute deadline rather than a per-tick subtraction, so a slow UI
         # thread can't stretch the run.
@@ -1245,8 +1267,10 @@ class StimulationWindow(QDialog):
             self._test_timer = None
         if self._test_serial is not None:
             self._test_serial.stop_triggers([])
-            self._test_serial.close()
+            if self._test_owns_serial:      # never close the main window's link
+                self._test_serial.close()
             self._test_serial = None
+            self._test_owns_serial = False
         self._test_end_at = None
         self._test_btn.setText("Test")
         self._apply_btn.setEnabled(True)
