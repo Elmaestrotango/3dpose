@@ -1,4 +1,5 @@
 """Main application window — wires cameras, sidebar, state machine, and encoding."""
+import json
 import shutil
 from datetime import datetime
 import numpy as np
@@ -21,6 +22,7 @@ from gui_app.coverage_worker import CoverageWorker
 from gui_app.session_config import SessionConfig, RigProfile
 from gui_app.widgets.camera_grid import CameraGridWidget
 from gui_app.widgets.sidebar import SidebarWidget
+from gui_app.widgets.stimulation_window import StimulationWindow
 
 try:
     from gui_app.board_detector import BoardDetector
@@ -87,8 +89,12 @@ class MainWindow(QMainWindow):
         self._sidebar.record_toggled.connect(self._on_record_toggle)
         self._sidebar.run_calibration_clicked.connect(self._on_run_calibration)
         self._sidebar.snapshot_clicked.connect(self._on_snapshot)
+        self._sidebar.stimulation_clicked.connect(self._on_stimulation)
         self._sidebar.profile_changed.connect(self._on_profile_changed)
         self._camera_mgr.error.connect(self._on_camera_error)
+
+        self._stim_window: StimulationWindow | None = None
+        self._stim_end_timer: QTimer | None = None
 
         self._display_timer = QTimer()
         self._display_timer.timeout.connect(self._refresh_displays)
@@ -347,6 +353,59 @@ class MainWindow(QMainWindow):
         else:
             self._state = State.RECORDING
             self._sidebar.set_status("RECORDING", "#ff4444")
+            self._save_stim_paradigm()
+            self._arm_stim_autostop()
+
+    def _save_stim_paradigm(self):
+        """Write the stimulus paradigm beside the video.
+
+        Without this the only record of what the animal received is whatever the
+        user happened to Save by hand, so a recording could not be interpreted
+        after the fact.
+        """
+        if self._stim_window is None:
+            return
+        try:
+            blocks, _edges = self._stim_window.get_workflow()
+            if not blocks:
+                return
+            (self._video_dir / "stim_paradigm.json").write_text(
+                json.dumps(self._stim_window.provenance(), indent=2))
+            (self._video_dir / "stim_paradigm.ino").write_text(
+                self._stim_window.firmware_source(), encoding="utf-8")
+            print(f"[stim] paradigm saved to {self._video_dir}", flush=True)
+        except Exception as e:
+            # Provenance must never take the recording down with it.
+            print(f"[stim] could not save paradigm: {e}", flush=True)
+
+    def _arm_stim_autostop(self):
+        """Stop the recording when the paradigm's 'Ending' block finishes.
+
+        The stim sequence is baked into the sketch and starts on the same serial
+        command as the triggers, so counting down from here is within a few ms of
+        the Arduino's own clock.
+        """
+        if self._stim_window is None:
+            return
+        secs = self._stim_window.end_time_s()
+        if not secs or secs <= 0:
+            return
+        self._stim_end_timer = QTimer(self)
+        self._stim_end_timer.setSingleShot(True)
+        self._stim_end_timer.timeout.connect(self._on_stim_end)
+        self._stim_end_timer.start(int(secs * 1000))
+        print(f"[stim] auto-stop armed: {secs:g}s", flush=True)
+
+    def _on_stim_end(self):
+        self._stim_end_timer = None
+        if self._state == State.RECORDING:
+            print("[stim] end block reached — stopping recording", flush=True)
+            self._sidebar.stop_record()
+
+    def _cancel_stim_autostop(self):
+        if self._stim_end_timer is not None:
+            self._stim_end_timer.stop()
+            self._stim_end_timer = None
 
     def _start_coverage_hud(self):
         """Spin up the live ChArUco coverage graph for this calibration run."""
@@ -386,6 +445,7 @@ class MainWindow(QMainWindow):
             pass
 
     def _stop_acquisition(self):
+        self._cancel_stim_autostop()
         self._teensy.stop_triggers(self._profile.trigger_pins)
         self._teensy.close()
 
@@ -655,6 +715,19 @@ class MainWindow(QMainWindow):
                 print(f"[snapshot] {cam} failed: {e}", flush=True)
         self.statusBar().showMessage(
             f"Snapshot: saved {saved}/{len(frames)} cameras → {out_dir}")
+
+    def _on_stimulation(self):
+        if self._stim_window is None:
+            self._stim_window = StimulationWindow(
+                get_port=lambda: self._profile.serial_port,
+                get_output_dir=lambda: self._sidebar.output_dir,
+                get_fps=lambda: self._profile.frame_rate,
+                is_busy=lambda: self._state in (State.RECORDING, State.CALIBRATING),
+                get_safe_pins=lambda: self._profile.stim_safe_pins,
+                parent=self,
+            )
+        self._stim_window.show()
+        self._stim_window.raise_()
 
     def _on_camera_error(self, msg: str):
         QMessageBox.critical(self, "Error", msg)

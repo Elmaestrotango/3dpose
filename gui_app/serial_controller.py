@@ -12,6 +12,14 @@ class TeensyController:
     def open(self, retries: int = 10) -> bool:
         for _ in range(retries):
             try:
+                # NOTE: opening the port pulses DTR, which auto-resets the Mega.
+                # That reset is LOAD-BEARING: the board re-enters setup() with a
+                # clean serial RX buffer and blocks on the handshake. Suppressing
+                # it (dtr=False before open) to avoid the laser flash during the
+                # bootloader's high-Z window was tried on 2026-07-26 and silently
+                # broke recording — the board ignored the config and produced zero
+                # triggers (Total_Packet_Count 0 on all six cameras). The flash is
+                # a hardware problem: fit a pulldown on the stim pin instead.
                 self._ser = serial.Serial(port=self._port, baudrate=self._baudrate, timeout=0.1)
                 time.sleep(1.0)
                 return True

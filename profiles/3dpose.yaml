@@ -18,3 +18,8 @@ serial_port: COM3
 trigger_pins: [2, 4, 6, 8, 10, 12]
 
 gige_driver: socket          # socket = user-space w/ reliable packet resends (proven). filter = in-kernel pylon GigE Vision driver: less CPU but silently dropped ~23% of frames w/ default resend settings (2026-06-12)
+
+# Optostim pins forced LOW at boot (before the serial handshake) so a powered
+# laser driver never sees a floating pin. Pin 53 = laser. Workflow pins are
+# added automatically; this list is the floor.
+stim_safe_pins: [53]

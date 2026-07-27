@@ -16,3 +16,7 @@ board_config: "configs/boards/charuco_5x5_3dface.yaml"
 
 serial_port: COM3
 trigger_pins: [2, 4, 6, 8, 10, 12]
+
+# No optostim hardware on this rig. Add the laser/LED pin here if that changes —
+# listed pins are driven LOW from boot so the driver never sees a floating pin.
+stim_safe_pins: []

@@ -18,6 +18,7 @@ class SidebarWidget(QWidget):
     record_toggled = pyqtSignal(bool)
     run_calibration_clicked = pyqtSignal()
     snapshot_clicked = pyqtSignal()
+    stimulation_clicked = pyqtSignal()
     profile_changed = pyqtSignal(object)
 
     def __init__(self, default_output_dir: str = str(REPO_ROOT / "data"), parent=None):
@@ -142,6 +143,16 @@ class SidebarWidget(QWidget):
         )
         self._snapshot_btn.clicked.connect(self.snapshot_clicked.emit)
         layout.addWidget(self._snapshot_btn)
+
+        self._stim_btn = QPushButton("Stimulation")
+        self._stim_btn.setToolTip("Open the stimulus paradigm editor")
+        self._stim_btn.setStyleSheet(
+            "QPushButton { background: #2a1a3a; color: #cc88ee; border: 1px solid #553366; "
+            "border-radius: 3px; padding: 6px 8px; font-size: 11px; font-weight: bold; }"
+            "QPushButton:hover { background: #3a2050; border-color: #8855aa; }"
+        )
+        self._stim_btn.clicked.connect(self.stimulation_clicked.emit)
+        layout.addWidget(self._stim_btn)
 
         # Live ChArUco coverage graph — shown only during calibration.
         self._coverage_graph = CoverageGraphWidget()
@@ -302,6 +313,10 @@ class SidebarWidget(QWidget):
     def set_toggles_enabled(self, enabled: bool):
         self._calibrate_toggle.setEnabled(enabled)
         self._record_toggle.setEnabled(enabled)
+
+    def stop_record(self):
+        """Flip Record off programmatically — emits record_toggled like a click."""
+        self._record_toggle.setChecked(False)
 
     def reset_toggles(self):
         self._calibrate_toggle.setChecked(False)

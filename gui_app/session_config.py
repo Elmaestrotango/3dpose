@@ -39,6 +39,12 @@ class RigProfile:
     board_config: str = ""
     serial_port: str = "COM3"
     trigger_pins: list = field(default_factory=lambda: [2, 4, 6, 8, 10, 12])
+    # Optostim output pins held LOW from the instant the sketch boots — before
+    # the serial handshake, which blocks until the GUI connects. Without this a
+    # powered laser driver reads the floating pin as ON at power-up. Pins used by
+    # the stimulation workflow are added automatically; list here anything that
+    # must be safe even when no paradigm is loaded.
+    stim_safe_pins: list = field(default_factory=lambda: [53])
 
     @classmethod
     def load(cls, path: Path) -> "RigProfile":
@@ -69,6 +75,7 @@ class RigProfile:
             board_config=_resolve(data.get("board_config", "")),
             serial_port=data.get("serial_port", "COM3"),
             trigger_pins=data.get("trigger_pins", [2, 4, 6, 8, 10, 12]),
+            stim_safe_pins=data.get("stim_safe_pins", [53]),
         )
 
     @staticmethod

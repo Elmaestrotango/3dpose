@@ -37,6 +37,101 @@ Rig-validated fixes layered on top of the original PR (all on master):
 
 3dface mirror of `gui_app/` is deferred — this rig only runs 3dpose for now.
 
+## Optostim: the Stimulation editor (added 2026-07-26)
+
+Bonsai-style node editor (sidebar → **Stimulation**) that compiles a block graph
+into the Arduino sketch. `gui_app/widgets/stimulation_window.py` (canvas + UI),
+`gui_app/stim_compiler.py` (graph → `.ino`, pure functions, no Qt).
+
+**The stim board IS the camera-trigger board** — one Arduino Mega 2560 on COM3.
+The generated sketch does both: the original TTL trigger protocol plus a
+non-blocking stim state machine, with `updateStim()` called inside the trigger's
+busy-wait loops.
+
+Non-obvious invariants — break these and the failure is silent or dangerous:
+- **`allStimLow()` is the first statement in `setup()`, before `Serial.begin()`.**
+  `setup()` blocks on the serial handshake until the GUI connects, so anything
+  later leaves the pin floating — which a powered laser driver reads as ON. The
+  pins come from the profile's **`stim_safe_pins`** (`[53]` on 3dpose = laser,
+  `[]` on 3dface) unioned with whatever the workflow uses. Do NOT hardcode pins
+  in `stim_compiler.py`; `gui_app/` is shared with 3dface.
+- **The sequence is baked into the `.ino` at compile time**, not sent over
+  serial. Editing blocks does nothing until **Apply** (arduino-cli compile +
+  upload, ~30 s). Record then just sends the normal start command and the
+  paradigm runs from t=0. Test/Record warn when the canvas has drifted from the
+  last upload.
+- **No floating-point math in `updateStim()`.** Period and pulse width are
+  resolved to integer microseconds by the compiler. An AVR float divide is ~30 µs
+  and runs inside the trigger busy-wait, blunting the firmware's ±0.35 µs edge
+  precision. `test_stim_compiler.py` asserts no floats reach that function.
+- **Pulse width ≥ period means constant ON**, not "invalid". Treating it as
+  unrepresentable silently held the laser LOW for a whole recording (10 Hz +
+  100 ms — an easy arithmetic slip). The bottom-left waveform preview red-glows
+  on this and on pw > period.
+- **Starts, and loops.** Per weakly-connected group: an explicit "Starting" flag
+  wins, else every block with no incoming arrow starts a chain. A pure loop has
+  neither, so it must be pinned or it compiles to nothing. `_extract_chains`
+  is cycle-safe (revisit closes the loop via `loop_to`); it used to hang.
+- **"Ending" stops the recording, not the chain** — a loop keeps running, so
+  bound it with a parallel timer chain. Python arms a `QTimer` and flips the
+  Record switch; the board is not asked to report back.
+- Two chains on one pin fight over the output; `pin_conflicts()` blocks Apply
+  and Test. Reusing a pin *within* a chain is fine (sequential).
+
+Every recording writes **`stim_paradigm.json`** (graph, resolved chains, end
+time, firmware SHA-256, `matches_uploaded_firmware`) and **`stim_paradigm.ino`**
+(exact firmware) into the recording dir, so a session is self-describing.
+`matches_uploaded_firmware: null` means nothing was uploaded that GUI session —
+the board's contents are unknown, not wrong.
+
+### Laser safety and the reset window (OPEN ITEM as of 2026-07-26)
+
+`allStimLow()` runs first thing in `setup()`, but there is a window it cannot
+cover: **during MCU reset and the ~1–2 s bootloader wait every GPIO is high-Z**,
+because the sketch is not executing yet. A laser driver on a floating input reads
+that as ON and fires a visible flash. Opening the serial port pulses DTR, which
+auto-resets the Mega — so this happens once per Record, once per Apply (avrdude
+must reset to reach the bootloader), and once at power-up.
+
+**Do NOT fix this by suppressing the DTR reset.** Tried 2026-07-26 (`dtr=False` /
+`rts=False` before `open()`): it did remove the flash and it silently broke
+recording — the board ignored the config and emitted zero triggers
+(`Total_Packet_Count: 0` on all six cameras; 15 s "recorded", empty
+`stream.h264`, 0 frames encoded). **The reset is load-bearing**: it returns the
+board to `setup()` with a cleared serial RX buffer. Reverted; a comment in
+`serial_controller.open()` marks it so nobody retries.
+
+**The fix is hardware: a 10 kΩ pulldown from the stim pin to GND** — in parallel
+with the driver input, never in series (a bare wire would clamp the pin at 0 V so
+it could never fire, and would pull ~200 mA through the output driver and destroy
+it). This covers every case software cannot: record reset, Apply reset, power-up,
+unplugged cable. Measure pin-to-GND with the board held in reset; if an internal
+pullup in the driver holds the divider above ~0.8 V, drop to 2.2 kΩ (5 mA at 1 kΩ
+is still well inside the AVR's 20 mA budget). **Not yet fitted.**
+
+If the reset ever does need to move (open the port once at startup / after Apply
+and keep it open), it needs a firmware **ack** first — the sketch echoing what it
+parsed and `start_triggers` verifying before the cameras roll. `loop()`'s
+reconfigure branch is exactly what failed above, and under a persistent
+connection it would fail on the *second* recording of a session rather than the
+first, which is a worse failure mode. The generated sketch is currently mute
+(the diagnostics from `trigger.ino` were dropped because Python never reads),
+which is why that failure was unfalsifiable from the log.
+
+`campy/campy/trigger/trigger.ino` is **superseded** and no longer what the board
+runs. It has no `stim_safe_pins` boot guard, so re-flashing it drops the laser
+safety and all stim. Kept only for the legacy `acquire.py` path.
+
+## Tests
+
+Plain scripts, no pytest — run directly:
+- `python test_stim_compiler.py` — stim graph → sketch. Start resolution,
+  cycle-safe chain extraction, integer µs encoding, safe-pin boot order, pin
+  conflicts, end/test durations, generated-sketch structure. Pure Python, runs
+  anywhere. **Run this after touching `stim_compiler.py`.**
+- `python test_frame_sync.py` — kick-out coordinator == post-hoc intersection.
+- `python test_sync_router.py` — encoder router smoke test (needs NVENC).
+
 ## Conventions
 - New OpenCV dependency: `opencv-contrib-python` (run `uv sync`). The coverage
   HUD self-disables if OpenCV is missing, so the GUI still runs.
