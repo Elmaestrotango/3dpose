@@ -261,6 +261,24 @@ Plain scripts, no pytest — run directly:
     set so the survivors keep recording aligned instead of everyone starving.
     The router logs `lag_behind_leader[...] forced_by[...]` every ~5 s, which is
     what identifies the camera causing forced drops.
+  - **MEASURED 2026-07-27 (44 min, 265,586 triggers, 6.34% loss — a 23-min run
+    earlier the same day lost 43%): the cameras split into two network groups.**
+
+    | group | resend requests | resend packets | failed buffers |
+    |---|---|---|---|
+    | cams 2, 3, 5 | ~313 | ~57,000 | ~170 |
+    | cams **1, 4, 6** | **~460,000** | **~1,325,000** | ~600 |
+
+    Same driver and socket buffer on all six (`SocketDriver`, 262144 KB), so this
+    is the physical path, not pylon config — those are the two switches / NIC
+    ports. **cam1 is the worst of the bad group**: median lag 235 against
+    `max_lag=240`, above 200 in 75% of reports, i.e. permanently ~2.3 s behind
+    and riding the cap, so anything that tips it over force-drops frames every
+    camera captured. cam1 is also the camera that stalled outright earlier that
+    day. **Next step is physical: the switch/NIC port carrying cams 1/4/6, cam1's
+    cable specifically, and MTU 9014 + max Receive Buffers on that leg.** Raising
+    `kick_max_lag` would only paper over it (ring RAM is `max_lag+264` NV12
+    buffers/cam ≈ 10.4 GB at 240, 15.4 GB at 480).
 - `3dpose (raw)` profile (`realtime_encode: false`) = the proven raw.bin + post-hoc
   NVENC fallback (no GPU encode during capture).
 - Blocking camera ops (open/close/reconfigure) run off the Qt main thread via
