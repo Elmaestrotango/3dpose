@@ -223,6 +223,24 @@ Plain scripts, no pytest — run directly:
 - New OpenCV dependency: `opencv-contrib-python` (run `uv sync`). The coverage
   HUD self-disables if OpenCV is missing, so the GUI still runs.
 - Video encoding is H.264 via `h264_nvenc` (GPU). Keep `yuv420p` for compatibility.
+- **Every mp4 the rig writes needs `-g <fps>` AND `-movflags +faststart`** — both exist so
+  the recordings load in the browser labeler (LUC3D), and both are easy to drop when adding
+  an encode path. Verified against LUC3D's loader (`loading/video.js`):
+  - **`-g <fps>`** (1 IDR/s, set across all paths 2026-07-24). Without an explicit `-g`,
+    NVENC's default GOP length depends on the ffmpeg build and driver — the bundled
+    `imageio-ffmpeg` emitted **ONE IDR for a whole 898 s / 415 MB recording**, so showing
+    frame N cost a decode of all N frames and `ffprobe` could not walk the file in 10 min.
+    1 IDR/s also matches LUC3D's own assumption (`kfInterval = Math.round(fps)`).
+  - **`-movflags +faststart`** (moov atom to the front). LUC3D appends the file in 1 MB
+    pieces from byte 0 and stops when moov parses, so moov-at-end forces a read of the
+    ENTIRE file per camera (×6) before frame 1 appears.
+  - `-qp` is constant-quantizer, so the extra IDRs cost almost nothing (measured +11%).
+    Do NOT reach for `-preset superfast` to speed loading: it changes neither the GOP nor
+    the atom order and inflates files ~64%, i.e. more bytes for the browser to pull.
+  - Applies to the three mp4 writers — `encode_worker._cmd` (both branches),
+    `acquire._encode_raw`, `alignment.extract_aligned` (that one REPLACES the session
+    recording). Not to `_append_raw_tail` or `sync_encode`, which emit Annex-B `.h264`
+    elementary streams that the stream-copy remux later wraps.
 - **Real-time GPU encode is the default** (`realtime_encode: true`), decoupled from
   capture: the grab loop only does retrieve→copy→queue→release; encoders drain through
   PyNvVideoCodec (`gui_app/nvenc.py`) into `stream.h264`; on stop `encode_worker`

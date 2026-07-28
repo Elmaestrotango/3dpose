@@ -70,6 +70,12 @@ class EncodeWorker(QThread):
             "-qp", str(self._quality),
             "-g", str(self._fps),
             "-bf:v", "0", "-gpu", "0",
+            # moov atom to the FRONT, matching the stream-copy branch above. The
+            # browser labeler (LUC3D) appends the file in 1 MB pieces from byte 0
+            # and stops as soon as moov parses, so moov-at-end costs a read of the
+            # ENTIRE file per camera (x6) before frame 1 appears. Whether the mp4
+            # muxer front-loads moov on its own varies by ffmpeg build, so say it.
+            "-movflags", "+faststart",
             "-loglevel", "warning",
             str(mp4_path),
         ]

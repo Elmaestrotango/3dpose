@@ -96,6 +96,8 @@ def _encode_raw(args):
         "-qp", str(quality),
         "-g", str(fps),
         "-bf:v", "0", "-gpu", "0",
+        # moov atom to the front — see gui_app/encode_worker.py for why LUC3D needs it.
+        "-movflags", "+faststart",
         "-loglevel", "warning",
         mp4_path,
     ]

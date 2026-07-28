@@ -132,6 +132,10 @@ def extract_aligned(video: Path, frame_idx: np.ndarray, dst: Path,
         "-c:v", "h264_nvenc", "-pix_fmt", "yuv420p",
         "-preset", "fast", "-qp", str(quality), "-g", str(fps),
         "-bf:v", "0", "-gpu", "0",
+        # moov atom to the front — this output REPLACES the session recording
+        # (os.replace below), so it is the file LUC3D actually opens. See
+        # gui_app/encode_worker.py for why moov-at-end breaks the browser labeler.
+        "-movflags", "+faststart",
         "-loglevel", "error", str(dst),
     ]
     proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, startupinfo=startupinfo)
