@@ -3,7 +3,9 @@
 # dependencies = [
 #     "numpy<2",
 #     "pyyaml>=6.0",
-#     "opencv-contrib-python>=4.6",
+#     # >=4.7 for CharucoBoard.setLegacyPattern. The 3dpose board is legacy;
+#     # without that call OpenCV returns 0 charuco corners silently.
+#     "opencv-contrib-python>=4.7",
 #     "matplotlib>=3.5",
 # ]
 # ///
@@ -32,6 +34,27 @@ import yaml
 # Board setup
 # ---------------------------------------------------------------------------
 
+def _apply_legacy_pattern(board, legacy: bool):
+    """Opt the board into the pre-4.6 ChArUco corner layout.
+
+    Loud on purpose. The physical 3dpose board uses the legacy layout, and on
+    OpenCV >= 4.7 a board built without this detects every marker fine but maps
+    them onto the new layout and returns ZERO charuco corners — no error, no
+    warning, just an empty calibration (diagnosed 2026-06-12). Skipping it
+    silently because the build is too old to support it would reintroduce
+    exactly that failure, so refuse instead.
+    """
+    if not legacy:
+        return
+    if not hasattr(board, "setLegacyPattern"):
+        raise RuntimeError(
+            f"board_legacy: true needs OpenCV >= 4.7 for setLegacyPattern, but "
+            f"this environment resolved {cv2.__version__}. Pre-4.7 builds use "
+            f"the legacy layout natively, but that cannot be confirmed from "
+            f"here — pin opencv-contrib-python>=4.7 rather than guess.")
+    board.setLegacyPattern(True)
+
+
 def create_board_and_dict(cfg):
     aruco = cv2.aruco
     bits = cfg.get("marker_bits", 4)
@@ -48,8 +71,7 @@ def create_board_and_dict(cfg):
         board = aruco.CharucoBoard((bx, by), sq, mk, aruco_dict)
     else:
         board = aruco.CharucoBoard_create(bx, by, sq, mk, aruco_dict)
-    if legacy and hasattr(board, "setLegacyPattern"):
-        board.setLegacyPattern(True)
+    _apply_legacy_pattern(board, legacy)
 
     return board, aruco_dict
 
@@ -64,7 +86,11 @@ def get_marker_obj_points(board):
 
 def get_charuco_obj_points(board):
     """Return {corner_id: ndarray(3,)} — each charuco corner's 3D position."""
-    pts = board.getChessboardCorners()
+    # OpenCV renamed this across the 4.6/4.7 boundary (attribute -> getter). The
+    # board constructor above is already version-split; match it here rather than
+    # crash on whichever build uv happens to resolve.
+    pts = (board.getChessboardCorners() if hasattr(board, "getChessboardCorners")
+           else board.chessboardCorners)
     return {i: pts[i].ravel().astype(np.float32) for i in range(len(pts))}
 
 
@@ -93,8 +119,7 @@ def _detect_one_camera(args_tuple):
         board = aruco.CharucoBoard((bx, by), sq, mk, aruco_dict)
     else:
         board = aruco.CharucoBoard_create(bx, by, sq, mk, aruco_dict)
-    if legacy and hasattr(board, "setLegacyPattern"):
-        board.setLegacyPattern(True)
+    _apply_legacy_pattern(board, legacy)
 
     if hasattr(aruco, "ArucoDetector"):
         _adet = aruco.ArucoDetector(aruco_dict, aruco.DetectorParameters())

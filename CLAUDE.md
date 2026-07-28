@@ -16,6 +16,14 @@ Rig-validated fixes layered on top of the original PR (all on master):
 - **`board_legacy: true`** in the board config — the physical 3dpose board uses
   the pre-OpenCV-4.6 ChArUco layout; without `setLegacyPattern(True)` the ≥4.7
   `CharucoDetector` returns 0 corners silently. Defaults false for other boards.
+  **`1_calibrate.py` pins `opencv-contrib-python>=4.7`** because of this: it is a
+  PEP 723 script, so uv re-resolves it freely, and OpenCV moved
+  `CharucoBoard.chessboardCorners` (attribute) to `getChessboardCorners()`
+  (method) across the 4.6/4.7 line. A `>=4.6` floor let uv land on either side —
+  4.6 crashed on the accessor (seen 2026-07-27) and, worse, made the
+  `hasattr(board, "setLegacyPattern")` guard no-op silently. Both call sites now
+  go through `_apply_legacy_pattern()`, which raises rather than skip, and the
+  accessor handles both spellings.
 - **HUD counts markers, not charuco corners** (`board_detector.py`) — matches the
   `1_calibrate.py` prescan (`len(ids) >= 4`). Corner-counting was far stricter
   than calibration eligibility and starved oblique cameras (cam1/cam4).
