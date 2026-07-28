@@ -36,6 +36,8 @@ class SyncEncodeRouter:
         self.block_ids = [[] for _ in range(self._n)]
         self.available = False
         self.dropped_full = 0  # frames lost to a wedged encoder queue (should be 0)
+        self._log_every = max(int(fps), 1) * 5 * self._n   # ~5 s of submissions
+        self._since_log = 0
 
         try:
             for i, rp in enumerate(raw_paths):
@@ -64,6 +66,14 @@ class SyncEncodeRouter:
     def pending(self) -> int:
         return self._coord.pending_depth()
 
+    def retire(self, cam: int, reason: str = ""):
+        """Drop a camera from the alignment set (stalled and unrecoverable)."""
+        with self._lock:
+            self._coord.retire(cam, reason)
+
+    def lag_report(self) -> str:
+        return self._coord.lag_report()
+
     def _route(self, releases):
         for cam, bid, payload in releases:
             ts, buf = payload
@@ -85,6 +95,14 @@ class SyncEncodeRouter:
             releases = self._coord.submit(cam, block_id, (ts, buf))
             if releases:
                 self._route(releases)
+            # Periodic lag report. Cross-camera skew beyond max_lag is what
+            # force-drops frames every camera actually captured (43% of a
+            # 23-min session on 2026-07-27), and nothing in the old logs said
+            # which camera was behind.
+            self._since_log += 1
+            if self._since_log >= self._log_every:
+                self._since_log = 0
+                print(self._coord.lag_report(), flush=True)
 
     def abandon(self):
         """Tear down WITHOUT draining (app quit mid-recording): close the output

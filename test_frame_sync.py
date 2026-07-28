@@ -134,7 +134,72 @@ def main():
     assert rel == set(range(1, 2001)) and co.dropped == 0
     print("6) zero-loss passthrough, 1 trial: PASS")
 
+    test_retire_keeps_survivors_aligned()
+    test_retired_camera_submissions_ignored()
+    test_forced_drops_are_attributed()
+
     print("\nALL FRAMESYNC EQUIVALENCE TESTS PASS")
+
+
+# ── camera retirement (added 2026-07-27) ─────────────────────────────────────
+# A stalled camera used to pin the watermark forever, so every later trigger was
+# force-dropped and the recording yielded nothing from the stall onward. Retiring
+# it keeps the survivors aligned.
+
+def test_retire_keeps_survivors_aligned():
+    co = FrameSyncCoordinator(3, max_lag=10)
+    out = []
+    for t in range(1, 6):                      # 5 clean triggers, all 3 cams
+        for c in range(3):
+            out += co.submit(c, t, f"c{c}t{t}")
+    assert co.released_triggers == 5
+
+    # cam2 stalls. Without retirement the other two starve past max_lag.
+    for t in range(6, 40):
+        for c in (0, 1):
+            co.submit(c, t, f"c{c}t{t}")
+    before = co.released_triggers
+    assert before == 5, "a stalled camera should block releases until retired"
+
+    co.retire(2, "stalled in test")
+    got = []
+    for t in range(40, 50):
+        for c in (0, 1):
+            got += co.submit(c, t, f"c{c}t{t}")
+    assert co.released_triggers > before, "retirement did not resume releases"
+    cams = {c for c, _t, _f in got}
+    assert cams == {0, 1}, f"retired camera still being released: {cams}"
+    # every released trigger must still be held by BOTH survivors
+    per_t = {}
+    for c, t, _f in got:
+        per_t.setdefault(t, set()).add(c)
+    assert all(v == {0, 1} for v in per_t.values()), "survivors not aligned"
+    print("7) retiring a stalled camera keeps survivors aligned: PASS")
+
+
+def test_retired_camera_submissions_ignored():
+    co = FrameSyncCoordinator(2, max_lag=10)
+    co.retire(1, "test")
+    assert co.submit(1, 5, "late") == []
+    out = []
+    for t in range(1, 4):
+        out += co.submit(0, t, f"t{t}")
+    assert [c for c, _t, _f in out] == [0, 0, 0]
+    assert co.released_triggers == 3
+    print("8) a retired camera's late frames never re-enter the stream: PASS")
+
+
+def test_forced_drops_are_attributed():
+    """The log must name the laggard — that is the whole point of the counter."""
+    co = FrameSyncCoordinator(3, max_lag=5)
+    for t in range(1, 30):
+        for c in (0, 1):        # cam2 never delivers
+            co.submit(c, t, None)
+    assert co.forced > 0, "no forcing happened, test is not exercising the path"
+    assert co.forced_by[2] > 0, "laggard not identified"
+    assert co.forced_by[0] == 0 and co.forced_by[1] == 0, "blamed the wrong camera"
+    assert "c3:" in co.lag_report()
+    print("9) forced drops are attributed to the lagging camera: PASS")
 
 
 if __name__ == "__main__":

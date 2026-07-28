@@ -134,6 +134,55 @@ class GrabThread(QThread):
         self.snapshot_frame = None
         self._keep_full = False
         self.latest_full_frame = None
+        # Stall recovery state (see _rearm_stream / _resync_offset).
+        self._last_ts = None          # device timestamp of the last good frame
+        self._last_bid_eff = -1       # its globally-consistent block ID
+        self.rearms = 0               # stream restarts this run
+        self.desynced = False         # stalled and could not be realigned
+
+    def _rearm_stream(self, attempt: int) -> bool:
+        """Restart this camera's stream after a stall.
+
+        A GigE Vision stream stall wedges the driver pipeline and never
+        self-recovers — the grab loop just times out for the rest of the session
+        (cam6 2026-06-10, cam1 2026-07-27). Restarting the grab is the only way
+        back without restarting the GUI.
+        """
+        print(f"[grab{self._cam_index}] STALLED — re-arming stream "
+              f"(attempt {attempt})", flush=True)
+        try:
+            self._camera.StopGrabbing()
+            self._camera.StartGrabbing(pylon.GrabStrategy_OneByOne)
+            return True
+        except Exception as e:
+            print(f"[grab{self._cam_index}] re-arm failed: "
+                  f"{type(e).__name__}: {e}", flush=True)
+            return False
+
+    def _resync_offset(self, raw_bid: int, ts: float):
+        """Block-ID offset that keeps trigger ordinals globally consistent.
+
+        StartGrabbing restarts the camera's block-ID counter, so a re-armed
+        camera looks like it jumped tens of thousands of triggers backwards —
+        which the coordinator's 16-bit unwrap would misread as a wrap, place it
+        far AHEAD, and force-drop every other camera.
+
+        The device timestamp is a free-running hardware clock that survives the
+        restart, and the triggers are hardware-timed, so the number of missed
+        periods is measurable rather than guessed. Returns None when the gap
+        doesn't land cleanly on a period boundary — better to declare desync
+        than to publish frames under the wrong trigger ordinal.
+        """
+        if self._last_ts is None or self._fps <= 0:
+            return None
+        periods = (ts - self._last_ts) * self._fps
+        k = round(periods)
+        resid = abs(periods - k)
+        if k < 1 or resid > 0.25:
+            print(f"[grab{self._cam_index}] cannot resync: {periods:.2f} trigger "
+                  f"periods elapsed, {resid:.2f} off a boundary", flush=True)
+            return None
+        return (self._last_bid_eff + k) - raw_bid
 
     def _put_frame(self, enc_thread: _EncoderThread, img) -> bool:
         """Copy the gray frame into the next NV12 ring buffer and queue it.
@@ -245,6 +294,14 @@ class GrabThread(QThread):
         print(f"[grab{self._cam_index}] grabbing={self._camera.IsGrabbing()}", flush=True)
         frame_n = 0
         timeout_n = 0
+        consec_timeouts = 0    # reset by every successful grab; stall detector
+        bid_offset = 0         # added to raw block IDs after a re-arm
+        awaiting_resync = False
+        # ~5 s of silence at the 200 ms recording timeout. Long enough that a
+        # burst of GigE resends can't trip it, short enough to lose seconds
+        # rather than the rest of the session.
+        STALL_TIMEOUTS = 25
+        MAX_REARMS = 5         # stop thrashing if the link is genuinely dead
         first_frame_logged = False
         t_wait = 0.0   # cumulative s blocked in RetrieveResult (per 1000 frames)
         t_proc = 0.0   # cumulative s spent processing a frame (per 1000 frames)
@@ -268,6 +325,7 @@ class GrabThread(QThread):
                         self.snapshot_frame = img.copy()  # full-resolution still
                         self._snapshot_requested = False
 
+                    consec_timeouts = 0
                     if recording:
                         if kick:
                             # Copy gray into the next ring slot and submit to the
@@ -277,11 +335,29 @@ class GrabThread(QThread):
                             self._ring_i = (self._ring_i + 1) % len(self._nv12_ring)
                             buf[:self._height, :] = img
                             try:
-                                bid = result.BlockID
+                                raw_bid = result.BlockID
                             except Exception:
-                                bid = -1
-                            self._router.submit(self._cam_index, bid,
-                                                result.TimeStamp * 1e-9, buf)
+                                raw_bid = -1
+                            dev_ts = result.TimeStamp * 1e-9
+                            if awaiting_resync:
+                                awaiting_resync = False
+                                off = self._resync_offset(raw_bid, dev_ts)
+                                if off is None:
+                                    self.desynced = True
+                                    self._router.retire(
+                                        self._cam_index,
+                                        "stream stalled and block IDs could not "
+                                        "be realigned")
+                                else:
+                                    bid_offset = off
+                                    print(f"[grab{self._cam_index}] resynced after "
+                                          f"re-arm, block-ID offset {off}", flush=True)
+                            if not self.desynced:
+                                bid = raw_bid + bid_offset
+                                self._last_bid_eff = bid
+                                self._last_ts = dev_ts
+                                self._router.submit(self._cam_index, bid,
+                                                    dev_ts, buf)
                             self.frame_count += 1  # grabbed count (for logging)
                         elif enc_thread is not None:
                             persisted = self._put_frame(enc_thread, img)
@@ -339,19 +415,35 @@ class GrabThread(QThread):
 
                 except pylon.TimeoutException:
                     timeout_n += 1
+                    consec_timeouts += 1
                     if recording and timeout_n in (1, 5, 20):
                         print(f"[grab{self._cam_index}] TIMEOUT #{timeout_n} (no frame in {timeout}ms, triggers_stopped={self._triggers_stopped})", flush=True)
                     if recording and self._triggers_stopped:
                         break
                     if not self._running:
                         break
+                    # Stalled: the stream has gone quiet while triggers are still
+                    # running. Restart it rather than time out for the rest of
+                    # the session.
+                    if (consec_timeouts >= STALL_TIMEOUTS and not self.desynced
+                            and self.rearms < MAX_REARMS):
+                        self.rearms += 1
+                        consec_timeouts = 0
+                        if self._rearm_stream(self.rearms):
+                            awaiting_resync = recording and kick
+                        elif recording and kick:
+                            self.desynced = True
+                            self._router.retire(self._cam_index,
+                                                "stream stalled, re-arm failed")
                 except Exception as e:
                     print(f"[grab{self._cam_index}] exception: {type(e).__name__}: {e}", flush=True)
                     if not self._running:
                         break
                     time.sleep(0.001)
         finally:
-            print(f"[grab{self._cam_index}] exiting: frames={frame_n} timeouts={timeout_n} drops={self.drops}", flush=True)
+            print(f"[grab{self._cam_index}] exiting: frames={frame_n} "
+                  f"timeouts={timeout_n} drops={self.drops} rearms={self.rearms}"
+                  + (" DESYNCED" if self.desynced else ""), flush=True)
             if recording:
                 self._log_stream_stats()  # before StopGrabbing resets counters
             if enc_thread is not None:

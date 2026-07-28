@@ -246,6 +246,21 @@ Plain scripts, no pytest — run directly:
     Standalone CLI for old recordings: `uv run 2_align.py <recording_dir> --replace`.
   - `_unwrap_blockids` handles the 16-bit BlockID wrap at 65535 (~11 min). Cameras also
     try to enable 64-bit extended BlockIDs at open.
+  - **Stall recovery + lag attribution (2026-07-27).** A GigE stream stall used to
+    end the session for that camera: the grab loop timed out forever, its frontier
+    froze, and the coordinator force-dropped every later trigger — so the whole
+    recording yielded nothing from the stall onward. Now `grab_thread` re-arms
+    (`StopGrabbing`/`StartGrabbing`) after 25 consecutive timeouts, up to 5 times.
+    **`StartGrabbing` restarts the camera's block-ID counter**, which the
+    coordinator's 16-bit unwrap would misread as a wrap and place the camera far
+    *ahead*; `_resync_offset()` recovers the true ordinal from the device
+    timestamp (a free-running hardware clock that survives the restart) and
+    **refuses if the gap isn't within 0.25 of a trigger period** — publishing
+    frames under a guessed ordinal is worse than losing the camera. If it can't
+    realign, `FrameSyncCoordinator.retire()` drops that camera from the alignment
+    set so the survivors keep recording aligned instead of everyone starving.
+    The router logs `lag_behind_leader[...] forced_by[...]` every ~5 s, which is
+    what identifies the camera causing forced drops.
 - `3dpose (raw)` profile (`realtime_encode: false`) = the proven raw.bin + post-hoc
   NVENC fallback (no GPU encode during capture).
 - Blocking camera ops (open/close/reconfigure) run off the Qt main thread via

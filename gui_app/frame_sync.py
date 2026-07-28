@@ -39,14 +39,49 @@ class FrameSyncCoordinator:
         self._last_raw = [0] * self.n         # for incremental wrap unwrap
         self._wrap_off = [0] * self.n
         self._decided_upto = 0                # highest block ID whose fate is set
+        self._retired = [False] * self.n      # cameras dropped from the align set
         # stats
         self.released = 0                     # common frames passed to encoders
+        self.released_triggers = 0            # triggers released (cam-count agnostic)
         self.dropped = 0                      # frames kicked out (not common)
         self.forced = 0                       # frames dropped by max_lag forcing
+        self.forced_by = [0] * self.n         # who was the laggard when forcing hit
+
+    def active(self) -> list:
+        return [c for c in range(self.n) if not self._retired[c]]
 
     def pending_depth(self) -> int:
         """Max frames buffered awaiting a release decision (for monitoring)."""
         return max((len(p) for p in self._pending), default=0)
+
+    def retire(self, cam: int, reason: str = ""):
+        """Drop a camera from the alignment set.
+
+        For a camera that stalled and could not be realigned. Without this its
+        frozen frontier pins the watermark, every later trigger gets force-
+        dropped, and the whole recording yields nothing; retiring keeps the
+        remaining cameras aligned and recording.
+        """
+        if self._retired[cam]:
+            return
+        self._retired[cam] = True
+        self._pending[cam].clear()
+        print(f"[sync] cam{cam + 1} RETIRED from the alignment set: {reason}. "
+              f"Remaining cameras stay aligned; this one's video ends here.",
+              flush=True)
+
+    def lag_report(self) -> str:
+        """Who is behind, and who is causing the forced drops."""
+        act = self.active()
+        if not act:
+            return "[sync] no active cameras"
+        lead = max(self._frontier[c] for c in act)
+        lags = " ".join(f"c{c + 1}:{lead - self._frontier[c]}" for c in act)
+        blame = " ".join(f"c{c + 1}:{self.forced_by[c]}" for c in act
+                         if self.forced_by[c])
+        return (f"[sync] lag_behind_leader[{lags}] depth={self.pending_depth()}"
+                f"/{self.max_lag} released={self.released_triggers} "
+                f"forced={self.forced}" + (f" forced_by[{blame}]" if blame else ""))
 
     def _unwrap(self, cam: int, raw: int) -> int:
         if self._seen_any[cam] and raw < self._last_raw[cam] - (BLOCKID_WRAP // 2):
@@ -57,6 +92,8 @@ class FrameSyncCoordinator:
     def submit(self, cam: int, raw_block_id: int, frame):
         """Register a successfully-grabbed frame. Returns a list of
         (cam, block_id, frame) ready to encode now, in per-camera order."""
+        if self._retired[cam]:
+            return []
         bid = self._unwrap(cam, raw_block_id)
         self._seen_any[cam] = True
         if bid <= self._decided_upto:
@@ -68,39 +105,45 @@ class FrameSyncCoordinator:
         self._frontier[cam] = bid
         return self._advance()
 
-    def _watermark(self) -> int:
-        # All cameras have reached at least this trigger.
-        wm = min(self._frontier)
+    def _watermark(self, act: list) -> int:
+        # All active cameras have reached at least this trigger.
+        wm = min(self._frontier[c] for c in act)
         # Force progress if the fastest camera is too far ahead of a laggard.
-        fastest = max(self._frontier)
+        fastest = max(self._frontier[c] for c in act)
         if fastest - wm > self.max_lag:
             wm = fastest - self.max_lag
         return wm
 
     def _advance(self):
         ready = []
-        wm = self._watermark()
+        act = self.active()
+        if not act:
+            return ready
+        wm = self._watermark(act)
         while True:
-            heads = [self._pending[c][0][0] for c in range(self.n) if self._pending[c]]
+            heads = [self._pending[c][0][0] for c in act if self._pending[c]]
             if not heads:
                 break
             t = min(heads)
             if t > wm:
                 break
-            havers = [c for c in range(self.n)
+            havers = [c for c in act
                       if self._pending[c] and self._pending[c][0][0] == t]
-            if len(havers) == self.n:
+            if len(havers) == len(act):
                 for c in havers:
                     _bid, frame = self._pending[c].popleft()
                     ready.append((c, t, frame))
-                self.released += self.n
+                self.released += len(act)
+                self.released_triggers += 1
             else:
-                forced = t > min(self._frontier)  # dropped only because of max_lag
+                slowest = min(act, key=lambda c: self._frontier[c])
+                forced = t > self._frontier[slowest]  # dropped only by max_lag
                 for c in havers:
                     self._pending[c].popleft()
                 self.dropped += len(havers)
                 if forced:
                     self.forced += len(havers)
+                    self.forced_by[slowest] += 1
             self._decided_upto = t
         return ready
 
@@ -108,18 +151,20 @@ class FrameSyncCoordinator:
         """End of recording: no more frames will arrive, so decide every
         remaining trigger. Returns the final ready list."""
         ready = []
-        while True:
-            heads = [self._pending[c][0][0] for c in range(self.n) if self._pending[c]]
+        act = self.active()
+        while act:
+            heads = [self._pending[c][0][0] for c in act if self._pending[c]]
             if not heads:
                 break
             t = min(heads)
-            havers = [c for c in range(self.n)
+            havers = [c for c in act
                       if self._pending[c] and self._pending[c][0][0] == t]
-            if len(havers) == self.n:
+            if len(havers) == len(act):
                 for c in havers:
                     _bid, frame = self._pending[c].popleft()
                     ready.append((c, t, frame))
-                self.released += self.n
+                self.released += len(act)
+                self.released_triggers += 1
             else:
                 for c in havers:
                     self._pending[c].popleft()
