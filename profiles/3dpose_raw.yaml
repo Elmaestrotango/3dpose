@@ -28,4 +28,11 @@ stim_safe_pins: [53]
 # Same cameras and pfs as the 3dpose profile (3.5 ms exposure), so the internal rate
 # limiter must be off here too — at 165 it would leave only 0.44 ms of margin before the
 # 50 fps bug. 0 = disabled, bounded by sensor readout instead.
-trigger_rate_limit: 0
+trigger_rate_limit: 165      # REVERTED 2026-08-11: setting this to 0 (limiter off) cost
+                             # 8-15% of frames IN TRANSMISSION. Cameras still acquired every
+                             # trigger (rate 100.03, block IDs contiguous) but delivery
+                             # dropped to 85-92% vs 99.98% with the limiter on. The limiter
+                             # paces readout over 6.06 ms; without it six cameras burst
+                             # together after each trigger and the marginal links lose
+                             # packets. Worst on cams 1/4/6. Do not disable this again
+                             # without fixing the network margin first.

@@ -32,4 +32,11 @@ stim_safe_pins: [53]
 # Disable the camera's internal rate generator in trigger mode. It does nothing while
 # externally triggered but enforces a minimum interval of exposure + 1/rate, which is what
 # capped exposure at ~3.94 ms. 0 = disabled; 3dface stays on 165 until tested there.
-trigger_rate_limit: 0
+trigger_rate_limit: 165      # REVERTED 2026-08-11: setting this to 0 (limiter off) cost
+                             # 8-15% of frames IN TRANSMISSION. Cameras still acquired every
+                             # trigger (rate 100.03, block IDs contiguous) but delivery
+                             # dropped to 85-92% vs 99.98% with the limiter on. The limiter
+                             # paces readout over 6.06 ms; without it six cameras burst
+                             # together after each trigger and the marginal links lose
+                             # packets. Worst on cams 1/4/6. Do not disable this again
+                             # without fixing the network margin first.

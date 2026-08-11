@@ -240,12 +240,17 @@ Plain scripts, no pytest — run directly:
   - Verify any change against a **recording, not the preview**: preview is free-run at
     30 fps (33 ms headroom), so an over-long exposure looks fine there and only halves
     the frame rate once triggered.
-  - **`trigger_rate_limit` (profile field, 2026-08-11).** `0` disables
-    `AcquisitionFrameRateEnable` in trigger mode, removing the `exposure + 1/rate` floor
-    and leaving only sensor readout. Both 3dpose profiles are `0` with exposure at
-    **3500 µs**; both 3dface profiles stay at `165` until tested there. The two 3dpose
-    profiles share one pfs, so they must agree — at 165 with 3.5 ms exposure the margin
-    is only 0.44 ms.
+  - **`trigger_rate_limit` (profile field, 2026-08-11). Keep it at 165 — DO NOT set it
+    to 0.** Setting it to 0 disables `AcquisitionFrameRateEnable` in trigger mode, which
+    does remove the `exposure + 1/rate` floor on exposure. Tried and **reverted the same
+    day**: it cost **8–15% of frames in transmission**. The cameras still acquired every
+    trigger (rate 100.03 fps, block IDs contiguous over the full span) but delivery fell
+    to 85–92% against 99.98% with the limiter on, and the released rate went 87.7 → 76.9
+    fps. The limiter paces readout across 6.06 ms; without it all six cameras burst
+    immediately after the shared trigger and the marginal links drop packets — worst on
+    cams 1/4/6, the heavy-resend group. **The exposure ceiling of ~3.94 ms is therefore
+    real and not worth buying out** until the network margin is fixed. Exposure stays at
+    3000 µs; 3500 would leave only 0.44 ms of margin at 165.
 - **`kick_max_lag: 480` on the `3dpose` profile (raised from 240, 2026-08-11).** One
   camera — **which one varies per session** — drifts to the cap and oscillates across it,
   force-dropping frames every camera captured: 12.3% on 2026-08-11 with cam5 at median
