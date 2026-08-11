@@ -45,6 +45,13 @@ class RigProfile:
     # the stimulation workflow are added automatically; list here anything that
     # must be safe even when no paradigm is loaded.
     stim_safe_pins: list = field(default_factory=lambda: [53])
+    # AcquisitionFrameRate applied in trigger mode, or 0 to disable the limiter.
+    # While externally triggered the camera's internal rate generator serves no
+    # purpose, but it still enforces a minimum interval of
+    # `exposure + 1/AcquisitionFrameRate` — the thing that capped exposure at
+    # ~3.94 ms at 100 fps, and (at the old value of 100) caused the 50 fps bug.
+    # 0 leaves only the sensor readout as the constraint.
+    trigger_rate_limit: float = 165.0
 
     @classmethod
     def load(cls, path: Path) -> "RigProfile":
@@ -76,6 +83,7 @@ class RigProfile:
             serial_port=data.get("serial_port", "COM3"),
             trigger_pins=data.get("trigger_pins", [2, 4, 6, 8, 10, 12]),
             stim_safe_pins=data.get("stim_safe_pins", [53]),
+            trigger_rate_limit=float(data.get("trigger_rate_limit", 165.0)),
         )
 
     @staticmethod

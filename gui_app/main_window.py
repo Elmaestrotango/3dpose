@@ -134,7 +134,9 @@ class MainWindow(QMainWindow):
         """Blocking open (run on a worker thread for live profile switches)."""
         pfs = self._profile.pfs_path
         if pfs and Path(pfs).exists():
-            return self._camera_mgr.open_all(pfs, gige_driver=self._profile.gige_driver)
+            return self._camera_mgr.open_all(
+                pfs, gige_driver=self._profile.gige_driver,
+                trigger_rate_limit=self._profile.trigger_rate_limit)
         return False
 
     def _apply_camera_open_result(self, ok):

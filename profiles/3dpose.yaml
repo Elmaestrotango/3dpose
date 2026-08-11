@@ -8,7 +8,12 @@ quality: 21
 encode_parallel: 3           # concurrent NVENC jobs (raw mode) / .h264->mp4 remux jobs (realtime mode)
 realtime_encode: true        # GPU H.264 encode during capture (no raw.bin, no post-hoc pass). Select "3dpose (raw)" to fall back.
 realtime_kick: true          # default: real-time cross-camera frame kick-out â€” only frames every camera caught are encoded, so videos come out trigger-aligned with no post-hoc re-encode.
-kick_max_lag: 240            # coordinator buffer (frames). DO NOT raise blindly: the NV12 ring scales with it; 1000 starved capture (24% loss, 2026-06-17). 240 runs clean.
+kick_max_lag: 480            # raised from 240 on 2026-08-11. One camera (which one varies
+                             # per session) drifts to the cap and oscillates across it, force-
+                             # dropping frames every camera captured — 12.3% on 2026-08-11 with
+                             # cam5 at median 238 / peak 330. The frames arrive, just late, so
+                             # this is headroom rather than masking. Ring RAM 10.4 -> 15.4 GB of
+                             # 64. Do NOT go to 1000: that starved capture outright (24% loss).            # coordinator buffer (frames). DO NOT raise blindly: the NV12 ring scales with it; 1000 starved capture (24% loss, 2026-06-17). 240 runs clean.
 
 pfs_path: "configs/mono8_1920x1200.pfs"
 output_dir: "data"
@@ -23,3 +28,8 @@ gige_driver: socket          # socket = user-space w/ reliable packet resends (p
 # laser driver never sees a floating pin. Pin 53 = laser. Workflow pins are
 # added automatically; this list is the floor.
 stim_safe_pins: [53]
+
+# Disable the camera's internal rate generator in trigger mode. It does nothing while
+# externally triggered but enforces a minimum interval of exposure + 1/rate, which is what
+# capped exposure at ~3.94 ms. 0 = disabled; 3dface stays on 165 until tested there.
+trigger_rate_limit: 0

@@ -240,6 +240,21 @@ Plain scripts, no pytest — run directly:
   - Verify any change against a **recording, not the preview**: preview is free-run at
     30 fps (33 ms headroom), so an over-long exposure looks fine there and only halves
     the frame rate once triggered.
+  - **`trigger_rate_limit` (profile field, 2026-08-11).** `0` disables
+    `AcquisitionFrameRateEnable` in trigger mode, removing the `exposure + 1/rate` floor
+    and leaving only sensor readout. Both 3dpose profiles are `0` with exposure at
+    **3500 µs**; both 3dface profiles stay at `165` until tested there. The two 3dpose
+    profiles share one pfs, so they must agree — at 165 with 3.5 ms exposure the margin
+    is only 0.44 ms.
+- **`kick_max_lag: 480` on the `3dpose` profile (raised from 240, 2026-08-11).** One
+  camera — **which one varies per session** — drifts to the cap and oscillates across it,
+  force-dropping frames every camera captured: 12.3% on 2026-08-11 with cam5 at median
+  238 / peak 330, having been cam1 two weeks earlier. **The July note blaming the cams
+  1/4/6 packet loss was wrong**: that resend split persists (1/4/6 ~3800 requests vs
+  2/3/5 ~3) but the 2026-08-11 laggard was cam5, from the *light* group, while cam1 sat
+  at median 0. Resends are not the mechanism. The frames arrive intact, only late, so
+  headroom is a real fix rather than masking. Ring RAM 10.5 → 15.4 GB of 64. **Do not go
+  to 1000** — that starved capture outright (24% loss, 2026-06-17).
 - Video encoding is H.264 via `h264_nvenc` (GPU). Keep `yuv420p` for compatibility.
 - **Every mp4 the rig writes needs `-g <fps>` AND `-movflags +faststart`** — both exist so
   the recordings load in the browser labeler (LUC3D), and both are easy to drop when adding

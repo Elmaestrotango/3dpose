@@ -50,7 +50,11 @@ class CameraManager(QObject):
         for gt in self._grab_threads:
             gt.set_keep_full(flag)
 
-    def open_all(self, pfs_path: str, gige_driver: str = "socket"):
+    def open_all(self, pfs_path: str, gige_driver: str = "socket",
+                 trigger_rate_limit: float = 165.0):
+        """trigger_rate_limit: AcquisitionFrameRate to apply in trigger mode, or
+        0 to disable the limiter altogether — see _set_trigger_mode."""
+        self._trigger_rate_limit = trigger_rate_limit
         tlf = pylon.TlFactory.GetInstance()
         devices = tlf.EnumerateDevices()
         if len(devices) == 0:
@@ -172,8 +176,22 @@ class CameraManager(QObject):
                 cam.TriggerMode.SetValue("On")
                 cam.TriggerSource.SetValue("Line1")
                 cam.TriggerActivation.SetValue("RisingEdge")
-                cam.AcquisitionFrameRateEnable.SetValue(True)
-                cam.AcquisitionFrameRate.SetValue(165.0)
+                # The camera's internal rate generator does nothing useful while
+                # it is externally triggered, but it still caps the minimum
+                # interval at `exposure + 1/AcquisitionFrameRate` — which is what
+                # capped exposure at ~3.94 ms and, at the old rate of 100, caused
+                # the original 50 fps bug. Disabling it (`trigger_rate_limit: 0`)
+                # leaves only the sensor readout in the way. Kept per-profile so
+                # the 3dface rig stays on the proven 165 until it is tested there.
+                limit = getattr(self, "_trigger_rate_limit", 165.0)
+                if limit and limit > 0:
+                    cam.AcquisitionFrameRateEnable.SetValue(True)
+                    cam.AcquisitionFrameRate.SetValue(float(limit))
+                else:
+                    cam.AcquisitionFrameRateEnable.SetValue(False)
+                    if i == 0:
+                        print("[cam] trigger-rate limiter DISABLED "
+                              "(exposure bounded by sensor readout only)", flush=True)
             except Exception as e:
                 print(f"[cam{i+1}] trigger config failed (camera offline?): {e}", flush=True)
 
