@@ -222,6 +222,24 @@ Plain scripts, no pytest — run directly:
 ## Conventions
 - New OpenCV dependency: `opencv-contrib-python` (run `uv sync`). The coverage
   HUD self-disables if OpenCV is missing, so the GUI still runs.
+- **Exposure/gain live in the `.pfs`, and the exposure ceiling is ~3.9 ms at 100 fps.**
+  In trigger mode the frame-rate timer starts *after* exposure ends, so the minimum
+  interval is `exposure + 1/AcquisitionFrameRate`. `_set_trigger_mode()` hardcodes 165
+  for BOTH rigs (1/165 = 6.06 ms), so exposure past ~3.94 ms pushes the interval over
+  the 10 ms trigger period and every second trigger is skipped — the 50 fps bug. The
+  3dface pfs says `AcquisitionFrameRate 1000000`, but code overrides it, so the same
+  ceiling applies there. Code never sets ExposureTime or Gain; the pfs is the only source.
+  - **Raised to 3000 µs + 6 dB (3.0×) from 2000 µs / 0 dB on 2026-08-11**, both rigs.
+    The old values put 65% of pixels in levels 0–15 with **21.5% clipped at exactly 0** —
+    destroyed at the ADC, unrecoverable by brightening in a player, and crushed further
+    by H.264 at qp21. Rig-confirmed a clear improvement on 3dpose; **3dface propagated
+    but NOT yet validated** (different camera, optics and lighting — check before a real
+    session). Modelled on a real frame, 3.0× lands ~4% saturated vs 1.43% already, while
+    **7× would clip 12.7%** — don't just crank it. Prefer more IR illumination (real
+    photons, better SNR) over gain, then exposure, then gain.
+  - Verify any change against a **recording, not the preview**: preview is free-run at
+    30 fps (33 ms headroom), so an over-long exposure looks fine there and only halves
+    the frame rate once triggered.
 - Video encoding is H.264 via `h264_nvenc` (GPU). Keep `yuv420p` for compatibility.
 - **Every mp4 the rig writes needs `-g <fps>` AND `-movflags +faststart`** — both exist so
   the recordings load in the browser labeler (LUC3D), and both are easy to drop when adding

@@ -63,7 +63,7 @@ ROIZoneSelector	Zone7
 ROIZoneOffset	0
 ROIZoneSelector	Zone0
 GainSelector	All
-Gain	0.00000
+Gain	6.00000
 GainSelector	All
 BlackLevelSelector	All
 BlackLevel	0.00000
@@ -76,7 +76,7 @@ RemoveParameterLimit	0
 RemoveParameterLimitSelector	Gain
 ShutterMode	Global
 ExposureMode	Timed
-ExposureTime	2000.0
+ExposureTime	3000.0
 SensorReadoutMode	Fast
 AcquisitionBurstFrameCount	1
 TriggerSelector	FrameBurstStart

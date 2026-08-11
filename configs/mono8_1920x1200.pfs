@@ -37,7 +37,7 @@ BslMultipleROIRowOffset	{BslMultipleROIRowSelector=Row2}	1216
 BslMultipleROIRowSelector	Row1
 AcquisitionStopMode	AbortExposure
 ExposureTimeMode	Common
-ExposureTime	{ExposureTimeSelector=Common}	2000.0
+ExposureTime	{ExposureTimeSelector=Common}	3000.0
 ExposureTimeSelector	Common
 ExposureAuto	Off
 ExposureMode	Timed
@@ -105,7 +105,7 @@ AutoFunctionROISelector	ROI1
 AutoFunctionROIHighlight	{AutoFunctionROISelector=ROI1}	0
 AutoFunctionROIHighlight	{AutoFunctionROISelector=ROI2}	0
 AutoFunctionROISelector	ROI1
-Gain	{GainSelector=All}	0.000
+Gain	{GainSelector=All}	6.000
 GainSelector	All
 GainAuto	{GainSelector=All}	Off
 GainSelector	All
