@@ -251,7 +251,26 @@ Plain scripts, no pytest — run directly:
     cams 1/4/6, the heavy-resend group. **The exposure ceiling of ~3.94 ms is therefore
     real and not worth buying out** until the network margin is fixed. Exposure stays at
     3000 µs; 3500 would leave only 0.44 ms of margin at 165.
-- **`kick_max_lag: 480` on the `3dpose` profile (raised from 240, 2026-08-11).** One
+- **`kick_max_lag: 480` on the `3dpose` profile — VALIDATED 2026-08-11 by a clean A/B**
+  with identical camera settings (3.0 ms exposure, limiter 165), only the cap differing:
+
+  | `kick_max_lag` | released | loss |
+  |---|---|---|
+  | 240 | 87.68 fps | 12.34% |
+  | **480** | **99.14 fps** | **0.88%** |
+
+  100,968 frames over 17 min. **Do not chase the last 0.88% by raising it further** —
+  the laggard drifts to *whatever* the cap is (it sat at 479/480 here), so a higher cap
+  buys little, costs ~5 GB of ring per 240, and 1000 starved capture outright in June.
+  3dface stays at 240; it has different cameras and an unknown RAM budget.
+- **The laggard rotates between sessions and is unexplained.** cam1 (2026-07-27),
+  cam5 (2026-08-11 13:55), cam2 (2026-08-11 14:32) — and it is NOT the heavy-resend
+  group: cam2 and cam5 both sit in the light group (~160 resend requests vs ~186,000
+  for cams 4/6). Whatever makes one camera drift ~2.4 s behind in *submission* while
+  still capturing ~100% of triggers is still unknown; it is not packet loss, not the
+  encoders (`queue_full_drops=0`), and not the cameras. 480 makes it cheap rather than
+  fixing it.
+- Historical detail on the original 240 investigation. One
   camera — **which one varies per session** — drifts to the cap and oscillates across it,
   force-dropping frames every camera captured: 12.3% on 2026-08-11 with cam5 at median
   238 / peak 330, having been cam1 two weeks earlier. **The July note blaming the cams
