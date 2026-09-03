@@ -673,6 +673,34 @@ class MainWindow(QMainWindow):
 
     def _on_acquisition_finalized(self, _result):
         self._end_busy()
+        # CallableWorker delivers a raised exception AS the result
+        # (ui_workers.py:22-25), and this slot used to ignore its argument. So if
+        # _finalize raised — a full disk at np.save, anything inside
+        # _router.stop() — camera_manager.stop_acquisition() never reached
+        # `self._router = None`, the encoder threads never got their sentinel and
+        # blocked forever holding NVENC sessions, and the GUI marched on to
+        # ENCODING and remuxed an unflushed stream.h264, then deleted the source.
+        # Silently. _apply_camera_open_result already does this check; the
+        # pattern was understood and simply not applied here.
+        if isinstance(_result, Exception):
+            print(f"[acq] FINALIZE FAILED: {type(_result).__name__}: {_result}",
+                  flush=True)
+            try:
+                self._camera_mgr.abandon()
+            except Exception as e:
+                print(f"[acq] abandon after failed finalize also failed: {e}",
+                      flush=True)
+            self._state = State.IDLE
+            self._sidebar.set_status("IDLE", "#888888")
+            self._sidebar.set_toggles_enabled(True)
+            self._sidebar.reset_toggles()
+            QMessageBox.critical(
+                self, "Recording did not finish cleanly",
+                f"Saving the recording failed:\n\n{type(_result).__name__}: "
+                f"{_result}\n\nThe raw capture files are still in:\n"
+                f"{self._video_dir}\n\nThey have NOT been encoded or deleted. Do "
+                f"not start another recording into that directory.")
+            return
         self._state = State.ENCODING
         self._sidebar.set_status("ENCODING", "#ffaa00")
         self._sidebar.set_toggles_enabled(False)

@@ -393,3 +393,51 @@ while waiting on them.
 
 Caveat: 60 s does not sample Eth5's bad moods, and the loss on this rig has always been
 bimodal by session. This needs a 10-minute run before it can be called settled.
+
+---
+
+## Round 2: adversarial review of the round-1 changes (2026-09-03)
+
+Six lanes reviewed the round-1 diff rather than the original code, on the principle that
+the risk had moved. **It found six regressions, four of them mine**, plus 19 confirmed
+pre-existing defects. Full adjudication is in the workflow output; the corrections are in
+the commit log. The two worth reading:
+
+**My zero-copy verification block was wrong on its own premise.** I wrote that "the
+PaddingX node is not implemented on these cameras, so it cannot be read directly" —
+conflating `cam.PaddingX` (a nodemap node, genuinely absent) with **`result.PaddingX`, a
+grab-result field that is always available**. Decisively: `GetArray()` itself reads
+`result.PaddingX` to build its strides, so *the code I replaced had been reading it 100
+times a second per camera all along.* Worse, the check could never run in the case it
+existed for: with padding present, `GetImageMemoryView().cast()` raises `TypeError`
+before my comparison is reached. And `zc_verified = True` was set *before* the check, so
+any raise silently disabled the gate for the whole session. Replaced with a
+`result.PaddingX or result.PaddingY` test **before** the `with`, where failure is
+handleable.
+
+**The highest-damage defect was one round 1 only half-closed.** Round 1 made the two
+*startup* paths retire a camera that fails to arm. But three *mid-session* paths still
+did not — the broad per-frame `except` (which printed, slept 1 ms and looped forever
+without ever arming the stall detector), re-arm exhaustion, and `IsGrabbing()` simply
+going False. Each starves the coordinator into force-dropping every trigger for every
+camera. And the zero-copy change **added two new deterministic per-frame raisers** into
+that first path, so it made a latent bug reachable.
+
+A lesson worth keeping: **the re-arm-exhaustion test hung on its first run and caught a
+bug in the fix itself** — retiring sets `desynced`, which makes the branch false forever
+after, so without a `break` the thread kept timing out. Exactly the silence the fix
+existed to end.
+
+### Live re-validation after the fixes (60 s, 6 cameras)
+
+`cycle` 10.00–10.12 ms, `avg_proc` 1.03–1.17 ms, slack 8.1–8.4 ms, `deliv_lag` ~0,
+**`Buffer_Underrun_Count` 0 on all six**, `forced=0`, `queue_full_drops=0`, **5994 frames
+identical on all six cameras**.
+
+This run also **caught the Eth5 variance in the act**, which is useful: cams 1/4/6 showed
+`Failed_Buffer_Count` 32–34 and ~2,900 resend requests each, where the previous run had 0
+and ~920. Union loss 117 of 6,111 triggers (~1.9%) — all of it genuine unrecovered
+network loss, none of it pipeline: underruns stayed 0, nothing was force-dropped, and the
+frame counts stayed identical across cameras. **This is exactly the bimodality that makes
+the pending 20-minute run necessary**, and it is a clean demonstration that the pipeline
+and the transport are now separable in the data.
