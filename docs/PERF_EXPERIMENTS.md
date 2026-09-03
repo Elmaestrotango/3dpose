@@ -368,3 +368,28 @@ Enforced in `compile_ino` (raises, so the `.ino` can never be generated) and sur
 `_blocking_problem` so Apply/Test/Record explain instead of throwing. A blank pin field
 also used to coerce to `int("0")` — creating a block on RX0 — and now refuses to guess.
 New test 5b in `test_stim_compiler.py`.
+
+### Integration check after the robustness fixes (60 s, 6 cameras, 2026-09-03)
+
+Full capture path with every change in place — zero-copy, the retire paths, the block-ID
+reconciliation, NVENC session release, and the serial changes:
+
+```
+cycle=10.00ms on all six    avg_proc 0.80-0.90ms    avg_wait 8.40-8.62ms
+deliv_lag ~0                Buffer_Underrun_Count 0 on all six
+Failed_Buffer_Count 0 on ALL SIX (including the Eth5 leg, cams 1/4/6)
+grabbed per camera: [6022, 6022, 6022, 6022, 6022, 6022]
+released=6022  dropped=0  forced=0  queue_full_drops=0
+```
+
+**100.00% capture, zero loss.** For scale, the same rig measured 12.34% loss at
+`kick_max_lag=240` and 0.88% at 480 on 2026-08-11, and the best previous result on record
+was ~99.67%. The Eth5 leg (cams 1/4/6) still issues resends — ~920 requests, ~5,300
+packets — but now recovers every one of them: `Failed_Buffer_Count` is 0, where it was
+~150–600 per camera historically. Worth noting explicitly: **the "lossy switch leg" that
+was chased physically since July was never the binding constraint.** Resends were always
+recoverable; what turned them into lost frames was a grab loop too slow to drain the pool
+while waiting on them.
+
+Caveat: 60 s does not sample Eth5's bad moods, and the loss on this rig has always been
+bimodal by session. This needs a 10-minute run before it can be called settled.
