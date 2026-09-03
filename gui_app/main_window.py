@@ -10,7 +10,8 @@ from PyQt5.QtWidgets import QMainWindow, QWidget, QHBoxLayout, QApplication, QMe
 from PyQt5.QtCore import QTimer, Qt
 from PyQt5.QtGui import QPalette, QColor, QIcon, QCursor
 
-from gui_app.camera_manager import CameraManager
+from gui_app.camera_manager import CameraManager, MAX_NUM_BUFFER
+from gui_app.grab_thread import ENCODE_QUEUE_DEPTH
 from gui_app.serial_controller import TeensyController
 from gui_app.encode_worker import EncodeWorker
 from gui_app.align_worker import AlignWorker
@@ -18,7 +19,8 @@ from gui_app.ui_workers import CallableWorker
 from gui_app import alignment
 from gui_app import stim_trace
 from gui_app.calibration_worker import CalibrationWorker
-from gui_app.hardware_check import HardwareCheckThread, format_report
+from gui_app.hardware_check import (HardwareCheckThread, format_report,
+                                    check_capacity)
 from gui_app.coverage_worker import CoverageWorker
 from gui_app.session_config import SessionConfig, RigProfile
 from gui_app.widgets.camera_grid import CameraGridWidget
@@ -285,6 +287,47 @@ class MainWindow(QMainWindow):
         elif self._state == State.RECORDING:
             self._stop_acquisition()
 
+    def _preflight_capacity(self) -> bool:
+        """Check RAM, NVENC sessions and disk against the ACTUAL camera count.
+
+        False means refuse to start. Cheap arithmetic plus a cached NVENC session
+        probe, so it costs nothing per recording after the first.
+        """
+        p = self._profile
+        realtime = bool(getattr(p, "realtime_encode", True))
+        kick = realtime and bool(getattr(p, "realtime_kick", False))
+        # Mirrors grab_thread: the kick-mode ring must outlast a frame's whole
+        # journey (coordinator up to max_lag, then the encoder queue).
+        ring_n = ((p.kick_max_lag + ENCODE_QUEUE_DEPTH + 64) if kick
+                  else (ENCODE_QUEUE_DEPTH + 4))
+        try:
+            blocking, warnings = check_capacity(
+                n_cams=self._camera_mgr.num_cameras,
+                width=p.frame_width, height=p.frame_height,
+                ring_n=ring_n, max_num_buffer=MAX_NUM_BUFFER,
+                realtime=realtime, output_dir=self._sidebar.output_dir,
+                fps=p.frame_rate)
+        except Exception as e:
+            # A broken preflight must never be what stops a recording.
+            print(f"[acq] capacity preflight failed to run: {e}", flush=True)
+            return True
+        for w in warnings:
+            print(f"[acq] capacity warning: {w}", flush=True)
+        if blocking:
+            print("[acq] REFUSING to start:\n  " + "\n  ".join(blocking), flush=True)
+            QMessageBox.critical(
+                self, "Cannot start",
+                "\n\n".join(blocking)
+                + ("\n\nWarnings:\n- " + "\n- ".join(warnings) if warnings else ""))
+            return False
+        if warnings:
+            reply = QMessageBox.warning(
+                self, "Proceed?", "\n\n".join(warnings) + "\n\nStart anyway?",
+                QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+            if reply == QMessageBox.No:
+                return False
+        return True
+
     def _start_acquisition(self, acq_type: str):
         # Refuse to start on top of a live or still-finalising acquisition. The
         # sidebar already disables the toggles while busy, so a user cannot
@@ -296,13 +339,28 @@ class MainWindow(QMainWindow):
                   f"busy={self._busy}", flush=True)
             self._sidebar.clear_toggles_silently()
             return
+
+        # Capacity preflight. Every limit here scales linearly with camera
+        # count, and each one currently fails SILENTLY — a camera dropping to
+        # raw.bin because the driver's NVENC session cap was hit, a MemoryError
+        # inside a grab thread, or a disk filling mid-session. Refuse up front
+        # instead of half-recording.
+        if not self._preflight_capacity():
+            self._sidebar.clear_toggles_silently()
+            return
+
         self._config = self._build_config()
         self._acq_type = acq_type
         video_dir = self._config.video_dir(acq_type)
 
+        # blockids/frametimes/aligned count as data too: a directory whose mp4s
+        # were moved away for labelling still holds the metadata that makes them
+        # interpretable, and without these patterns it reads as empty and gets
+        # silently overwritten.
         has_data = video_dir.exists() and any(
             next(video_dir.rglob(pat), None) is not None
-            for pat in ("*.mp4", "raw.bin", "stream.h264"))
+            for pat in ("*.mp4", "raw.bin", "stream.h264",
+                        "blockids.npy", "frametimes.npy", "alignment.npz"))
         if has_data:
             reply = QMessageBox.question(
                 self, "Overwrite?",

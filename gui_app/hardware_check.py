@@ -106,6 +106,123 @@ def run_hardware_check(output_dir: str = "") -> HardwareReport:
     return report
 
 
+_nvenc_sessions: int | None = None    # highest count CONFIRMED grantable
+_nvenc_saturated = False              # last probe stopped at its limit, not at a failure
+
+
+def nvenc_session_capacity(width: int, height: int, want: int,
+                           force: bool = False) -> int:
+    """Concurrent NVENC sessions grantable, at least `want` if possible. Cached.
+
+    The cap is real and finite — measured 12 on this rig — and NVIDIA has moved
+    it across driver generations (2 → 3 → 5 → 8 → 12), so it must be PROBED and
+    never hardcoded. Six cameras never revealed it because 6 < 12.
+
+    Probing is capped at `want` because every session is a real allocation, and
+    that makes the result a LOWER BOUND whenever the probe stops at its own
+    limit rather than at a refusal. Caching such a value as if it were the cap
+    is wrong — it made a 6-camera probe (limit 8) report "8" and then wrongly
+    block a 9-camera start. So `_nvenc_saturated` records which kind of answer
+    we have, and a larger request re-probes only when the previous answer was
+    limit-bound. Returns -1 if NVENC is unavailable entirely.
+    """
+    global _nvenc_sessions, _nvenc_saturated
+    if (_nvenc_sessions is not None and not force
+            and (_nvenc_sessions >= want or not _nvenc_saturated)):
+        # Either we already confirmed enough, or we found the true ceiling.
+        return _nvenc_sessions
+    try:
+        from gui_app import nvenc
+        if not nvenc.available():
+            _nvenc_sessions, _nvenc_saturated = -1, False
+        else:
+            limit = max(1, want)
+            got = nvenc.probe_max_sessions(width, height, limit=limit)
+            _nvenc_sessions = max(got, _nvenc_sessions or 0)
+            _nvenc_saturated = (got >= limit)
+        print(f"[hw] NVENC sessions: {_nvenc_sessions}"
+              + (" (at least — probe stopped at its limit)" if _nvenc_saturated
+                 else " (driver ceiling)")
+              + f", needed {want}", flush=True)
+    except Exception as e:
+        print(f"[hw] NVENC session probe failed: {e}", flush=True)
+        _nvenc_sessions, _nvenc_saturated = -1, False
+    return _nvenc_sessions
+
+
+def check_capacity(n_cams: int, width: int, height: int,
+                   ring_n: int, max_num_buffer: int,
+                   realtime: bool, output_dir: str = "",
+                   minutes: float = 10.0, fps: int = 100) -> tuple[list, list]:
+    """Refuse-or-warn check run at acquisition start. Returns (blocking, warnings).
+
+    Everything here scales linearly with camera count, which is why it exists:
+    the numbers that were comfortable at 6 cameras are not at 9, and each of
+    these limits currently fails SILENTLY — a camera dropping to `raw.bin`
+    (~207 GB/10 min for that camera alone), a MemoryError inside a grab thread,
+    or a disk filling mid-session.
+    """
+    blocking: list[str] = []
+    warnings: list[str] = []
+    if n_cams <= 0:
+        blocking.append("No cameras are open. Recording would run the trigger "
+                        "protocol — and any baked-in stim paradigm — while "
+                        "saving nothing.")
+        return blocking, warnings
+
+    frame_b = width * height                  # mono8 from the camera
+    nv12_b = width * (height * 3 // 2)        # what the ring holds
+
+    # --- RAM -----------------------------------------------------------------
+    pool_gb = n_cams * max_num_buffer * frame_b / 2 ** 30
+    ring_gb = (n_cams * ring_n * nv12_b / 2 ** 30) if realtime else 0.0
+    need_gb = pool_gb + ring_gb
+    avail_gb = psutil.virtual_memory().available / 2 ** 30
+    detail = (f"{need_gb:.1f} GiB needed ({pool_gb:.1f} pylon pool"
+              + (f" + {ring_gb:.1f} NV12 ring" if realtime else "")
+              + f"), {avail_gb:.1f} GiB available")
+    if need_gb > avail_gb:
+        blocking.append(
+            f"Not enough RAM for {n_cams} cameras: {detail}. Lower "
+            f"MaxNumBuffer or kick_max_lag, or close other applications.")
+    elif need_gb > 0.75 * avail_gb:
+        warnings.append(f"RAM is tight for {n_cams} cameras: {detail}.")
+
+    # --- NVENC sessions ------------------------------------------------------
+    if realtime:
+        got = nvenc_session_capacity(width, height, n_cams + 2)
+        if got == 0:
+            blocking.append("NVENC granted no encode sessions, so real-time "
+                            "encoding cannot start. Use the raw profile.")
+        elif 0 < got < n_cams:
+            blocking.append(
+                f"NVENC granted only {got} concurrent sessions but {n_cams} "
+                f"cameras need one each. The driver caps this. Cameras beyond "
+                f"the cap would silently fall back to raw.bin at ~{frame_b*fps/2**30*600:.0f} "
+                f"GiB per 10 min each. Use the raw profile, or record fewer cameras.")
+
+    # --- disk ----------------------------------------------------------------
+    # Real-time H.264 is ~4.6 KB/frame; raw is the full frame every frame.
+    per_s = n_cams * fps * (4600 if realtime else frame_b)
+    need_disk_gb = per_s * minutes * 60 / 2 ** 30
+    free_gb = _get_disk_free(Path(output_dir) if output_dir else Path("."))
+    if free_gb >= 0:
+        if need_disk_gb > free_gb:
+            blocking.append(
+                f"Not enough disk for a {minutes:g}-minute recording: "
+                f"{need_disk_gb:.0f} GiB needed, {free_gb:.0f} GiB free.")
+        elif need_disk_gb > 0.8 * free_gb:
+            warnings.append(
+                f"Disk is tight: a {minutes:g}-minute recording needs "
+                f"~{need_disk_gb:.0f} GiB of {free_gb:.0f} GiB free.")
+    if not realtime and per_s / 2 ** 30 > 1.5:
+        warnings.append(
+            f"Raw capture will write {per_s / 2**30:.2f} GiB/s. Spread the "
+            f"output across both NVMe drives — a single 990 PRO drops to "
+            f"~1.6 GB/s once its SLC cache is exhausted.")
+    return blocking, warnings
+
+
 def format_report(report: HardwareReport) -> str:
     lines = [
         "Hardware Check Results",

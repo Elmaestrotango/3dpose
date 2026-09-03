@@ -6,6 +6,20 @@ import pypylon.pylon as pylon
 
 from gui_app.grab_thread import GrabThread
 
+#: Driver-side buffers per camera. 1000 is 10 s of slack at 100 fps, and it
+#: costs n_cams x 1000 x 2.304 MB of RAM — 13.8 GiB at 6 cameras, 20.7 GiB at 9.
+#: Exported so the capacity preflight can do that arithmetic before a recording
+#: starts instead of discovering it as a MemoryError inside a grab thread.
+#:
+#: The deep slack is also what let a 1.5% per-frame deficit hide for ~11 minutes
+#: before anything went wrong (see docs/PERF_EXPERIMENTS.md): nothing errors, the
+#: pool just quietly fills and every frame retrieved gets staler. Reducing it
+#: would make that failure loud within a second — but it is ALSO what absorbs
+#: genuine GigE jitter, and pool size is not monotonic (1000 NV12 ring buffers
+#: starved capture outright in June), so it must not be changed without a rig
+#: A/B. Left at 1000 deliberately.
+MAX_NUM_BUFFER = 1000
+
 
 class CameraManager(QObject):
     error = pyqtSignal(str)
@@ -70,7 +84,7 @@ class CameraManager(QObject):
                 pylon.FeaturePersistence.Load(pfs_path, cam.GetNodeMap(), False)
                 # 1000 buffers = ~2.3 GB/cam at 1920x1200 (10 s of slack at
                 # 100 fps); ~13.8 GB across 6 cams, fine on the 64 GB machine.
-                cam.MaxNumBuffer.SetValue(1000)
+                cam.MaxNumBuffer.SetValue(MAX_NUM_BUFFER)
                 self._enable_extended_block_ids(i, cam)
                 self._select_gige_driver(i, cam, gige_driver)
             except Exception as e:
