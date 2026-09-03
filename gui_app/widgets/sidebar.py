@@ -342,6 +342,14 @@ class SidebarWidget(QWidget):
         self._calibrate_toggle.setEnabled(enabled)
         self._record_toggle.setEnabled(enabled)
 
+    def clear_toggles_silently(self):
+        """Force both toggles off WITHOUT emitting — for refusing a start.
+        Emitting here would re-enter the stop path we are already guarding."""
+        for t in (self._calibrate_toggle, self._record_toggle):
+            t.blockSignals(True)
+            t.setChecked(False)
+            t.blockSignals(False)
+
     def stop_record(self):
         """Flip Record off programmatically — emits record_toggled like a click."""
         self._record_toggle.setChecked(False)

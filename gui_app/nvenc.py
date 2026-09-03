@@ -41,7 +41,38 @@ def _load():
         except Exception as e:  # missing wheel, missing cudart, no GPU, etc.
             _load_error = e
             print(f"[nvenc] PyNvVideoCodec unavailable, will fall back to raw: {e}", flush=True)
+        if _nvc is not None:
+            _warm()
         _loaded = True
+
+
+def _warm():
+    """Force PyNvVideoCodec's first-Encode lazy import, single-threaded.
+
+    Encode() pulls in more machinery the first time it is called. When six
+    encoder threads hit that simultaneously they pile up on the import
+    machinery and the WHOLE PROCESS wedges — proven 2026-08-11 with a
+    faulthandler dump showing one thread parked in importlib.find_spec() under
+    Encode() while every grab thread sat idle and the recording produced
+    nothing at all. Doing one throwaway encode here, inside the load lock,
+    means the encoder threads only ever meet the already-imported fast path.
+
+    Tiny frame, and failures are swallowed: this is a hazard removal, not a
+    requirement. create_h264_encoder() still surfaces real errors.
+    """
+    import numpy as np
+    try:
+        # 256x256, not smaller: NVENC rejects 128x128 with "CreateEncoder
+        # Error code : 8", which silently skipped this warmup when first added.
+        enc = _nvc.CreateEncoder(256, 256, "NV12", True, codec="h264")
+        enc.Encode(np.full((384, 256), 128, np.uint8))
+        try:
+            enc.EndEncode()
+        except Exception:
+            pass
+        print("[nvenc] warmed (first-Encode import done single-threaded)", flush=True)
+    except Exception as e:
+        print(f"[nvenc] warmup skipped: {e}", flush=True)
 
 
 def available() -> bool:

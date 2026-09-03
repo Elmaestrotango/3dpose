@@ -305,6 +305,23 @@ class GrabThread(QThread):
         first_frame_logged = False
         t_wait = 0.0   # cumulative s blocked in RetrieveResult (per 1000 frames)
         t_proc = 0.0   # cumulative s spent processing a frame (per 1000 frames)
+        # --- lag diagnostics -------------------------------------------------
+        # Delivery lag = how stale a frame is when we finally retrieve it,
+        # measured against the camera's own clock so host scheduling can't skew
+        # it. MaxNumBuffer is 1000 (10 s at 100 fps) and GrabStrategy_OneByOne
+        # hands frames over oldest-first, so a thread that stalls briefly and
+        # then only just keeps up carries that backlog for the rest of the run.
+        # If that is what the coordinator sees as "lag", this number grows and
+        # stays; if the lag lives elsewhere, this stays flat.
+        clock_off = None          # (host - device) at the first frame
+        deliv_lag = 0.0           # seconds of accumulated delivery delay
+        t_copy = t_submit = t_disp = 0.0   # where the per-frame budget goes
+        # t_wait + t_proc does NOT cover the whole iteration: Release(), the fps
+        # bookkeeping and the loop edge sit outside both. On 2026-08-11 the
+        # laggard camera had LOWER proc than its peers, so the ~1.5% deficit that
+        # walks it into the cap has to live in that gap. t_cycle closes it.
+        t_rel = t_cycle = 0.0
+        t_prev = None
 
         try:
             while self._running and self._camera.IsGrabbing():
@@ -333,12 +350,18 @@ class GrabThread(QThread):
                             # (the common set), so this thread records none.
                             buf = self._nv12_ring[self._ring_i]
                             self._ring_i = (self._ring_i + 1) % len(self._nv12_ring)
+                            tc0 = time.perf_counter()
                             buf[:self._height, :] = img
+                            t_copy += time.perf_counter() - tc0
                             try:
                                 raw_bid = result.BlockID
                             except Exception:
                                 raw_bid = -1
                             dev_ts = result.TimeStamp * 1e-9
+                            # How far behind the camera's own clock we are now.
+                            if clock_off is None:
+                                clock_off = t1 - dev_ts
+                            deliv_lag = (t1 - dev_ts) - clock_off
                             if awaiting_resync:
                                 awaiting_resync = False
                                 off = self._resync_offset(raw_bid, dev_ts)
@@ -356,8 +379,10 @@ class GrabThread(QThread):
                                 bid = raw_bid + bid_offset
                                 self._last_bid_eff = bid
                                 self._last_ts = dev_ts
+                                ts0 = time.perf_counter()
                                 self._router.submit(self._cam_index, bid,
                                                     dev_ts, buf)
+                                t_submit += time.perf_counter() - ts0
                             self.frame_count += 1  # grabbed count (for logging)
                         elif enc_thread is not None:
                             persisted = self._put_frame(enc_thread, img)
@@ -393,8 +418,12 @@ class GrabThread(QThread):
                             self._router.pending() if kick else 0)
                         print(f"[grab{self._cam_index}] frames={frame_n} timeouts={timeout_n} "
                               f"avg_wait={t_wait:.2f}ms avg_proc={t_proc:.2f}ms "
-                              f"qsize={qd}", flush=True)
+                              f"qsize={qd} | deliv_lag={deliv_lag:+.3f}s "
+                              f"copy={t_copy:.2f} submit={t_submit:.2f} "
+                              f"disp={t_disp:.2f} rel={t_rel:.2f} "
+                              f"cycle={t_cycle:.2f}ms", flush=True)
                         t_wait = t_proc = 0.0
+                        t_copy = t_submit = t_disp = t_rel = t_cycle = 0.0
                     now = time.perf_counter()
                     self._fps_times.append(now)
                     if len(self._fps_times) >= 2:
@@ -403,6 +432,7 @@ class GrabThread(QThread):
                             self.current_fps = (len(self._fps_times) - 1) / dt
 
                     if frame_n % self._display_every == 0:
+                        td0 = time.perf_counter()
                         d = self._downsample
                         self.latest_frame = img[::d, ::d].copy()
                         # Full-res copy for the coverage HUD detector (calibration
@@ -410,8 +440,14 @@ class GrabThread(QThread):
                         # board, same as the post-hoc calibration.
                         if self._keep_full:
                             self.latest_full_frame = img.copy()
+                        t_disp += time.perf_counter() - td0
 
+                    tr0 = time.perf_counter()
                     result.Release()
+                    t_rel += time.perf_counter() - tr0
+                    if t_prev is not None:
+                        t_cycle += tr0 - t_prev   # start-of-iteration to start
+                    t_prev = tr0
 
                 except pylon.TimeoutException:
                     timeout_n += 1

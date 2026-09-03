@@ -286,6 +286,16 @@ class MainWindow(QMainWindow):
             self._stop_acquisition()
 
     def _start_acquisition(self, acq_type: str):
+        # Refuse to start on top of a live or still-finalising acquisition. The
+        # sidebar already disables the toggles while busy, so a user cannot
+        # reach this — but any programmatic path that bypasses the widget starts
+        # a SECOND acquisition whose state the machine then loses track of
+        # (proven 2026-08-11: cameras kept streaming while _state read IDLE).
+        if self._state != State.IDLE or self._busy:
+            print(f"[acq] refusing start: state={self._state.value} "
+                  f"busy={self._busy}", flush=True)
+            self._sidebar.clear_toggles_silently()
+            return
         self._config = self._build_config()
         self._acq_type = acq_type
         video_dir = self._config.video_dir(acq_type)
