@@ -480,7 +480,22 @@ class MainWindow(QMainWindow):
 
     def _rollback_acquisition(self, message: str):
         """Undo a half-started acquisition. The cameras are already grabbing in
-        trigger mode, so without this they sit waiting for triggers forever."""
+        trigger mode, so without this they sit waiting for triggers forever.
+
+        Stand the BOARD down first, before the cameras. This runs from the
+        `start_triggers() == False` branch, which is precisely the case where the
+        board may have consumed the config, begun triggering and run initStim()
+        but failed to ack — so a stim paradigm (and the laser pin) can be live
+        right now. Rolling back only the cameras leaves it running while the GUI
+        returns to IDLE showing "did not acknowledge", which reads to the user as
+        "nothing happened".
+        """
+        if self._teensy is not None:
+            if not self._teensy.stop_triggers(self._profile.trigger_pins):
+                message += ("\n\nWARNING: the trigger board did not accept the stop "
+                            "command. It may still be triggering and any stim "
+                            "paradigm may still be running. Power-cycle the board "
+                            "and key off the laser before continuing.")
         self._camera_mgr.stop_acquisition()
         self._camera_mgr.resume_preview()
         self._sidebar.reset_toggles()
@@ -805,6 +820,7 @@ class MainWindow(QMainWindow):
                 get_fps=lambda: self._profile.frame_rate,
                 is_busy=lambda: self._state in (State.RECORDING, State.CALIBRATING),
                 get_safe_pins=lambda: self._profile.stim_safe_pins,
+                get_trigger_pins=lambda: self._profile.trigger_pins,
                 get_serial=self._teensy_connection,
                 release_serial=self.release_serial_port,
                 parent=self,

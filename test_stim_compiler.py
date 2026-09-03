@@ -137,6 +137,33 @@ def test_pin_conflicts():
     print("5) pin conflict detection (within vs across chains): PASS")
 
 
+def test_forbidden_pins():
+    TRIG = [2, 4, 6, 8, 10, 12]
+    # A stim block on a camera trigger line injects extra rising edges into ONE
+    # camera, so its block IDs advance faster and block-ID N stops meaning the
+    # same instant across cameras. frame_sync/alignment/stim_trace all assume
+    # that identity, so nothing downstream can detect it -- refuse at compile.
+    bad = sc.forbidden_pin_uses([B("A", pin=6)], TRIG)
+    assert [p for p, _ in bad] == [6], bad
+    assert "trigger" in bad[0][1]
+    # RX0/TX0 garble the serial link and the RDY ack. Checked with no profile.
+    assert [p for p, _ in sc.forbidden_pin_uses([B("A", pin=0)])] == [0]
+    assert [p for p, _ in sc.forbidden_pin_uses([B("A", pin=1)])] == [1]
+    # A legitimate stim pin is untouched.
+    assert sc.forbidden_pin_uses([B("A", pin=53)], TRIG) == []
+    # compile_ino must REFUSE, so the .ino can never reach the board.
+    for pin in (6, 0):
+        try:
+            sc.compile_ino([B("A", pin=pin)], [], [53], TRIG)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(f"compile_ino accepted a block on pin {pin}")
+    # And still compiles normally for a good graph.
+    assert "void setup()" in sc.compile_ino([B("A", pin=53)], [], [53], TRIG)
+    print("5b) forbidden pins: trigger lines + RX0/TX0 refused at compile: PASS")
+
+
 def test_durations():
     # end_time_s = cumulative duration up to and including the flagged block.
     assert sc.end_time_s([B("A", 5), B("B", 3, end=True)], [E("A", "B")]) == 8.0
@@ -292,6 +319,7 @@ def main():
     test_waveform_encoding()
     test_safe_pins()
     test_pin_conflicts()
+    test_forbidden_pins()
     test_durations()
     test_describe()
     test_generated_sketch_is_wellformed()

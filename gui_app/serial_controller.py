@@ -39,7 +39,14 @@ class TeensyController:
                 # Total_Packet_Count 0 on all six cameras. Do not do that again.
                 # The laser flash it causes is a hardware problem; the fix is to
                 # keep this connection open rather than to defeat the reset.
-                self._ser = serial.Serial(port=self._port, baudrate=self._baudrate, timeout=0.1)
+                # write_timeout matters for safety, not just tidiness: without it
+                # a write to a wedged or unplugged board blocks forever, and the
+                # one write that must never hang is stop_triggers() — the command
+                # that ends a paradigm and drives the laser pin low. With it, a
+                # failed stop raises SerialTimeoutException (a SerialException
+                # subclass) and the caller can tell the user instead of hanging.
+                self._ser = serial.Serial(port=self._port, baudrate=self._baudrate,
+                                          timeout=0.1, write_timeout=1.0)
                 time.sleep(1.0)
                 return True
             except serial.SerialException:
@@ -113,16 +120,35 @@ class TeensyController:
             print(f"[teensy] wanted {want!r}, got {buf.strip()!r}", flush=True)
         return False
 
-    def stop_triggers(self, pins: list[int]):
+    def stop_triggers(self, pins: list[int]) -> bool:
+        """Stop triggering and drive the stim pins low. True iff the board got it.
+
+        This cannot be fire-and-forget. The sketch's reconfigure branch runs
+        `camsLow(); allStimLow(); FPS_OUT=0`, so this command is what ends a
+        paradigm — and a *looping* stim chain otherwise runs forever, driving the
+        laser pin with the GUI showing IDLE. CLAUDE.md's invariant is "closing the
+        GUI can never leave a paradigm or laser running", and a swallowed failure
+        here breaks exactly that.
+
+        The caller MUST NOT infer success from the port being open: pyserial's
+        `is_open` stays True after the USB device disappears, so an unplugged
+        cable looks healthy right up until the write fails.
+        """
         if not self._ser:
-            return
+            print("[teensy] STOP NOT SENT: no serial link. The board may still be "
+                  "triggering and any stim paradigm may still be running.",
+                  flush=True)
+            return False
         cmd = ",".join(str(x) for x in [len(pins)] + list(pins) + [-1]) + "\n"
         try:
             self._ser.write(cmd.encode())
         except (serial.SerialException, OSError) as e:
-            print(f"[teensy] stop write failed: {e}", flush=True)
-            return
+            print(f"[teensy] STOP WRITE FAILED: {e} — the board may still be "
+                  f"triggering and any stim paradigm may still be running. "
+                  f"Power-cycle the board and key off the laser.", flush=True)
+            return False
         print(f"[teensy] sent stop: {cmd!r}", flush=True)
+        return True
 
     def close(self):
         if self._ser and self._ser.is_open:

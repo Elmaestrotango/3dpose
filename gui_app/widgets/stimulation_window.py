@@ -806,6 +806,7 @@ class StimulationWindow(QDialog):
                  is_busy: Callable[[], bool] = lambda: False,
                  get_safe_pins: Callable[[], list] = lambda: list(
                      stim_compiler.DEFAULT_SAFE_LOW_PINS),
+                 get_trigger_pins: Callable[[], list] = lambda: [],
                  get_serial: Callable[[], object] = lambda: None,
                  release_serial: Callable[[], None] = lambda: None,
                  parent=None):
@@ -815,6 +816,10 @@ class StimulationWindow(QDialog):
         self._get_fps        = get_fps
         self._is_busy        = is_busy
         self._get_safe_pins  = get_safe_pins
+        # Needed to refuse a stim chain on a camera trigger line, which would
+        # silently break cross-camera block-ID alignment. Defaults to empty so a
+        # bare editor still works, but main_window MUST pass the profile's pins.
+        self._get_trigger_pins = get_trigger_pins
         self._get_serial     = get_serial
         self._release_serial = release_serial
         self._test_owns_serial = False
@@ -1026,7 +1031,8 @@ class StimulationWindow(QDialog):
 
     def _compile(self) -> str:
         blocks, edges = self._canvas.get_workflow()
-        return stim_compiler.compile_ino(blocks, edges, self._get_safe_pins())
+        return stim_compiler.compile_ino(blocks, edges, self._get_safe_pins(),
+                                         self._get_trigger_pins())
 
     def _blocking_problem(self) -> str | None:
         """Reason this workflow must not be uploaded or run, or None."""
@@ -1035,6 +1041,15 @@ class StimulationWindow(QDialog):
         if needs:
             return (f"{len(needs)} block(s) form a loop with no starting block, "
                     f"so they would never run.\n\nSelect one and tick 'Starting'.")
+        # Refuse before compile_ino raises, so the user gets an explanation
+        # rather than a traceback. This is the only known way to silently break
+        # the rig's core assumption that block ID N is the same instant on every
+        # camera, so it blocks Apply, Test and Record.
+        bad = stim_compiler.forbidden_pin_uses(blocks, self._get_trigger_pins())
+        if bad:
+            return "\n\n".join(
+                [f"Pin {p} cannot carry a stim waveform: {why}." for p, why in bad]
+                + ["Move the block to a free pin."])
         clash = stim_compiler.pin_conflicts(blocks, edges)
         if clash:
             pins = ", ".join(str(p) for p in clash)
@@ -1083,7 +1098,14 @@ class StimulationWindow(QDialog):
     # ── create ────────────────────────────────────────────────────────────────
     def _on_create(self):
         try:
-            pin  = int(self._f_pin.text()   or "0")
+            # No default for the pin. Coercing a blank field to "0" silently
+            # created a block on pin 0 = UART RX0, which garbles the link to the
+            # trigger board; and on a rig whose trigger pins start at 2 a
+            # mistyped pin is far better refused than guessed.
+            if not self._f_pin.text().strip():
+                self._set_status("Enter a pin number.", error=True)
+                return
+            pin  = int(self._f_pin.text())
             freq = float(self._f_freq.text() or "0")
             pw   = float(self._f_pw.text()   or "0")
             dur  = float(self._f_dur.text()  or "1")

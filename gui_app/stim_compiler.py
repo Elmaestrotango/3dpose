@@ -175,13 +175,62 @@ def test_duration_s(blocks: list[dict], edges: list[dict]) -> float | None:
     return max(sum(float(b["dur"]) for b in c) for c, _ in chains)
 
 
+#: Pins a stim chain must never drive, regardless of rig. 0/1 are the Mega's
+#: UART RX0/TX0 — the link the GUI talks to the board over.
+RESERVED_SERIAL_PINS = (0, 1)
+
+
+def forbidden_pin_uses(blocks: list[dict],
+                       trigger_pins=()) -> list[tuple[int, str]]:
+    """Stim blocks assigned to pins that must never carry a stim waveform.
+
+    Two classes, both of which fail SILENTLY — nothing downstream can detect
+    either, which is why this is enforced at compile time rather than reviewed:
+
+    - **Camera trigger pins.** The rig's whole alignment model rests on GigE
+      BlockID N denoting the same instant on every camera, which holds because
+      one board drives every trigger line from one timer. A stim chain on a
+      trigger pin makes `updateStim()` inject extra rising edges into ONE
+      camera, so that camera's BlockIDs advance faster and BlockID identity
+      quietly stops meaning simultaneity. `frame_sync`, `alignment.py` and
+      `stim_trace` all take that identity as given.
+    - **RX0/TX0 (pins 0 and 1).** Driving them garbles the serial protocol and
+      the RDY ack that CLAUDE.md calls "the whole safety property". Pin 0 is
+      especially easy to hit because a blank pin field in the editor coerces to
+      0.
+
+    No legitimate paradigm drives either. Returns [(pin, reason), ...].
+    """
+    trig = {int(p) for p in trigger_pins}
+    out: list[tuple[int, str]] = []
+    for pin in sorted({int(b["pin"]) for b in blocks}):
+        if pin in trig:
+            out.append((pin, "camera trigger line — extra edges on one camera "
+                             "would break cross-camera block-ID alignment"))
+        elif pin in RESERVED_SERIAL_PINS:
+            out.append((pin, "UART RX0/TX0 — would garble the trigger-board "
+                             "serial link and the RDY ack"))
+    return out
+
+
 def compile_ino(blocks: list[dict], edges: list[dict],
-                safe_pins=DEFAULT_SAFE_LOW_PINS) -> str:
+                safe_pins=DEFAULT_SAFE_LOW_PINS, trigger_pins=()) -> str:
     """Return the .ino source for the combined camera-trigger + stim sketch.
 
     safe_pins come from the rig profile's `stim_safe_pins` and are held LOW from
     boot regardless of what the workflow uses.
+
+    trigger_pins come from the profile too, and are refused rather than
+    compiled: see forbidden_pin_uses(). Raises ValueError so a graph that would
+    corrupt cross-camera alignment can never reach the board. The RX0/TX0 check
+    is unconditional; the trigger-pin check needs the profile, so callers that
+    have one MUST pass it.
     """
+    bad = forbidden_pin_uses(blocks, trigger_pins)
+    if bad:
+        detail = "; ".join(f"pin {p}: {why}" for p, why in bad)
+        raise ValueError(f"stim block on a forbidden pin — {detail}")
+
     chains = _extract_chains(blocks, edges)
     n = len(chains)
 
