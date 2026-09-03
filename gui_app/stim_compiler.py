@@ -4,10 +4,56 @@ import tempfile
 import shutil
 from pathlib import Path
 
-ARDUINO_CLI = Path(
-    r"C:\Program Files\Arduino IDE\resources\app\lib\backend\resources\arduino-cli.exe"
-)
 FQBN = "arduino:avr:mega"
+
+#: Where arduino-cli might live, in priority order. Overridable with the
+#: PANOPTICON_ARDUINO_CLI environment variable. Kept as a search rather than a
+#: constant because the old hardcoded absolute path silently broke Apply on any
+#: machine with a different Arduino install — and the failure surfaced as a
+#: generic upload error rather than "the tool is missing".
+_ARDUINO_CLI_CANDIDATES = (
+    r"C:\Program Files\Arduino IDE\resources\app\lib\backend\resources\arduino-cli.exe",
+    r"C:\Program Files (x86)\Arduino IDE\resources\app\lib\backend\resources\arduino-cli.exe",
+    "/usr/local/bin/arduino-cli",
+    "/usr/bin/arduino-cli",
+    "/opt/homebrew/bin/arduino-cli",
+)
+
+
+def find_arduino_cli() -> Path | None:
+    """Locate arduino-cli, or None. Checked at Apply time, not import time."""
+    import os
+    env = os.environ.get("PANOPTICON_ARDUINO_CLI")
+    if env and Path(env).exists():
+        return Path(env)
+    on_path = shutil.which("arduino-cli")
+    if on_path:
+        return Path(on_path)
+    for c in _ARDUINO_CLI_CANDIDATES:
+        if Path(c).exists():
+            return Path(c)
+    return None
+
+
+def arduino_cli_help() -> str:
+    """A message that says what to actually DO, for when it is not found."""
+    return (
+        "arduino-cli was not found, so the stim firmware cannot be compiled or "
+        "uploaded.\n\n"
+        "Panopticon looked in, in order:\n"
+        "  1. $PANOPTICON_ARDUINO_CLI\n"
+        "  2. arduino-cli on PATH\n"
+        + "".join(f"  {i}. {c}\n" for i, c in enumerate(_ARDUINO_CLI_CANDIDATES, 3))
+        + "\nFix it either way:\n"
+        "  - install the Arduino IDE (which bundles arduino-cli), or\n"
+        "  - install arduino-cli standalone and put it on PATH, or\n"
+        "  - set PANOPTICON_ARDUINO_CLI to its full path.\n\n"
+        "Camera acquisition does NOT need this — only the Stimulation editor's "
+        "Apply/Test, which compile and flash the trigger board.")
+
+
+#: Back-compat for existing callers; None if not installed.
+ARDUINO_CLI = find_arduino_cli()
 
 # Fallback for callers that don't pass the rig's pins. The real list comes from
 # the profile's `stim_safe_pins` — see RigProfile. These are forced LOW the
@@ -506,27 +552,56 @@ void loop() {{
 
 def upload(ino_content: str, port: str) -> tuple[bool, str]:
     """Compile and upload the .ino to the Arduino. Returns (success, message)."""
+    # Resolve at call time, not import time: the tool may be installed while the
+    # GUI is open, and a missing tool should read as "install this" rather than
+    # as a generic upload failure (the old hardcoded path produced the latter).
+    cli = find_arduino_cli()
+    if cli is None:
+        return False, arduino_cli_help()
+
     tmp = Path(tempfile.mkdtemp())
     sketch_dir = tmp / "panopticon_stim"
     sketch_dir.mkdir()
     (sketch_dir / "panopticon_stim.ino").write_text(ino_content, encoding="utf-8")
     try:
         r = subprocess.run(
-            [str(ARDUINO_CLI), "compile", "--fqbn", FQBN, str(sketch_dir)],
+            [str(cli), "compile", "--fqbn", FQBN, str(sketch_dir)],
             capture_output=True, text=True, timeout=120,
         )
         if r.returncode != 0:
-            return False, f"Compile failed:\n{r.stderr}\n{r.stdout}"
+            return False, (
+                f"Compile failed (arduino-cli exit {r.returncode}).\n\n"
+                f"This is a problem with the generated sketch or the toolchain, "
+                f"not with the board — nothing was flashed, so the board still "
+                f"runs whatever it ran before.\n\n"
+                f"If the error mentions a missing core, install it:\n"
+                f"    arduino-cli core install arduino:avr\n\n"
+                f"{r.stderr}\n{r.stdout}")
         r = subprocess.run(
-            [str(ARDUINO_CLI), "upload", "--fqbn", FQBN, "--port", port, str(sketch_dir)],
+            [str(cli), "upload", "--fqbn", FQBN, "--port", port, str(sketch_dir)],
             capture_output=True, text=True, timeout=60,
         )
         if r.returncode != 0:
-            return False, f"Upload failed:\n{r.stderr}\n{r.stdout}"
+            return False, (
+                f"Upload failed on {port} (arduino-cli exit {r.returncode}).\n\n"
+                f"The sketch compiled, so this is the link to the board. Common "
+                f"causes: the port is held by something else (Arduino Serial "
+                f"Monitor, another Panopticon instance), the wrong port is set "
+                f"in the profile, or the board is not an {FQBN}.\n\n"
+                f"WARNING: an upload that failed part-way leaves the board's "
+                f"firmware in an UNKNOWN state, which means the stim/laser pin "
+                f"state is also unknown. Power-cycle the board before relying "
+                f"on it.\n\n"
+                f"{r.stderr}\n{r.stdout}")
         return True, "Upload successful — Arduino will restart and wait for record command."
-    except subprocess.TimeoutExpired:
-        return False, "Timed out during compile/upload."
+    except subprocess.TimeoutExpired as e:
+        return False, (
+            f"Timed out after {e.timeout:.0f}s during compile/upload.\n\n"
+            f"If it timed out on UPLOAD the board may have been partially "
+            f"flashed and its firmware — including the laser-pin boot guard — "
+            f"is in an unknown state. Power-cycle it.")
     except Exception as e:
-        return False, str(e)
+        return False, (f"{type(e).__name__}: {e}\n\n"
+                       f"arduino-cli used: {cli}")
     finally:
         shutil.rmtree(tmp, ignore_errors=True)

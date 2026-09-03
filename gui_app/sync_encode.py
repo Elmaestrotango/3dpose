@@ -18,6 +18,11 @@ from pathlib import Path
 
 import numpy as np
 
+#: _O_BINARY only exists on Windows; on POSIX the flag is meaningless
+#: and referencing it is an AttributeError at import. Zero is the correct
+#: no-op there, so this is all that stands between these modules and Linux.
+_O_BINARY = getattr(os, "O_BINARY", 0)
+
 from gui_app import nvenc
 from gui_app.frame_sync import FrameSyncCoordinator
 from gui_app.grab_thread import _EncoderThread
@@ -51,7 +56,7 @@ class SyncEncodeRouter:
                 enc = nvenc.create_h264_encoder(width, height, quality, fps=fps)
                 h264_path = Path(rp).parent / "stream.h264"
                 fd = os.open(str(h264_path),
-                             os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_BINARY)
+                             os.O_WRONLY | os.O_CREAT | os.O_TRUNC | _O_BINARY)
                 et = _EncoderThread(i, enc, fd, Path(rp).parent / "raw_tail.bin",
                                     width, height)
                 self._encoders.append(et)

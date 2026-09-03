@@ -12,6 +12,11 @@ import queue
 import threading
 import time
 import numpy as np
+
+#: _O_BINARY only exists on Windows; on POSIX the flag is meaningless
+#: and referencing it is an AttributeError at import. Zero is the correct
+#: no-op there, so this is all that stands between these modules and Linux.
+_O_BINARY = getattr(os, "O_BINARY", 0)
 from collections import deque
 from pathlib import Path
 from PyQt5.QtCore import QThread
@@ -113,7 +118,7 @@ class _EncoderThread(threading.Thread):
                     except Exception:
                         pass
                     spill_fd = os.open(str(self._spill_path),
-                                       os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_BINARY)
+                                       os.O_WRONLY | os.O_CREAT | os.O_TRUNC | _O_BINARY)
                     os.write(spill_fd, nv12[:self._height])
                     self.spilled += 1
         finally:
@@ -289,7 +294,7 @@ class GrabThread(QThread):
                 from gui_app import nvenc
                 enc = nvenc.create_h264_encoder(self._width, self._height, self._quality, fps=self._fps)
                 h264_path = self._raw_path.parent / "stream.h264"
-                h264_fd = os.open(str(h264_path), os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_BINARY)
+                h264_fd = os.open(str(h264_path), os.O_WRONLY | os.O_CREAT | os.O_TRUNC | _O_BINARY)
                 enc_thread = _EncoderThread(
                     self._cam_index, enc, h264_fd,
                     self._raw_path.parent / "raw_tail.bin",
@@ -310,7 +315,7 @@ class GrabThread(QThread):
                     os.close(h264_fd); h264_fd = None
 
         if recording and not kick and enc_thread is None:
-            fd = os.open(str(self._raw_path), os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_BINARY)
+            fd = os.open(str(self._raw_path), os.O_WRONLY | os.O_CREAT | os.O_TRUNC | _O_BINARY)
 
         print(f"[grab{self._cam_index}] StartGrabbing (recording={recording})", flush=True)
         try:

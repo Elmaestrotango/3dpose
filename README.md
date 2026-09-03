@@ -1,42 +1,84 @@
 # Panopticon — 3DPose
 
-Multi-camera synchronized acquisition GUI for 3D pose estimation. This is the **3dpose rig** deployment of Panopticon.
+Multi-camera **hardware-synchronized** acquisition for 3D pose estimation: N cameras
+triggered off one clock, encoded to H.264 on the GPU *during* capture, and written out
+already frame-aligned so that frame *i* is the same instant in every view.
 
-The same GUI codebase (`gui_app/`) is shared with the [3dface](https://github.com/Elmaestrotango/3dface) repository. The only difference between deployments is the rig profile, which configures camera resolution, board parameters, and data paths.
+This repo is the **3dpose rig** deployment. The `gui_app/` codebase is shared unchanged
+with [3dface](https://github.com/Elmaestrotango/3dface); only the rig profile differs.
 
 | | 3dpose (this repo) | 3dface |
 |---|---|---|
 | **Cameras** | 6x Basler a2A1920-165g5m (GigE) | 6x Basler acA1300-200um (USB3) |
 | **Resolution** | 1920x1200 | 1280x1024 (full sensor) |
-| **Interface** | GigE | USB 3.0 |
+| **Interface** | GigE (2x 10 GbE, 3 cameras per port) | USB 3.0 |
 | **Storage / 10 min** | ~a few GB (online encode) · ~138 GB/cam in raw fallback | ~a few GB · ~79 GB/cam raw |
 | **Calibration board** | ChArUco 8x8, 15mm squares | ChArUco 5x5, 0.5mm squares |
 
-> **Offline use:** Once installed, the entire pipeline (acquisition, encoding, calibration) runs fully offline. Only initial setup (`uv sync`, `git clone`) requires internet.
+> **Offline use:** once installed, acquisition, encoding and calibration run fully
+> offline. Only `git clone` and `uv sync` need the internet.
 
 ---
 
-## Prerequisites
+## Will this run on my hardware?
 
-| Requirement | Notes |
-|---|---|
-| **uv** | Python package manager ([install](https://docs.astral.sh/uv/getting-started/installation/)) |
-| **Basler Pylon SDK** | [Download](https://www.baslerweb.com/en/downloads/software-downloads/) — needed for USB3/GigE camera drivers |
-| **NVIDIA GPU + driver 550+** | NVENC H.264 encoding, used live during capture by default (online encode). Without it the GUI falls back to raw-to-disk + post-hoc encode. |
-| **Teensy/Arduino** | Flashed with `campy/campy/trigger/trigger.ino` via Arduino IDE |
-| **NVMe SSD** | Online encode writes only a few GB/session. The raw-to-disk fallback needs 500+ GB free and 1000+ MB/s sustained write. |
+Honest answer up front, because the compatibility surface is narrow in one specific
+place and wide everywhere else.
 
-### Hardware requirements
-
-| Resource | Minimum | Recommended |
+| Layer | Requirement | How hard to change |
 |---|---|---|
-| CPU | 4 cores | 8+ cores |
-| RAM | 16 GB | 32 GB |
-| Disk free | 500 GB | 1 TB+ |
-| Disk write | 500 MB/s | 1400+ MB/s (NVMe) |
-| GPU | NVIDIA with NVENC | Any modern NVIDIA GPU |
+| **Cameras** | **Basler** (pypylon) | **Hard.** ~1,050 LOC across `camera_manager.py` + `grab_thread.py` is Basler-specific. Other SDKs expose the same concepts (frame IDs, buffer pools, resends) but not the same API. |
+| **GPU** | NVIDIA with NVENC | Easy — the session limit and encoder config are *probed*, not assumed. |
+| **OS** | Windows (today) | Moderate — a handful of Win32 calls, all isolated. See *Porting to Linux*. |
+| **Trigger** | Arduino/Teensy on a serial port | Easy — pins, port and rate are profile fields. |
+| **Camera count** | any | Easy — `n_cameras` in the profile. |
 
-On launch, Panopticon runs a hardware check and shows a warning if any resource falls below the minimum. The warning is non-blocking — you can dismiss it and continue.
+**~1,300 LOC is already fully portable** with no camera, GUI or OS dependency:
+`frame_sync.py` (the cross-camera coordinator, with a proof of equivalence to post-hoc
+block-ID intersection), `alignment.py`, `stim_compiler.py`, `stim_trace.py`,
+`session_config.py`, `serial_controller.py`, `board_detector.py`. If you only want the
+synchronization logic, take `frame_sync.py` — it is 173 lines and depends on nothing.
+
+**Four of the five test suites run with no hardware at all**, so you can develop against
+this without a rig:
+
+```bash
+uv run python test_frame_sync.py        # coordinator == post-hoc intersection
+uv run python test_grab_failure.py      # camera-failure paths (stub camera + router)
+uv run python test_stim_compiler.py     # stim graph -> firmware
+uv run python test_serial_handshake.py  # trigger-board handshake (stubs pyserial)
+uv run python test_sync_router.py       # NEEDS an NVENC GPU
+```
+
+---
+
+## Requirements
+
+### Software
+
+| Requirement | Why | Notes |
+|---|---|---|
+| **uv** | everything | [install](https://docs.astral.sh/uv/getting-started/installation/). No conda needed. |
+| **Basler pylon SDK** | camera drivers | [download](https://www.baslerweb.com/en/downloads/software-downloads/). Install before `uv sync`. |
+| **NVIDIA driver** | NVENC H.264 during capture | Recent driver. Without a working NVENC the GUI falls back to raw-to-disk + post-hoc encode, which needs **~100x more disk**. |
+| **Arduino IDE** *or* `arduino-cli` | only for the Stimulation editor | Not needed for plain acquisition. Set `PANOPTICON_ARDUINO_CLI` if it is installed somewhere unusual. |
+
+### Hardware
+
+These are **measured on the reference rig** (6 cameras, 1920x1200, 100 fps), not
+guesses. Scale them by your own camera count and pixel rate.
+
+| Resource | Minimum | Reference rig | Why it matters |
+|---|---|---|---|
+| CPU | 4 cores | Intel Ultra 9 285K (24 cores) | Each grab thread must finish its cycle inside one frame period (10 ms at 100 fps). Cores beyond that mostly help the *network* stack, not Python. |
+| RAM | 16 GB | 64 GB | Dominated by buffers: `n_cams x MaxNumBuffer x frame_bytes` for the driver pool **plus** `n_cams x (kick_max_lag + 264) x 1.5 x frame_bytes` for the NV12 ring. At 6 cameras that is ~29 GB; at 9 it is ~41 GB. **Panopticon computes this and refuses to start if it will not fit.** |
+| GPU | NVIDIA w/ NVENC | RTX 5080 | You need **one concurrent encode session per camera**. The driver caps this — measured **12** on the reference rig, and NVIDIA has moved the cap over time (2 -> 3 -> 5 -> 8 -> 12). Panopticon probes it at startup and refuses a real-time start if there are fewer sessions than cameras. |
+| Disk | 500 GB free | 2x NVMe | Online encode writes only a few GB/session. The **raw fallback** writes `n_cams x fps x frame_bytes`: 1.38 GB/s at 6 cameras, 2.07 GB/s at 9. Spread that across drives — a single consumer NVMe drops to ~1.6 GB/s once its SLC cache is exhausted. |
+| Network (GigE) | — | 2x 10 GbE, 3 cameras/port | Each 1920x1200 mono8 camera at 100 fps is ~1.84 Gbit/s. Keep cameras-per-port low; see *Tuning*. |
+
+On launch Panopticon runs a hardware check and warns about anything below minimum. At
+**Record** time it runs a second, stricter check against the *actual* camera count and
+refuses to start rather than half-record.
 
 ---
 
@@ -380,37 +422,151 @@ Uses [sleap-anipose](https://github.com/talmolab/sleap-anipose). Board parameter
 
 ---
 
+## Tuning for your hardware
+
+The constants in `profiles/*.yaml` are **calibrated to the reference rig**. They are not
+universal, and inheriting them blindly on different hardware is the most likely way to
+get a bad session. What generalizes is the *method*, so here it is.
+
+### The one number that matters
+
+Each grab thread must complete its cycle within one frame period. The grab-thread log
+line prints it directly:
+
+```
+[grab0] frames=87000 ... avg_wait=8.63ms avg_proc=0.87ms  deliv_lag=-0.027s  cycle=10.00ms
+```
+
+- **`cycle`** — start-of-iteration to start-of-iteration. It must equal the trigger
+  period (10.00 ms at 100 fps). **Anything above it means you are accumulating backlog**,
+  and the failure stays silent for as long as the buffer pool can absorb it.
+- **`deliv_lag`** — how stale a frame is when retrieved, measured against the camera's
+  own clock. Should sit at ~0. If it grows without bound, the loop is losing to the
+  trigger.
+- **`avg_wait` >> `avg_proc`** is healthy: the thread is *waiting for triggers*, i.e. it
+  has slack. The reference rig runs 8.6 ms of wait against 0.87 ms of work.
+
+### Things to re-derive, not copy
+
+| Setting | Reference value | Depends on |
+|---|---|---|
+| `kick_max_lag` | 480 | **RAM.** The NV12 ring is `(max_lag + 264)` buffers per camera — 2.39 GiB each at 480. Raising it is not free, and 1000 once starved capture outright (24% loss). |
+| `MaxNumBuffer` (`camera_manager.py`) | 1000 | RAM, and how much silent backlog you are willing to hide. 1000 buffers is 10 s at 100 fps. |
+| `GevSCPD` (in the `.pfs`) | 10000 | Cameras per port and link speed. Inter-packet delay; 0 causes collisions. |
+| `AcquisitionFrameRate` | 165 | Sets your exposure ceiling. In trigger mode the minimum interval is `exposure + 1/rate`, so at 165 anything past ~3.94 ms exposure silently **halves** the frame rate. |
+| NIC RSS receive queues | 4 | Your NIC. See below. |
+
+### Profiling your own rig
+
+Included probes, all runnable standalone:
+
+```bash
+uv run probe_copy_scaling.py     # is a hot-path operation GIL-bound? (no hardware)
+uv run probe_gil_wait.py         # split "executing" from "waiting for the GIL" (no hardware)
+uv run probe_zerocopy.py         # A/B frame-access routes on a real camera
+uv run probe_lag.py --seconds 90 # the full capture path, headless, real cameras
+uv run python probe_native_cpu.py --counters-only --duration 150
+```
+
+Two methodological warnings that cost this project real time:
+
+1. **Never wall-clock a GIL-releasing call.** numpy releases the GIL for a large memcpy
+   and must re-acquire it before returning, so the wait lands *inside* your timer. That
+   is how a 0.08 ms copy got measured as 2.7 ms, and it misled this project twice. Split
+   execution from waiting with `QueryThreadCycleTime` — `probe_gil_wait.py` shows how.
+2. **Measure on a quiet machine.** Competing CPU load moved the cycle from 10.00 to
+   10.32 ms, which is enough to accumulate 5.6 s of backlog in 150 s.
+
+### Network tuning (GigE rigs)
+
+`configure_nic.ps1` (run elevated) spreads receive processing across cores. On the
+reference rig both ports defaulted to **one RSS receive queue**, funnelling ~78,000
+packets/s per port through a single core's DPC — measured at 46% of two cores while the
+24-core average was 4%, with one port discarding packets at the NIC. Check yours:
+
+```powershell
+Get-NetAdapterRss -Name "Ethernet 4" | Select-Object Name,NumberOfReceiveQueues
+```
+
+Also verify jumbo frames (MTU 9014) end to end, receive buffers at maximum, and Energy
+Efficient Ethernet **disabled** — EEE caused a catastrophic stall on this rig.
+
+---
+
+## Porting to Linux
+
+Not done, but the surface is small and known:
+
+- `os.O_BINARY` — already handled via `getattr(os, "O_BINARY", 0)`.
+- `subprocess.STARTUPINFO` in `encode_worker.py` — already guarded by `sys.platform`.
+- Serial port — a profile field; set `serial_port: /dev/ttyACM0`.
+- `arduino-cli` — discovered via PATH or `PANOPTICON_ARDUINO_CLI`, no longer hardcoded.
+- The perf probes (`probe_gil_wait.py`, `probe_native_cpu.py`) are Win32-only. The
+  capture path does not depend on them.
+
+NVENC and pypylon both support Linux, so nothing structural blocks it.
+
+---
+
 ## Troubleshooting
+
+Panopticon tries to fail **loudly and specifically**: most messages name the likely cause
+and what to do about it. If something goes wrong *silently*, that is a bug worth
+reporting.
+
+### It refuses to start a recording
+
+| Message | What it means |
+|---|---|
+| `Expected N cameras but M enumerated` | A camera did not appear. Names are positional by serial number, so starting anyway would rename every later camera and attach calibration extrinsics to the **wrong physical camera**. Power-cycle the missing one. Set `n_cameras: 0` to disable the check. |
+| `NVENC granted only N concurrent sessions but M cameras need one each` | The driver's encode-session cap is below your camera count. Use the `(raw)` profile, or record fewer cameras. |
+| `Not enough RAM for N cameras` | The buffer arithmetic does not fit. Lower `kick_max_lag` or `MaxNumBuffer`, or close other applications. The message shows the breakdown. |
+| `PixelFormat is Mono12, not Mono8` | The `.pfs` was saved with the wrong pixel format. Anything wider than 8-bit is silently truncated mod 256, so this refuses rather than recording shredded video. |
+| `Pin N cannot carry a stim waveform` | A stim block targets a camera trigger pin (which would desynchronize that camera) or UART RX0/TX0. Move it. |
+| `No cameras are open` | Recording would run the trigger protocol and any stim paradigm while saving nothing. |
+
+### It warns during or after a recording
+
+| Message | What it means |
+|---|---|
+| `FATAL: PaddingX=… rows would shear` | The camera reports row padding, which the zero-copy frame view does not handle. That camera is retired rather than recording sheared frames. |
+| `camera did not start grabbing` / `stream dead after N re-arms` | That camera was **retired** from the alignment set so the others keep recording aligned. You get N-1 cameras instead of an empty session. |
+| `block-ID bookkeeping claimed X frames but only Y were persisted` | An encoder fell behind or died. Metadata is truncated to what is actually in the video, and a `WARNINGS.txt` is written beside it. |
+| `STOP NOT CONFIRMED` / a failed `Test stopped` dialog | The trigger board did not accept the stop command. **A looping stim chain never ends on its own** — power-cycle the board and key off the laser. |
+| `ffmpeg reported success but <file> is missing or empty` | The source file is kept rather than deleted. |
 
 ### Cameras not found
 
 | Symptom | Fix |
 |---|---|
-| "No cameras found" on launch | Check that cameras are connected and powered. Close PylonViewer or other apps holding the cameras. |
-| .pfs file not found | Verify `pfs_path` in your profile points to an existing file in `configs/`. |
-| GigE cameras not detected | Run `PylonGigEConfigurator auto-all` as Administrator. Add firewall rule. |
+| "No cameras found" on launch | Check power and cabling. Close PylonViewer or anything else holding the cameras. |
+| .pfs file not found | `pfs_path` in the profile must point at an existing file in `configs/`. |
+| GigE cameras not detected | `PylonGigEConfigurator auto-all` as Administrator, plus an inbound UDP firewall rule for the Python interpreter. |
+| Cameras vanish after a NIC change | Expected — the adapters reset. They re-enumerate within seconds. |
 
-### Serial port errors
-
-| Symptom | Fix |
-|---|---|
-| "Could not open COM3" | Close Arduino Serial Monitor. Check `serial_port` in profile. Restart GUI. |
-| Teensy not responding | Verify `trigger.ino` is flashed. Check USB connection. |
-
-### Recording issues
+### Serial / trigger board
 
 | Symptom | Fix |
 |---|---|
-| Frame counts differ (±5) | Normal — data is auto-truncated to min count. |
-| Very low fps | Check `AcquisitionFrameRate` in `.pfs` is set to 165+. |
-| Encoding fails | Check NVIDIA drivers are installed. Look for ffmpeg errors in console output. |
+| "Could not open COM3" | Close the Arduino Serial Monitor. Check `serial_port` in the profile. |
+| Board does not acknowledge | Verify the sketch is flashed. Panopticon retries with a reset before giving up. |
+| `arduino-cli was not found` | Install the Arduino IDE, or set `PANOPTICON_ARDUINO_CLI`. Only the Stimulation editor needs it. |
 
-### Calibration issues
+### Recording quality
 
 | Symptom | Fix |
 |---|---|
-| "0 boards detected" | Check board parameters in `configs/boards/*.yaml` match your physical board. |
-| numpy ABI error | `1_calibrate.py` pins `numpy<2`. Run `uv cache clean` and retry. |
+| `cycle` above the frame period | Something is stealing CPU, or a hot-path change added work. See *Tuning*. |
+| Very low fps (about half expected) | `exposure + 1/AcquisitionFrameRate` exceeds the trigger period. Lower exposure or raise `AcquisitionFrameRate`. |
+| Frames lost, high resend counts | Network. Check RSS queues, jumbo frames, EEE, and cameras-per-port. |
+| Video will not seek in the labeler | The mp4 lost its explicit GOP. Every encode path must pass `-g <fps>` and `-movflags +faststart`. |
+
+### Calibration
+
+| Symptom | Fix |
+|---|---|
+| "0 boards detected" | Board parameters in `configs/boards/*.yaml` must match the physical board — including `board_legacy` for pre-OpenCV-4.6 layouts. |
+| numpy ABI error | `1_calibrate.py` pins its own dependencies. `uv cache clean` and retry. |
 
 ---
 
