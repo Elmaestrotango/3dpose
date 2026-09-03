@@ -20,7 +20,17 @@ _O_BINARY = getattr(os, "O_BINARY", 0)
 from collections import deque
 from pathlib import Path
 from PyQt5.QtCore import QThread
-import pypylon.pylon as pylon
+
+# The hot loop uses the NATIVE grab-result object rather than a wrapper — see
+# gui_app/backends/__init__.py for the contract it must satisfy and why it is
+# deliberately not abstracted per-field. Everything else this file needs from
+# the vendor SDK comes through the backend, which is what keeps the coupling
+# down to that one documented contract.
+from gui_app.backends import load_backend
+
+_BACKEND = load_backend("basler")
+TimeoutException = _BACKEND.TimeoutException
+GRAB_STRATEGY = _BACKEND.GRAB_STRATEGY
 
 # Frames of slack per camera between grab and encode (~2.3 MB each at
 # 1920x1200). The pylon buffer pool upstream adds ~10 s more.
@@ -127,7 +137,7 @@ class _EncoderThread(threading.Thread):
 
 
 class GrabThread(QThread):
-    def __init__(self, cam_index: int, camera: pylon.InstantCamera,
+    def __init__(self, cam_index: int, camera,
                  raw_path: Path = None, display_every: int = 1,
                  downsample: int = 3, realtime: bool = False,
                  width: int = 0, height: int = 0, quality: int = 21,
@@ -178,7 +188,7 @@ class GrabThread(QThread):
               f"(attempt {attempt})", flush=True)
         try:
             self._camera.StopGrabbing()
-            self._camera.StartGrabbing(pylon.GrabStrategy_OneByOne)
+            self._camera.StartGrabbing(GRAB_STRATEGY)
             return True
         except Exception as e:
             print(f"[grab{self._cam_index}] re-arm failed: "
@@ -233,22 +243,12 @@ class GrabThread(QThread):
     def _log_stream_stats(self):
         """Dump pylon's per-stream counters — distinguishes network packet loss
         (Failed_Packet/Resend) from pool exhaustion (Buffer_Underrun)."""
-        try:
-            sg = self._camera.GetStreamGrabberNodeMap()
-            stats = {}
-            for s in ("Statistic_Total_Buffer_Count",
-                      "Statistic_Failed_Buffer_Count",
-                      "Statistic_Buffer_Underrun_Count",
-                      "Statistic_Total_Packet_Count",
-                      "Statistic_Failed_Packet_Count",
-                      "Statistic_Resend_Request_Count",
-                      "Statistic_Resend_Packet_Count"):
-                n = sg.GetNode(s)
-                if n is not None:
-                    stats[s.replace("Statistic_", "")] = n.GetValue()
+        stats = _BACKEND.stream_stats(self._camera)
+        if stats.get("error"):
+            print(f"[grab{self._cam_index}] stream stats unavailable: "
+                  f"{stats['error']}", flush=True)
+        else:
             print(f"[grab{self._cam_index}] stream stats: {stats}", flush=True)
-        except Exception as e:
-            print(f"[grab{self._cam_index}] stream stats unavailable: {e}", flush=True)
 
     def run(self):
         self._running = True
@@ -319,7 +319,7 @@ class GrabThread(QThread):
 
         print(f"[grab{self._cam_index}] StartGrabbing (recording={recording})", flush=True)
         try:
-            self._camera.StartGrabbing(pylon.GrabStrategy_OneByOne)
+            self._camera.StartGrabbing(GRAB_STRATEGY)
         except Exception as e:
             # Camera offline / in a bad transport state: exit this thread cleanly
             # rather than letting the exception escape run() and abort Qt.
@@ -385,7 +385,7 @@ class GrabThread(QThread):
                 try:
                     timeout = 200 if recording else 2000
                     t0 = time.perf_counter()
-                    result = self._camera.RetrieveResult(timeout, pylon.TimeoutHandling_ThrowException)
+                    result = _BACKEND.retrieve(self._camera, timeout)
                     t1 = time.perf_counter()
                     t_wait += t1 - t0
                     if not result.GrabSucceeded():
@@ -558,7 +558,7 @@ class GrabThread(QThread):
                         t_cycle += tr0 - t_prev   # start-of-iteration to start
                     t_prev = tr0
 
-                except pylon.TimeoutException:
+                except TimeoutException:
                     timeout_n += 1
                     consec_timeouts += 1
                     if recording and timeout_n in (1, 5, 20):

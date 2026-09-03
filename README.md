@@ -27,11 +27,14 @@ place and wide everywhere else.
 
 | Layer | Requirement | How hard to change |
 |---|---|---|
-| **Cameras** | **Basler** (pypylon) | **Hard.** ~1,050 LOC across `camera_manager.py` + `grab_thread.py` is Basler-specific. Other SDKs expose the same concepts (frame IDs, buffer pools, resends) but not the same API. |
+| **Cameras** | **Basler** (pypylon) | **Moderate.** All vendor code lives in `gui_app/backends/basler.py` behind a documented `CameraBackend` contract — nothing else in `gui_app/` imports pypylon. Write one file. The hard part is not the API, it is supplying the *guarantees*: a per-frame trigger ordinal, an observable buffer pool, and genuinely zero-copy pixel access. |
 | **GPU** | NVIDIA with NVENC | Easy — the session limit and encoder config are *probed*, not assumed. |
 | **OS** | Windows (today) | Moderate — a handful of Win32 calls, all isolated. See *Porting to Linux*. |
 | **Trigger** | Arduino/Teensy on a serial port | Easy — pins, port and rate are profile fields. |
 | **Camera count** | any | Easy — `n_cameras` in the profile. |
+
+A new backend is a single file. `gui_app/backends/__init__.py` documents exactly what it
+must provide and why each guarantee matters; `basler.py` is the worked example.
 
 **~1,300 LOC is already fully portable** with no camera, GUI or OS dependency:
 `frame_sync.py` (the cross-camera coordinator, with a proof of equivalence to post-hoc

@@ -2,8 +2,7 @@
 import numpy as np
 from pathlib import Path
 from PyQt5.QtCore import QObject, pyqtSignal
-import pypylon.pylon as pylon
-
+from gui_app.backends import load_backend
 from gui_app.grab_thread import GrabThread
 
 #: Driver-side buffers per camera. 1000 is 10 s of slack at 100 fps, and it
@@ -24,9 +23,14 @@ MAX_NUM_BUFFER = 1000
 class CameraManager(QObject):
     error = pyqtSignal(str)
 
-    def __init__(self):
+    def __init__(self, backend: str = "basler"):
+        # The only vendor-specific object in this class. Everything below is
+        # camera-agnostic orchestration; see gui_app/backends/__init__.py for
+        # what a new backend has to provide.
+        self._backend = load_backend(backend)
         super().__init__()
-        self._cameras: list[pylon.InstantCamera] = []
+        self._cameras: list = []
+        self._geometry = None      # (w, h) agreed by every camera
         self._grab_threads: list[GrabThread] = []
         self._router = None  # SyncEncodeRouter in real-time kick-out mode
 
@@ -72,8 +76,7 @@ class CameraManager(QObject):
         expect_cameras: if nonzero, refuse to start unless exactly this many
         cameras enumerate."""
         self._trigger_rate_limit = trigger_rate_limit
-        tlf = pylon.TlFactory.GetInstance()
-        devices = tlf.EnumerateDevices()
+        devices = self._backend.enumerate_devices()
         if len(devices) == 0:
             self.error.emit("No cameras found")
             return False
@@ -97,16 +100,11 @@ class CameraManager(QObject):
                 f"profile.")
             return False
 
-        sorted_devs = sorted(devices, key=lambda d: d.GetSerialNumber())
+        sorted_devs = devices          # backend guarantees a stable order
 
         for i, dev in enumerate(sorted_devs):
             try:
-                cam = pylon.InstantCamera(tlf.CreateDevice(dev))
-                cam.Open()
-                pylon.FeaturePersistence.Load(pfs_path, cam.GetNodeMap(), False)
-                # 1000 buffers = ~2.3 GB/cam at 1920x1200 (10 s of slack at
-                # 100 fps); ~13.8 GB across 6 cams, fine on the 64 GB machine.
-                cam.MaxNumBuffer.SetValue(MAX_NUM_BUFFER)
+                cam = self._backend.open(dev, pfs_path, MAX_NUM_BUFFER)
                 # Read back what the .pfs actually applied. FeaturePersistence
                 # is loaded with validation disabled, and CLAUDE.md tells users
                 # to edit the .pfs in pylon Viewer — where ROI and pixel format
@@ -119,23 +117,22 @@ class CameraManager(QObject):
                 #     300 -> 44), yielding a full-length, perfectly aligned,
                 #     visually shredded recording that looks fine until someone
                 #     tries to label it.
-                pf = cam.PixelFormat.GetValue()
-                w, h = cam.Width.GetValue(), cam.Height.GetValue()
+                info = self._backend.describe(cam)
+                pf, w, h = info["pixel_format"], info["width"], info["height"]
                 if pf != "Mono8":
                     raise RuntimeError(
                         f"PixelFormat is {pf}, not Mono8. The capture path "
                         f"assumes 8-bit; anything wider is silently truncated "
                         f"mod 256. Fix the .pfs.")
-                if self._cameras and (w, h) != (self._cameras[0].Width.GetValue(),
-                                                self._cameras[0].Height.GetValue()):
+                if self._geometry and (w, h) != self._geometry:
                     raise RuntimeError(
                         f"resolution {w}x{h} differs from camera 1 "
-                        f"({self._cameras[0].Width.GetValue()}x"
-                        f"{self._cameras[0].Height.GetValue()}); all cameras "
-                        f"must match.")
-                print(f"[cam{i+1}] {dev.GetSerialNumber()} {w}x{h} {pf}", flush=True)
-                self._enable_extended_block_ids(i, cam)
-                self._select_gige_driver(i, cam, gige_driver)
+                        f"({self._geometry[0]}x{self._geometry[1]}); all "
+                        f"cameras must match.")
+                self._geometry = (w, h)
+                print(f"[cam{i+1}] {info['serial']} {w}x{h} {pf}", flush=True)
+                self._backend.enable_extended_block_ids(i, cam)
+                self._backend.select_gige_driver(i, cam, gige_driver)
             except Exception as e:
                 # Don't continue with a partial set: camera names are assigned by
                 # serial-number order, so a missing camera would silently shift
@@ -151,112 +148,24 @@ class CameraManager(QObject):
         self._start_grab_threads()
         return True
 
-    @staticmethod
-    def _enable_extended_block_ids(i: int, cam: pylon.InstantCamera):
-        """Use 64-bit GVSP block IDs so the trigger ordinal doesn't wrap at
-        65535 (~11 min at 100 fps). alignment._unwrap_blockids is the software
-        fallback if the camera/driver can't honor this."""
-        ok = False
-        try:
-            nm = cam.GetNodeMap()
-            cam_node = nm.GetNode("GevGVSPExtendedIDMode")
-            if cam_node is not None:
-                cam_node.FromString("On")
-                ok = True
-        except Exception as e:
-            print(f"[cam{i+1}] GevGVSPExtendedIDMode unavailable: {e}", flush=True)
-        try:
-            sg = cam.GetStreamGrabberNodeMap()
-            sg_node = sg.GetNode("UseExtendedIdIfAvailable")
-            if sg_node is not None:
-                sg_node.SetValue(True)
-                ok = True
-        except Exception as e:
-            print(f"[cam{i+1}] UseExtendedIdIfAvailable unavailable: {e}", flush=True)
-        print(f"[cam{i+1}] extended (64-bit) block IDs: "
-              f"{'enabled' if ok else 'UNAVAILABLE — relying on software unwrap'}",
-              flush=True)
-
-    @staticmethod
-    def _select_gige_driver(i: int, cam: pylon.InstantCamera, which: str = "socket"):
-        """Select the GigE receive driver per the profile's `gige_driver`.
-
-        "socket": user-space driver — costs more CPU but its packet resends
-        reliably recover lost packets (raw mode held 100 fps +-1 on it).
-        "filter": in-kernel pylon GigE Vision driver — far less host CPU, but
-        with default resend settings it silently dropped ~23% of frames
-        (~5,800 single-frame gaps/cam, 2026-06-12 test) under 6x100 fps load.
-        "auto": leave pylon's own default. No-op for non-GigE cameras."""
-        sym = {"socket": "SocketDriver", "filter": "WindowsFilterDriver"}.get(which)
-        try:
-            sg = cam.GetStreamGrabberNodeMap()
-            t = sg.GetNode("Type")
-            if t is None:
-                return
-            if sym is not None:
-                avail = sg.GetNode(f"TypeIs{sym}Available")
-                if avail is None or avail.GetValue():
-                    t.FromString(sym)
-            extra = ""
-            if t.ToString() == "SocketDriver":
-                # Max out the per-stream socket receive buffer (KB): more slack
-                # for the receive thread when encode threads contend for CPU.
-                try:
-                    sbs = sg.GetNode("SocketBufferSize")
-                    sbs_max = sg.GetNode("SocketBufferSize_Max")
-                    if sbs is not None and sbs_max is not None:
-                        sbs.SetValue(sbs_max.GetValue())
-                        extra = f" (SocketBufferSize={sbs.GetValue()} KB)"
-                except Exception:
-                    pass
-            print(f"[cam{i+1}] GigE stream driver: {t.ToString()}{extra}", flush=True)
-        except Exception as e:
-            print(f"[cam{i+1}] GigE driver selection skipped: {e}", flush=True)
-
     def _set_freerun_mode(self):
         for i, cam in enumerate(self._cameras):
             try:
-                try:
-                    cam.StopGrabbing()
-                except Exception:
-                    pass
-                cam.TriggerMode.SetValue("Off")
-                cam.AcquisitionFrameRateEnable.SetValue(True)
-                cam.AcquisitionFrameRate.SetValue(30.0)
+                self._backend.set_freerun(cam, 30.0)
             except Exception as e:
-                # A camera that dropped off the bus must not abort teardown for the
-                # rest — log and continue so the surviving cameras still recover.
-                print(f"[cam{i+1}] free-run config failed (camera offline?): {e}", flush=True)
+                # A camera that dropped off the bus must not abort teardown for
+                # the rest — log and continue so the survivors still recover.
+                print(f"[cam{i+1}] free-run config failed (camera offline?): {e}",
+                      flush=True)
 
     def _set_trigger_mode(self):
+        limit = getattr(self, "_trigger_rate_limit", 165.0)
         for i, cam in enumerate(self._cameras):
             try:
-                try:
-                    cam.StopGrabbing()
-                except Exception:
-                    pass
-                cam.TriggerSelector.SetValue("FrameStart")
-                cam.TriggerMode.SetValue("On")
-                cam.TriggerSource.SetValue("Line1")
-                cam.TriggerActivation.SetValue("RisingEdge")
-                # The camera's internal rate generator does nothing useful while
-                # it is externally triggered, but it still caps the minimum
-                # interval at `exposure + 1/AcquisitionFrameRate` — which is what
-                # capped exposure at ~3.94 ms and, at the old rate of 100, caused
-                # the original 50 fps bug. Disabling it (`trigger_rate_limit: 0`)
-                # leaves only the sensor readout in the way. Kept per-profile so
-                # the 3dface rig stays on the proven 165 until it is tested there.
-                limit = getattr(self, "_trigger_rate_limit", 165.0)
-                if limit and limit > 0:
-                    cam.AcquisitionFrameRateEnable.SetValue(True)
-                    cam.AcquisitionFrameRate.SetValue(float(limit))
-                else:
-                    cam.AcquisitionFrameRateEnable.SetValue(False)
-                    if i == 0:
-                        print("[cam] trigger-rate limiter DISABLED "
-                              "(exposure bounded by sensor readout only)", flush=True)
+                self._backend.set_triggered(cam, limit, announce=(i == 0))
             except Exception as e:
-                print(f"[cam{i+1}] trigger config failed (camera offline?): {e}", flush=True)
+                print(f"[cam{i+1}] trigger config failed (camera offline?): {e}",
+                      flush=True)
 
     def _start_grab_threads(self, raw_paths=None, display_every=1,
                             realtime=False, width=0, height=0, quality=21,
@@ -351,7 +260,7 @@ class CameraManager(QObject):
         self._stop_grab_threads()
         for cam in self._cameras:
             try:
-                cam.Close()
+                self._backend.close(cam)
             except Exception:
                 pass
         self._cameras.clear()
@@ -373,11 +282,11 @@ class CameraManager(QObject):
             self._router = None
         for cam in self._cameras:
             try:
-                cam.StopGrabbing()
+                self._backend.stop_grabbing(cam)
             except Exception:
                 pass
             try:
-                cam.Close()
+                self._backend.close(cam)
             except Exception:
                 pass
         self._cameras.clear()

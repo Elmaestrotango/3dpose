@@ -589,3 +589,38 @@ one.
 re-run. If the discards follow the cable, it is physical; if they stay on Ethernet 5, it
 is the NIC port or its interrupt placement. Either answer is worth more than further
 software tuning, because the current numbers say the software is no longer the limit.
+
+---
+
+## E7 — Camera backend extraction (2026-09-03)
+
+Vendor code moved behind `gui_app/backends/`. Nothing outside that package imports
+pypylon now (verified by grep). `camera_manager.py` keeps the vendor-neutral
+orchestration; `basler.py` holds enumeration, open/.pfs, geometry read-back, GigE driver
+selection, extended block IDs, trigger/free-run modes, and stream statistics.
+
+**What is deliberately NOT abstracted:** the per-frame result object. `retrieve()` returns
+the *native* grab result and `backends/__init__.py` documents the attributes it must
+expose. The reason is not call overhead — a Python call is ~60 ns, so even seven per
+frame across nine cameras is ~40 µs/s, irrelevant against a 10 ms budget. The reason is
+that the hot path has invariants a wrapper quietly breaks: the frame view must not
+outlive `Release()`, and it must not be copied on the way through. A hidden copy there is
+*precisely* the 2.3 MB GIL-held memcpy that cost this project years of frame loss (E3).
+A documented duck-type contract keeps those invariants visible where they matter.
+
+**Live re-validation (90 s, 6 cameras) — indistinguishable from the pre-refactor baseline:**
+
+| | 20-min baseline | after extraction |
+|---|---|---|
+| `cycle` | 10.00 ms | **10.00–10.01 ms** |
+| `avg_proc` | 0.77–0.84 ms | **0.78–0.81 ms** |
+| `Buffer_Underrun_Count` | 0 | **0** |
+| `forced` | 0 | **0** |
+| frames/camera | identical | **9081, identical on all six** |
+
+**A mistake worth recording.** The first attempt corrupted `grab_thread.py`: I sliced the
+file with `s.index("    def run(self):")`, which matched `_EncoderThread.run` *earlier* in
+the file, producing an empty slice — and `str.replace("", new)` then inserted the
+replacement between every character. Restored from git and redone with exact-match edits.
+The lesson generalises: **never locate code by a substring that is not unique**, and
+prefer exact-match replacement over index arithmetic when editing source programmatically.
