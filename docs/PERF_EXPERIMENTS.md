@@ -441,3 +441,75 @@ network loss, none of it pipeline: underruns stayed 0, nothing was force-dropped
 frame counts stayed identical across cameras. **This is exactly the bimodality that makes
 the pending 20-minute run necessary**, and it is a clean demonstration that the pipeline
 and the transport are now separable in the data.
+
+---
+
+## E5 — Transport CPU: the term nobody had measured (2026-09-03)
+
+**Why it mattered.** Every instrument in this repo samples only threads holding a Python
+thread state. GVSP packet reassembly runs on threads created inside
+`PylonGigE_v11_TL.dll` that never touch the GIL, and NIC receive processing runs in DPC
+and ISR context billed to **no thread at all**. At 9 cameras that is ~2.07 GB/s and
+~234,000 packets/s charged to nothing we had ever looked at — the one term that could
+still defeat the zero-copy win.
+
+**Method.** 150 s, 6 cameras, real triggers, with `probe_native_cpu.py --counters-only`
+sampling `Processor Information(*)` DPC/interrupt time and NIC/UDP counters alongside.
+(Selftest first: `threading` ident set == OS `native_id` set, so the Python/native
+exclusion rule is sound; `GetThreadTimes` quantum measured at exactly 15.625 ms — fine at
+session scale, useless per frame.)
+
+### Result 1 — two cores are carrying the entire network receive load
+
+| counter | mean | max |
+|---|---|---|
+| `Processor Information(0,0)\% DPC Time` | **45.71%** | 48.37% |
+| `Processor Information(0,1)\% DPC Time` | **45.44%** | 47.29% |
+| `_Total\% DPC Time` (24 cores) | 3.96% | 4.10% |
+
+**Cores 0 and 1 sit at ~46% DPC while the machine average is 4%.** That is the
+single-RSS-queue signature: `Get-NetAdapterRss` reports `NumberOfReceiveQueues : 1` on
+both Ethernet 4 and Ethernet 5, so RSS is enabled but inert and each port's ~78,000
+packets/s funnel through one core's DPC.
+
+**This is the 9-camera risk, quantified.** The load is per-port and the expansion keeps 3
+cameras per port, so the *per-port* term is flat — but a third port adds a third
+DPC-bound core, and any of them landing on an already-loaded core is a problem. More
+importantly, 46% is not a comfortable place to start from, and DPC on a single core
+cannot exceed 100%.
+
+### Result 2 — Ethernet 5 discards packets in the NIC; Ethernet 4 does not
+
+| | Ethernet 4 | Ethernet 5 |
+|---|---|---|
+| ReceivedBytes | 85.6 GB | 85.9 GB |
+| ReceivedUnicastPackets | 9,593,495 | 9,628,901 |
+| **ReceivedDiscardedPackets** | **0** | **35,423** |
+| ReceivedPacketErrors | 0 | 0 |
+| `UDPv4\Receive Errors` (whole host) | \multicolumn{2}{c}{**0**} | |
+
+Identically configured ports, same driver, same settings. **`UDPv4 Receive Errors = 0`
+rules out socket-buffer overflow**, and `ReceivedPacketErrors = 0` rules out corruption
+on the wire. What is left is the receive ring being serviced too slowly — a host-side
+scheduling problem, not a cable or switch one.
+
+The numbers close the loop with the pylon statistics from the same run: the Eth5 cameras
+issued ~1,900 resend requests each and recovered ~14,100 packets each (≈42,000 across the
+three, matching the 35,423 discarded), finishing with `Failed_Buffer_Count` of 4–6. The
+recording itself was **15,083 of 15,083 triggers released, `forced=0`,
+`Buffer_Underrun_Count=0`, identical frame counts on all six**, union loss 27 (0.18%).
+
+**This finally explains the Eth5 asymmetry that has been open since July** — the ~460,000
+vs ~313 resend split. It was never signal integrity on that leg. It is NIC receive
+discards under a single-queue DPC path, recovered by resends. Which is also why the
+physical triage never happened to help: there was nothing physical to fix.
+
+### The indicated change (NOT yet applied — needs a rig decision)
+
+`Set-NetAdapterRss -Name 'Ethernet 4','Ethernet 5' -NumberOfReceiveQueues 4`. Windows
+hashes non-TCP IPv4 on the source/destination 2-tuple and the three cameras per port have
+distinct IPs, so they should spread across queues. One variable, reversible, free, and it
+has a clean A/B metric that this run establishes a baseline for:
+**`ReceivedDiscardedPackets` on Ethernet 5 (35,423 per 150 s) and `% DPC Time` on cores 0
+and 1 (~46%).** Note the adapter resets when this is applied, so it must be done with no
+recording in flight.
