@@ -65,14 +65,36 @@ class CameraManager(QObject):
             gt.set_keep_full(flag)
 
     def open_all(self, pfs_path: str, gige_driver: str = "socket",
-                 trigger_rate_limit: float = 165.0):
+                 trigger_rate_limit: float = 165.0, expect_cameras: int = 0):
         """trigger_rate_limit: AcquisitionFrameRate to apply in trigger mode, or
-        0 to disable the limiter altogether — see _set_trigger_mode."""
+        0 to disable the limiter altogether — see _set_trigger_mode.
+
+        expect_cameras: if nonzero, refuse to start unless exactly this many
+        cameras enumerate."""
         self._trigger_rate_limit = trigger_rate_limit
         tlf = pylon.TlFactory.GetInstance()
         devices = tlf.EnumerateDevices()
         if len(devices) == 0:
             self.error.emit("No cameras found")
+            return False
+
+        # A camera that fails to OPEN is caught below. A camera that never
+        # ENUMERATES — dead switch port, unpowered, still booting — is invisible
+        # to that check, and it is the more dangerous case: names are positional
+        # by serial order (`cam{i+1}`), so a missing camera 3 silently renames
+        # physical 4..9 to cam3..cam8. Every extrinsic in calibration.toml then
+        # attaches to the wrong physical camera, triangulation still runs, and
+        # the 3D output is simply wrong. Three switches make this likelier.
+        if expect_cameras and len(devices) != expect_cameras:
+            found = ", ".join(sorted(d.GetSerialNumber() for d in devices))
+            self.error.emit(
+                f"Expected {expect_cameras} cameras but {len(devices)} "
+                f"enumerated.\n\nFound: {found}\n\n"
+                f"Camera names are assigned by serial-number order, so starting "
+                f"with a missing camera would rename every camera after it and "
+                f"attach the calibration extrinsics to the wrong physical "
+                f"cameras. Power-cycle the missing camera and reselect the "
+                f"profile.")
             return False
 
         sorted_devs = sorted(devices, key=lambda d: d.GetSerialNumber())
@@ -85,6 +107,33 @@ class CameraManager(QObject):
                 # 1000 buffers = ~2.3 GB/cam at 1920x1200 (10 s of slack at
                 # 100 fps); ~13.8 GB across 6 cams, fine on the 64 GB machine.
                 cam.MaxNumBuffer.SetValue(MAX_NUM_BUFFER)
+                # Read back what the .pfs actually applied. FeaturePersistence
+                # is loaded with validation disabled, and CLAUDE.md tells users
+                # to edit the .pfs in pylon Viewer — where ROI and pixel format
+                # are one click away. Both failure modes are severe:
+                #   - a Width/Height divergence makes `buf[:H,:] = img` raise
+                #     EVERY frame, which now retires the camera but wastes a
+                #     session;
+                #   - Mono12 makes the frame uint16 and that same assignment
+                #     truncates **mod 256 with no error at all** (measured:
+                #     300 -> 44), yielding a full-length, perfectly aligned,
+                #     visually shredded recording that looks fine until someone
+                #     tries to label it.
+                pf = cam.PixelFormat.GetValue()
+                w, h = cam.Width.GetValue(), cam.Height.GetValue()
+                if pf != "Mono8":
+                    raise RuntimeError(
+                        f"PixelFormat is {pf}, not Mono8. The capture path "
+                        f"assumes 8-bit; anything wider is silently truncated "
+                        f"mod 256. Fix the .pfs.")
+                if self._cameras and (w, h) != (self._cameras[0].Width.GetValue(),
+                                                self._cameras[0].Height.GetValue()):
+                    raise RuntimeError(
+                        f"resolution {w}x{h} differs from camera 1 "
+                        f"({self._cameras[0].Width.GetValue()}x"
+                        f"{self._cameras[0].Height.GetValue()}); all cameras "
+                        f"must match.")
+                print(f"[cam{i+1}] {dev.GetSerialNumber()} {w}x{h} {pf}", flush=True)
                 self._enable_extended_block_ids(i, cam)
                 self._select_gige_driver(i, cam, gige_driver)
             except Exception as e:

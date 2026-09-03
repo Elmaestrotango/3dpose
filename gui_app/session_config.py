@@ -39,6 +39,11 @@ class RigProfile:
     board_config: str = ""
     serial_port: str = "COM3"
     trigger_pins: list = field(default_factory=lambda: [2, 4, 6, 8, 10, 12])
+    # Expected camera count. 0 = don't check. Nonzero makes open_all refuse a
+    # partial set: names are positional by serial order, so a camera that fails
+    # to ENUMERATE renames every camera after it and silently attaches the
+    # calibration extrinsics to the wrong physical cameras.
+    n_cameras: int = 0
     # Optostim output pins held LOW from the instant the sketch boots — before
     # the serial handshake, which blocks until the GUI connects. Without this a
     # powered laser driver reads the floating pin as ON at power-up. Pins used by
@@ -82,6 +87,7 @@ class RigProfile:
             board_config=_resolve(data.get("board_config", "")),
             serial_port=data.get("serial_port", "COM3"),
             trigger_pins=data.get("trigger_pins", [2, 4, 6, 8, 10, 12]),
+            n_cameras=data.get("n_cameras", 0),
             stim_safe_pins=data.get("stim_safe_pins", [53]),
             trigger_rate_limit=float(data.get("trigger_rate_limit", 165.0)),
         )
@@ -108,6 +114,11 @@ class SessionConfig:
     pfs_path: Path = Path("")
     serial_port: str = "COM3"
     trigger_pins: list = field(default_factory=lambda: [2, 4, 6, 8, 10, 12])
+    # Expected camera count. 0 = don't check. Nonzero makes open_all refuse a
+    # partial set: names are positional by serial order, so a camera that fails
+    # to ENUMERATE renames every camera after it and silently attaches the
+    # calibration extrinsics to the wrong physical cameras.
+    n_cameras: int = 0
     frame_rate: int = 100
     calibration_frame_rate: int = 30
     frame_width: int = 1920

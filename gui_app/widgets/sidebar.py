@@ -342,6 +342,15 @@ class SidebarWidget(QWidget):
         self._calibrate_toggle.setEnabled(enabled)
         self._record_toggle.setEnabled(enabled)
 
+    def set_solve_enabled(self, enabled: bool):
+        """Enable/disable the Solve button independently of the toggles.
+
+        A solve runs 4-5 minutes without changing the app state, so it needs its
+        own gate: a second click would rebind the worker and drop the only
+        reference to a running QThread, which is an immediate qFatal.
+        """
+        self._run_calib_btn.setEnabled(enabled)
+
     def clear_toggles_silently(self):
         """Force both toggles off WITHOUT emitting — for refusing a start.
 

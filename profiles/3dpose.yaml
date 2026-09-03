@@ -8,12 +8,25 @@ quality: 21
 encode_parallel: 3           # concurrent NVENC jobs (raw mode) / .h264->mp4 remux jobs (realtime mode)
 realtime_encode: true        # GPU H.264 encode during capture (no raw.bin, no post-hoc pass). Select "3dpose (raw)" to fall back.
 realtime_kick: true          # default: real-time cross-camera frame kick-out â€” only frames every camera caught are encoded, so videos come out trigger-aligned with no post-hoc re-encode.
-kick_max_lag: 480            # raised from 240 on 2026-08-11. One camera (which one varies
-                             # per session) drifts to the cap and oscillates across it, force-
-                             # dropping frames every camera captured — 12.3% on 2026-08-11 with
-                             # cam5 at median 238 / peak 330. The frames arrive, just late, so
-                             # this is headroom rather than masking. Ring RAM 10.4 -> 15.4 GB of
-                             # 64. Do NOT go to 1000: that starved capture outright (24% loss).            # coordinator buffer (frames). DO NOT raise blindly: the NV12 ring scales with it; 1000 starved capture (24% loss, 2026-06-17). 240 runs clean.
+kick_max_lag: 480            # Coordinator buffer, in frames. RAISED 2026-08-11 when one
+                             # camera per session drifted to the cap and force-dropped
+                             # frames every camera had captured (12.3% loss at 240).
+                             # ROOT CAUSE FOUND 2026-09-03: that drift was result.Array's
+                             # GIL-held 2.3 MB memcpy in the grab loop, since replaced
+                             # with GetArrayZeroCopy. Observed cross-camera lag is now
+                             # median 0 / p95 1 / max 2, so this headroom currently buys
+                             # nothing -- it could likely drop back to 240, halving the
+                             # NV12 ring (max_lag + queue + 64 buffers/cam = 2.39 GiB
+                             # each at 480). Deferred pending a rig A/B; do NOT lower it
+                             # blind, and do NOT raise it to 1000 -- that starved
+                             # capture outright (24% loss, 2026-06-17).
+
+# Number of cameras that MUST enumerate before a session starts. Camera names are
+# positional by serial-number order, so a camera that fails to enumerate (dead switch
+# port, unpowered, still booting) renames every camera after it and silently attaches
+# the calibration extrinsics to the wrong physical cameras. Set to 9 when the third
+# switch and cameras 7-9 are installed.
+n_cameras: 6
 
 pfs_path: "configs/mono8_1920x1200.pfs"
 output_dir: "data"

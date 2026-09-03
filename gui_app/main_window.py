@@ -138,7 +138,8 @@ class MainWindow(QMainWindow):
         if pfs and Path(pfs).exists():
             return self._camera_mgr.open_all(
                 pfs, gige_driver=self._profile.gige_driver,
-                trigger_rate_limit=self._profile.trigger_rate_limit)
+                trigger_rate_limit=self._profile.trigger_rate_limit,
+                expect_cameras=self._profile.n_cameras)
         return False
 
     def _apply_camera_open_result(self, ok):
@@ -420,8 +421,11 @@ class MainWindow(QMainWindow):
             # Remove stale capture artifacts from a previous run in this dir —
             # a leftover raw_tail.bin would otherwise be appended to the NEW
             # recording's stream at stop.
+            # WARNINGS.txt is swept too: it is the only durable trace of a
+            # block-ID reconciliation, so a stale one left beside a clean
+            # recording is exactly what someone would trust months later.
             for stale in ("raw.bin", "raw_tail.bin", "stream.h264",
-                          "tail.h264", "encode_error.log"):
+                          "tail.h264", "encode_error.log", "WARNINGS.txt"):
                 try:
                     (cam_dir / stale).unlink(missing_ok=True)
                 except OSError:
@@ -865,6 +869,17 @@ class MainWindow(QMainWindow):
         if self._state != State.IDLE:
             self.statusBar().showMessage("Solve unavailable while acquiring/encoding")
             return
+        # A solve takes 4-5 minutes and never changes _state, so the guard above
+        # does not cover a second click — and the only feedback is a status-bar
+        # message, which makes a second click likely. That click would rebind
+        # self._calib_worker below, dropping the ONLY Python reference to a
+        # running QThread: sip deletes the C++ object underneath it and Qt calls
+        # qFatal("QThread: Destroyed while thread is still running"), which
+        # sys.excepthook cannot intercept. Instant process death, mid-solve.
+        # (Two solves would also race on the same calibration.toml.)
+        if self._calib_worker is not None and self._calib_worker.isRunning():
+            self.statusBar().showMessage("A solve is already running")
+            return
         config = self._build_config()
         calib_dir = config.video_dir("calibration")
 
@@ -887,6 +902,9 @@ class MainWindow(QMainWindow):
 
         self._sidebar.set_status("CALIBRATING...", "#aa88ff")
         self._sidebar.set_toggles_enabled(False)
+        # set_toggles_enabled touches only the two toggles, not the Solve button
+        # (sidebar.py:341-343), so disable it explicitly for the duration.
+        self._sidebar.set_solve_enabled(False)
         self.statusBar().showMessage("Running sleap-anipose calibration...")
 
         self._calib_worker = CalibrationWorker(
@@ -897,6 +915,7 @@ class MainWindow(QMainWindow):
 
     def _on_calibration_done(self, success: bool, msg: str):
         self._sidebar.set_toggles_enabled(True)
+        self._sidebar.set_solve_enabled(True)
         self._sidebar.set_status("IDLE", "#888")
         if success:
             config = self._build_config()
@@ -963,8 +982,16 @@ class MainWindow(QMainWindow):
         QMessageBox.critical(self, "Error", msg)
 
     def _workers_running(self) -> bool:
+        # _cam_op and _coverage_worker are usually masked by self._busy, but the
+        # stim editor's upload is NOT: an Apply runs with _state IDLE and _busy
+        # False, so quitting during a ~30 s arduino-cli flash would destroy a
+        # running QThread and can kill avrdude mid-write — leaving a Mega with
+        # no allStimLow() boot guard, i.e. a laser pin floating on next power-up.
+        if self._stim_window is not None and self._stim_window.is_uploading():
+            return True
         return any(w is not None and w.isRunning() for w in
-                   (self._encode_worker, self._align_worker, self._calib_worker))
+                   (self._encode_worker, self._align_worker, self._calib_worker,
+                    self._cam_op, self._coverage_worker))
 
     def closeEvent(self, event):
         # Quitting mid-session can't be finalized — confirm, then ABANDON the
@@ -1025,14 +1052,28 @@ class MainWindow(QMainWindow):
                     pass
         except Exception:
             pass
-        try:
-            self._camera_mgr.abandon()
-        except Exception:
-            pass
+        # Wait for the workers BEFORE tearing the cameras down. abandon() calls
+        # StopGrabbing()/Close() on every InstantCamera from the Qt main thread,
+        # while _cam_op is the thread running _finalize — possibly inside
+        # _router.stop() or resume_preview(). Two threads making native pylon
+        # calls on the same device is an access violation, not an exception, so
+        # excepthook cannot save us. Killing the child processes above is what
+        # lets these waits actually return.
         for w in (self._cam_op, self._encode_worker, self._align_worker,
-                  self._calib_worker):
+                  self._calib_worker, self._coverage_worker):
             if w is not None and w.isRunning():
                 w.wait(3000)
+        if self._cam_op is not None and self._cam_op.isRunning():
+            # Still inside pylon after 3 s. Leaking the camera handles costs
+            # nothing at process exit; closing them under a live native call
+            # crashes. Skip the teardown entirely.
+            print("[quit] _cam_op still running — leaking camera handles rather "
+                  "than closing under a live pylon call", flush=True)
+        else:
+            try:
+                self._camera_mgr.abandon()
+            except Exception as e:
+                print(f"[quit] abandon failed: {e}", flush=True)
         if delete_data and self._video_dir and Path(self._video_dir).exists():
             shutil.rmtree(self._video_dir, ignore_errors=True)
             print(f"[quit] deleted incomplete session data: {self._video_dir}", flush=True)

@@ -1059,6 +1059,17 @@ class StimulationWindow(QDialog):
                     f"pin, or merge them into a single chain.")
         return None
 
+    def is_uploading(self) -> bool:
+        """True while arduino-cli is compiling/flashing the board.
+
+        An Apply runs with the main window at IDLE and not busy, so nothing else
+        knows it is happening. Quitting during the ~30 s flash would destroy a
+        running QThread and can kill avrdude mid-write, leaving the Mega with no
+        `allStimLow()` boot guard — a laser pin floating on the next power-up.
+        """
+        return (self._upload_worker is not None
+                and self._upload_worker.isRunning())
+
     def record_blocker(self) -> str | None:
         """Reason a RECORDING must not start with this workflow, or None.
 
