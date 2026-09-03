@@ -64,8 +64,20 @@ foreach ($p in $Ports) {
     }
 }
 
-# The adapter reset is not instant; give it a moment before reading back.
-Start-Sleep -Seconds 5
+# The adapter reset is not instant, and a fixed wait is not good enough: a 5 s
+# sleep read back the OLD value and reported "NOT APPLIED" for a change that had
+# in fact taken effect moments later. Poll until it settles, and say how long it
+# took rather than guessing.
+$deadline = (Get-Date).AddSeconds(60)
+while ((Get-Date) -lt $deadline) {
+    $now = Get-NetAdapterRss -Name $Ports
+    if (-not ($now | Where-Object { $_.NumberOfReceiveQueues -lt $Queues })) {
+        Write-Host ("  settled after {0:N0}s" -f `
+            (60 - ($deadline - (Get-Date)).TotalSeconds)) -ForegroundColor DarkGray
+        break
+    }
+    Start-Sleep -Seconds 2
+}
 Show-State "AFTER"
 
 # Verify rather than assume: a driver that silently ignores the request is the

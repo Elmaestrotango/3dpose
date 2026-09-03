@@ -513,3 +513,79 @@ has a clean A/B metric that this run establishes a baseline for:
 **`ReceivedDiscardedPackets` on Ethernet 5 (35,423 per 150 s) and `% DPC Time` on cores 0
 and 1 (~46%).** Note the adapter resets when this is applied, so it must be done with no
 recording in flight.
+
+---
+
+## E6 — The 20-minute validation, and an RSS change that did not deliver (2026-09-03)
+
+### The recording: the best result this rig has ever produced
+
+20 minutes, 6 cameras, real triggers, RSS set to 4 queues beforehand.
+
+| metric | result |
+|---|---|
+| frames per camera | **120,106 — identical on all six** |
+| `cycle` | **10.00 ms, every camera, the entire run** |
+| `avg_proc` | 0.77–0.84 ms |
+| slack (`avg_wait`) | 8.47–8.86 ms |
+| `deliv_lag` | −0.031 to −0.050 s (no backlog) |
+| `Buffer_Underrun_Count` | **0 on all six** |
+| `forced` drops | **0** |
+| `queue_full_drops` | 0 |
+| coordinator lag | median 0, p95 1, max 4–5 |
+| union loss | 60 of 720,636 submissions — **99.95% kept** |
+
+For scale: this rig lost **12.34%** at `kick_max_lag=240` three weeks ago, 0.88% at 480,
+and the best previously recorded result was ~99.67%.
+
+It also **crossed the 16-bit block-ID wrap** at 65,535 (~11 min) without incident — the
+first real-data exercise of that path since the June bug that silently left a 15-minute
+recording disjoint. 120,106 frames is nearly twice the wrap point.
+
+Per-camera stream statistics keep the two network groups clearly separated:
+
+| group | `Resend_Request_Count` | `Failed_Buffer_Count` |
+|---|---|---|
+| cams 2/3/5 (Ethernet 4) | 3 | 2 |
+| cams 1/4/6 (Ethernet 5) | ~9,700 | 13–14 |
+
+### The RSS change: applied, and ineffective
+
+**It did apply.** `NumberOfReceiveQueues = 4` and the registry value reads `{4}` on both
+ports. (`configure_nic.ps1` initially reported "NOT APPLIED" — that was a **bug in the
+script**: a fixed 5 s wait read back the old value before the adapter reset settled. Now
+it polls. Worth recording because the false negative was more convincing than the truth.)
+
+**It changed nothing that mattered:**
+
+| | RSS = 1 (150 s) | RSS = 4 (1200 s) |
+|---|---|---|
+| DPC, core 0 | 45.71% | **46.19%** |
+| DPC, core 1 | 45.44% | **46.15%** |
+| Eth5 discard rate | 0.368% | 0.266% |
+| Eth4 discard rate | 0.000% | **0.000%** |
+| `UDPv4 Receive Errors` | 0 | 0 |
+
+The DPC concentration is **unchanged**. The discard-rate difference is small and the two
+runs differ in length by 8×, so it should not be claimed as an improvement without a
+matched-length A/B.
+
+### A correction to E5's conclusion
+
+E5 concluded the Eth5 discards were "host-side scheduling, not cabling." **That was
+stated too strongly.** Both ports now carry identical settings and their DPC cores are
+equally loaded at ~46%, and yet **Ethernet 4 discards exactly zero packets while
+Ethernet 5 discards 0.27%.** Generic host-side scheduling pressure does not explain an
+asymmetry that survives making the hosts identical. Something port-specific is still
+unaccounted for — the switch, the cable, the SFP, or per-port interrupt placement.
+
+What E5 got right stands: the discards are recovered by resends, and they were never the
+mechanism behind the historical frame loss (that was `result.Array`). What it got wrong
+was ruling the physical path out. It is back on the list, now with a precise metric to
+test it against — `ReceivedDiscardedPackets` per port, which reads exactly 0 on a healthy
+one.
+
+**Cheapest decisive experiment:** swap the two ports' cables/SFPs at the switch end and
+re-run. If the discards follow the cable, it is physical; if they stay on Ethernet 5, it
+is the NIC port or its interrupt placement. Either answer is worth more than further
+software tuning, because the current numbers say the software is no longer the limit.
