@@ -242,9 +242,24 @@ class GrabThread(QThread):
             # ring must outlast a frame's whole journey (held by the coordinator
             # up to max_lag, then queued at the encoder) before its slot reuses.
             ring_n = self._router.max_lag + ENCODE_QUEUE_DEPTH + 64
-            self._nv12_ring = [
-                np.full((self._height * 3 // 2, self._width), 128, np.uint8)
-                for _ in range(ring_n)]
+            try:
+                self._nv12_ring = [
+                    np.full((self._height * 3 // 2, self._width), 128, np.uint8)
+                    for _ in range(ring_n)]
+            except MemoryError as e:
+                # Reachable, not theoretical: the ring is 2.39 GiB per camera at
+                # max_lag=480, so 9 cameras is ~21.5 GiB of ring on top of
+                # ~20.7 GiB of pylon buffer pool. Unprotected, a MemoryError
+                # here escapes run() and takes the GUI down — and in kick mode a
+                # camera that never publishes makes the coordinator force-drop
+                # EVERY trigger for EVERY camera, so the session yields empty
+                # videos from all of them. Retire so the others record aligned.
+                gib = ring_n * self._width * (self._height * 3 // 2) / 2**30
+                print(f"[grab{self._cam_index}] FATAL: could not allocate the "
+                      f"{ring_n}-buffer NV12 ring ({gib:.2f} GiB): {e}", flush=True)
+                self._router.retire(self._cam_index,
+                                    "could not allocate its NV12 ring")
+                return
             self._ring_i = 0
             print(f"[grab{self._cam_index}] real-time kick-out -> shared router "
                   f"(ring={ring_n})", flush=True)
@@ -283,6 +298,16 @@ class GrabThread(QThread):
             # Camera offline / in a bad transport state: exit this thread cleanly
             # rather than letting the exception escape run() and abort Qt.
             print(f"[grab{self._cam_index}] StartGrabbing failed (camera offline?): {e}", flush=True)
+            # THE highest-damage path in this file. In kick mode the coordinator
+            # only releases trigger N once every camera has delivered N, so a
+            # camera that never arms holds the frontier at 0 and force-drops
+            # every trigger for EVERY camera: one dead camera silently produces
+            # an empty recording from all of them. Retiring drops it from the
+            # alignment set so the survivors record aligned, which is the
+            # difference between losing one camera and losing the session.
+            if kick and self._router is not None:
+                self._router.retire(self._cam_index,
+                                    "camera did not start grabbing")
             if fd is not None:
                 os.close(fd)
             if enc_thread is not None:

@@ -313,3 +313,58 @@ capture and encode sessions never overlap.** Still to do: a startup preflight th
 the count and refuses a real-time start below `n_cams`, explicit encoder teardown on the
 `sync_encode` failure path and in `stop()`/`abandon()`, and the NVIDIA driver version
 recorded in session metadata so a post-driver-update regression is diagnosable.
+
+---
+
+## Robustness fixes from the round-1 adversarial audit (2026-09-03)
+
+Not experiments — defects found by reading, each a **silent** failure. Recorded here
+because the reasoning matters more than the diff.
+
+### A single camera that fails to arm zeroed the ENTIRE recording
+
+The highest-damage finding. In kick-out mode `FrameSyncCoordinator` releases trigger N
+only once *every* camera has delivered N. A camera whose stream never starts holds the
+frontier at 0 forever, so the coordinator force-drops every trigger for every camera:
+**one dead camera produced an empty recording from all of them**, with no error beyond a
+single stdout line. At 9 cameras across 3 switches, a dead port becomes 50% more likely.
+
+Two paths reached it, both now retiring the camera so the survivors record aligned:
+- `StartGrabbing` failure returned without calling `retire()`.
+- The NV12 ring allocation sat outside any `try`. That is 2.39 GiB per camera at
+  `max_lag=480` — ~21.5 GiB across 9 cameras on top of ~20.7 GiB of pylon pool — so a
+  `MemoryError` is reachable at scale, and it would have escaped `run()` and taken the
+  GUI with it.
+
+Covered by the new `test_grab_failure.py` (stub camera + stub router, no hardware).
+
+### Laser safety: the stop command was unverified
+
+- `_rollback_acquisition` never stopped the triggers, and it runs from the
+  `start_triggers() == False` branch — exactly when the board may have consumed the
+  config, begun triggering and run `initStim()` but failed to ack. It rolled back the
+  cameras and left the paradigm and laser pin live while the GUI returned to IDLE showing
+  "did not acknowledge", which a user reads as "nothing happened".
+- `stop_triggers` was fire-and-forget with a swallowed `SerialException`. A pulled USB
+  cable left the board triggering and a **looping** stim chain running forever — a loop
+  has no end — while the GUI showed Finishing → ENCODING → IDLE. This contradicted
+  `CLAUDE.md`'s invariant that "closing the GUI can never leave a paradigm or laser
+  running". Now returns bool and tells the user to power-cycle and key off the laser.
+  Note `pyserial`'s `is_open` stays True after the device disappears, so callers must
+  never infer success from port state.
+- The port had `timeout=0.1` but **no `write_timeout`**, so a write to a wedged board
+  blocked forever — and the one write that must never hang is the stop. Now 1.0 s.
+
+### The only silent violation of the alignment axiom
+
+A stim block on a camera trigger pin (2/4/6/8/10/12) makes `updateStim()` drive that
+camera's trigger line, injecting extra rising edges into **one** camera. Its block IDs
+then advance faster and block-ID N stops denoting the same instant across cameras —
+which `frame_sync`, `alignment.py` and `stim_trace` all take as given, so **nothing
+downstream can detect it**. Pins 0/1 (UART RX0/TX0) are refused too; they garble the
+serial link and the RDY ack that `CLAUDE.md` calls "the whole safety property".
+
+Enforced in `compile_ino` (raises, so the `.ino` can never be generated) and surfaced by
+`_blocking_problem` so Apply/Test/Record explain instead of throwing. A blank pin field
+also used to coerce to `int("0")` — creating a block on RX0 — and now refuses to guess.
+New test 5b in `test_stim_compiler.py`.
