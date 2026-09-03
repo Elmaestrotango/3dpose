@@ -97,3 +97,44 @@ scaling only 1.66× across 6 threads.
   "time executing" from "time waiting for the GIL", or it will keep misattributing.
 
 **Status.** `probe_copy_scaling.py` committed. Raw numbers in `probe_out/copy_scaling.json`.
+
+---
+
+## E1a — Correction: the ring is ALREADY pre-faulted (2026-09-03)
+
+**This retracts E1's headline recommendation.** Before changing `grab_thread.py` I read
+the allocation at line 246 and found the ring is built with
+`np.full((h*3//2, w), 128, np.uint8)`. `np.full` allocates with `np.empty` and then
+*writes every byte*, so all pages are committed and resident before capture starts.
+
+Verified directly — first write to each buffer of a fresh 60-buffer ring vs a second
+pass over the same buffers:
+
+| allocation | first-touch median | warm median |
+|---|---|---|
+| `np.empty` (untouched) | **0.402 ms** | 0.080 ms |
+| `np.full(…, 128)` — **production** | **0.079 ms** | 0.079 ms |
+| `np.zeros` | 0.398 ms | 0.076 ms |
+
+`np.full` shows no first-touch penalty at all: the fault is already paid. (`np.zeros`
+does show it — `calloc` hands back lazily-zeroed pages.) So the UV-plane initialization
+to 128, which exists for correctness, has been doing pre-faulting for free all along.
+
+**Consequences.**
+- **No code change. The optimization was already there.** One of my top three candidates
+  is void; recording it so nobody re-proposes it.
+- E1's cold-ring numbers are still valid physics, they just **don't describe production**.
+- This is now the important part: with a warm ring the copy should cost **~0.08 ms**, yet
+  production reported **2.7 ms** — a 34× gap with page faults eliminated as the cause,
+  and memory bandwidth eliminated too (9 cameras need 2.76 GB/s of traffic against a
+  measured ~24 GB/s ceiling). **GIL re-acquisition wait inside the timer bracket is now
+  the only surviving explanation**, which promotes it from "a factor" to "the dominant
+  cost" — and makes GIL escape (processes / subinterpreters / free-threaded CPython /
+  a C extension holding the release across the whole cycle) the main line of attack.
+- Confidence is by elimination, not direct measurement. E2 must measure GIL wait
+  directly before this is treated as established.
+
+**Gap in E1 to close:** the prefaulted case was tested at 200 buffers (691 MB), not the
+full production 744 buffers (2.39 GiB). TLB/cache behavior at true production ring size,
+with 6–9 rings live and ~28 GB committed, is untested — Windows working-set trimming
+could reintroduce soft faults that the small test cannot show.
