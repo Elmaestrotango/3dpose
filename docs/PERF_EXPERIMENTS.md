@@ -251,3 +251,65 @@ network jitter that this 90 s run did not sample.
 
 **Status.** Implemented in `grab_thread.py`. All three test suites pass
 (`test_frame_sync.py`, `test_stim_compiler.py`, `test_serial_handshake.py`).
+
+---
+
+## E4 — NVENC concurrent session cap: REAL, and it is 12 (2026-09-03)
+
+**Context.** I had recorded this as a closed non-issue on the stated basis that NVIDIA
+removed the session cap. A round-1 audit lane found live evidence to the contrary on this
+rig: `[nvenc] WARNING: full encoder config rejected (Error code : 21 ...); created with
+reduced settings {...}`. **NVENCSTATUS 21 is the concurrent-session limit**, not a config
+error. Probed directly with `nvenc.probe_max_sessions()`:
+
+```
+>>> CONCURRENT NVENC SESSIONS GRANTED: 12
+```
+
+The historical sequence is 2 → 3 → 5 → 8 → **12**. It was raised, not removed. Six
+cameras never revealed it because 6 < 12.
+
+**Why it was worse than a clean failure.** Two compounding bugs:
+
+1. `create_h264_encoder` descended a kwarg fallback ladder on *any* exception, including
+   21. A session-limit error is not a config error, so retrying cannot help — but if a
+   slot freed mid-ladder (GC reaping the failed object), a **later rung succeeded with a
+   reduced config that had no `gopLength`/`idrPeriod`**. NVENC's driver-default GOP then
+   produced **one IDR for an entire recording**, which `CLAUDE.md` already documents as
+   unseekable in the LUC3D labeler and unwalkable by `ffprobe` in 10 minutes. Invisible
+   until someone opens the file days later. **This is a silent data-quality failure
+   triggered by a capacity error.**
+2. `_warm()` called `EndEncode()` but never released the object. The session is freed by
+   the **destructor**, so the warm-up session was held for the life of the process,
+   permanently costing one of the 12 slots.
+
+**Fixes applied.**
+- Every rung of the ladder now carries `gopLength`/`idrPeriod`, so a downgrade can never
+  silently lose the GOP; if it somehow does, the warning says so explicitly.
+- Fatal NVENCSTATUS values (21 session limit, 10 OOM, 1/2/4/5 device) are classified and
+  no longer descend the ladder — one `gc.collect()` retry at full config, then a loud
+  `RuntimeError` naming the cap and the budget.
+- `_warm()` now `del`s the encoder and collects, releasing the slot.
+- New `nvenc.probe_max_sessions()` for a preflight. **Probes; never hardcodes 12.**
+
+**Budget arithmetic at 9 cameras.**
+
+| | sessions |
+|---|---|
+| cap (measured) | **12** |
+| capture: one per camera | 9 |
+| `encode_parallel` (post-hoc/raw path only) | 3 |
+| warm-up | ~~1~~ 0 (now released) |
+
+During **capture** only the 9 camera sessions are live → 9 of 12, comfortable. The
+`encode_parallel` NVENC jobs belong to the raw-fallback encode at stop; in real-time kick
+mode the stop path is an ffmpeg `-c copy` remux, which uses no NVENC session at all. The
+danger is **overlap**: if capture sessions are not torn down before an encode begins,
+9 + 3 = 12 is exactly at the cap with zero margin, and the failure mode is a camera
+silently degrading to `raw.bin` at ~207 GB/10 min with no disk guard.
+
+**So 9 cameras fits — but only because the warm-session leak is fixed, and only if
+capture and encode sessions never overlap.** Still to do: a startup preflight that probes
+the count and refuses a real-time start below `n_cams`, explicit encoder teardown on the
+`sync_encode` failure path and in `stop()`/`abandon()`, and the NVIDIA driver version
+recorded in session metadata so a post-driver-update regression is diagnosable.
