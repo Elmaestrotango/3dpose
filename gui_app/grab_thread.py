@@ -303,6 +303,7 @@ class GrabThread(QThread):
         STALL_TIMEOUTS = 25
         MAX_REARMS = 5         # stop thrashing if the link is genuinely dead
         first_frame_logged = False
+        zc_verified = False   # zero-copy view checked against GetArray once
         t_wait = 0.0   # cumulative s blocked in RetrieveResult (per 1000 frames)
         t_proc = 0.0   # cumulative s spent processing a frame (per 1000 frames)
         # --- lag diagnostics -------------------------------------------------
@@ -336,111 +337,154 @@ class GrabThread(QThread):
                         result.Release()
                         continue
 
-                    img = result.Array
-
-                    if self._snapshot_requested:
-                        self.snapshot_frame = img.copy()  # full-resolution still
-                        self._snapshot_requested = False
-
-                    consec_timeouts = 0
-                    if recording:
-                        if kick:
-                            # Copy gray into the next ring slot and submit to the
-                            # router; it records metadata for frames it RELEASES
-                            # (the common set), so this thread records none.
-                            buf = self._nv12_ring[self._ring_i]
-                            self._ring_i = (self._ring_i + 1) % len(self._nv12_ring)
-                            tc0 = time.perf_counter()
-                            buf[:self._height, :] = img
-                            t_copy += time.perf_counter() - tc0
-                            try:
-                                raw_bid = result.BlockID
-                            except Exception:
-                                raw_bid = -1
-                            dev_ts = result.TimeStamp * 1e-9
-                            # How far behind the camera's own clock we are now.
-                            if clock_off is None:
-                                clock_off = t1 - dev_ts
-                            deliv_lag = (t1 - dev_ts) - clock_off
-                            if awaiting_resync:
-                                awaiting_resync = False
-                                off = self._resync_offset(raw_bid, dev_ts)
-                                if off is None:
-                                    self.desynced = True
+                    # Zero-copy view over the driver buffer. `result.Array`
+                    # (GetArray) ALLOCATES a fresh 2.3 MB array and memcpys into
+                    # it with the GIL HELD -- measured 0.837 ms/frame of GIL-held
+                    # work vs 0.157 ms here (5.33x, probe_zerocopy.py on a real
+                    # camera). That is ~0.68 ms per camera per frame, and it is the
+                    # term that scales with camera count: 9 cams x 0.68 = 6.1 ms of
+                    # a 10 ms window. E2 showed <=300 us/thread/frame is safe even
+                    # at 17 threads while ~1000 us blows the budget at 11, so this
+                    # single change is what makes 9 cameras arithmetically possible.
+                    #
+                    # The view MUST NOT outlive this block: every consumer below
+                    # copies out of it (snapshot, NV12 ring, os.write, preview
+                    # decimate, full-res HUD copy), and pypylon raises on exit if a
+                    # reference escaped. Do NOT hoist `img` out of the with.
+                    # np.frombuffer(GetBuffer()) is NOT a substitute -- measured
+                    # 0.902 ms, i.e. no better than .Array.
+                    with result.GetArrayZeroCopy() as img:
+                        if not zc_verified:
+                            # One-time correctness gate. GetArrayZeroCopy reshapes the
+                            # raw buffer to (H, W) and does NOT account for row
+                            # padding, which would SHEAR every frame silently. The
+                            # PaddingX node is not implemented on these cameras
+                            # (LogicalErrorException), so it cannot be read directly —
+                            # instead compare once against the known-good GetArray()
+                            # path. Costs one extra copy per acquisition.
+                            zc_verified = True
+                            ref = result.Array
+                            if img.shape != ref.shape or not np.array_equal(img, ref):
+                                print(f"[grab{self._cam_index}] FATAL: zero-copy view "
+                                      f"does not match GetArray ({img.shape} vs "
+                                      f"{ref.shape}) — row padding or stride mismatch. "
+                                      f"Refusing to record sheared frames.", flush=True)
+                                self.desynced = True
+                                if kick and self._router is not None:
+                                    # Drop this camera from the alignment set so the
+                                    # others keep recording aligned instead of the
+                                    # coordinator starving on a camera that is gone.
                                     self._router.retire(
                                         self._cam_index,
-                                        "stream stalled and block IDs could not "
-                                        "be realigned")
-                                else:
-                                    bid_offset = off
-                                    print(f"[grab{self._cam_index}] resynced after "
-                                          f"re-arm, block-ID offset {off}", flush=True)
-                            if not self.desynced:
-                                bid = raw_bid + bid_offset
-                                self._last_bid_eff = bid
-                                self._last_ts = dev_ts
-                                ts0 = time.perf_counter()
-                                self._router.submit(self._cam_index, bid,
-                                                    dev_ts, buf)
-                                t_submit += time.perf_counter() - ts0
-                            self.frame_count += 1  # grabbed count (for logging)
-                        elif enc_thread is not None:
-                            persisted = self._put_frame(enc_thread, img)
-                            if persisted:
+                                        "zero-copy frame view failed verification")
+                                self._running = False
+                            else:
+                                print(f"[grab{self._cam_index}] zero-copy view verified "
+                                      f"({img.shape} {img.dtype})", flush=True)
+
+                        if self._snapshot_requested:
+                            self.snapshot_frame = img.copy()  # full-resolution still
+                            self._snapshot_requested = False
+
+                        consec_timeouts = 0
+                        if recording:
+                            if kick:
+                                # Copy gray into the next ring slot and submit to the
+                                # router; it records metadata for frames it RELEASES
+                                # (the common set), so this thread records none.
+                                buf = self._nv12_ring[self._ring_i]
+                                self._ring_i = (self._ring_i + 1) % len(self._nv12_ring)
+                                tc0 = time.perf_counter()
+                                buf[:self._height, :] = img
+                                t_copy += time.perf_counter() - tc0
+                                try:
+                                    raw_bid = result.BlockID
+                                except Exception:
+                                    raw_bid = -1
+                                dev_ts = result.TimeStamp * 1e-9
+                                # How far behind the camera's own clock we are now.
+                                if clock_off is None:
+                                    clock_off = t1 - dev_ts
+                                deliv_lag = (t1 - dev_ts) - clock_off
+                                if awaiting_resync:
+                                    awaiting_resync = False
+                                    off = self._resync_offset(raw_bid, dev_ts)
+                                    if off is None:
+                                        self.desynced = True
+                                        self._router.retire(
+                                            self._cam_index,
+                                            "stream stalled and block IDs could not "
+                                            "be realigned")
+                                    else:
+                                        bid_offset = off
+                                        print(f"[grab{self._cam_index}] resynced after "
+                                              f"re-arm, block-ID offset {off}", flush=True)
+                                if not self.desynced:
+                                    bid = raw_bid + bid_offset
+                                    self._last_bid_eff = bid
+                                    self._last_ts = dev_ts
+                                    ts0 = time.perf_counter()
+                                    self._router.submit(self._cam_index, bid,
+                                                        dev_ts, buf)
+                                    t_submit += time.perf_counter() - ts0
+                                self.frame_count += 1  # grabbed count (for logging)
+                            elif enc_thread is not None:
+                                persisted = self._put_frame(enc_thread, img)
+                                if persisted:
+                                    self.frame_count += 1
+                                    self.timestamps.append(result.TimeStamp * 1e-9)
+                                    # GigE Vision block ID = trigger ordinal: makes a
+                                    # dropped frame a detectable, re-alignable gap
+                                    # instead of a silent cross-camera desync.
+                                    try:
+                                        self.block_ids.append(result.BlockID)
+                                    except Exception:
+                                        self.block_ids.append(-1)
+                            else:
+                                os.write(fd, img)
                                 self.frame_count += 1
                                 self.timestamps.append(result.TimeStamp * 1e-9)
-                                # GigE Vision block ID = trigger ordinal: makes a
-                                # dropped frame a detectable, re-alignable gap
-                                # instead of a silent cross-camera desync.
                                 try:
                                     self.block_ids.append(result.BlockID)
                                 except Exception:
                                     self.block_ids.append(-1)
-                        else:
-                            os.write(fd, img)
-                            self.frame_count += 1
-                            self.timestamps.append(result.TimeStamp * 1e-9)
-                            try:
-                                self.block_ids.append(result.BlockID)
-                            except Exception:
-                                self.block_ids.append(-1)
 
-                    frame_n += 1
-                    if recording and not first_frame_logged:
-                        print(f"[grab{self._cam_index}] first frame received", flush=True)
-                        first_frame_logged = True
-                    t_proc += time.perf_counter() - t1
-                    if recording and frame_n % 1000 == 0:
-                        # wait >> proc and ~10 ms/frame -> loop keeps up (waits
-                        # for triggers); proc-bound or wait ~0 -> loop is the
-                        # bottleneck and a pool backlog is building.
-                        qd = enc_thread.queue.qsize() if enc_thread else (
-                            self._router.pending() if kick else 0)
-                        print(f"[grab{self._cam_index}] frames={frame_n} timeouts={timeout_n} "
-                              f"avg_wait={t_wait:.2f}ms avg_proc={t_proc:.2f}ms "
-                              f"qsize={qd} | deliv_lag={deliv_lag:+.3f}s "
-                              f"copy={t_copy:.2f} submit={t_submit:.2f} "
-                              f"disp={t_disp:.2f} rel={t_rel:.2f} "
-                              f"cycle={t_cycle:.2f}ms", flush=True)
-                        t_wait = t_proc = 0.0
-                        t_copy = t_submit = t_disp = t_rel = t_cycle = 0.0
-                    now = time.perf_counter()
-                    self._fps_times.append(now)
-                    if len(self._fps_times) >= 2:
-                        dt = self._fps_times[-1] - self._fps_times[0]
-                        if dt > 0:
-                            self.current_fps = (len(self._fps_times) - 1) / dt
+                        frame_n += 1
+                        if recording and not first_frame_logged:
+                            print(f"[grab{self._cam_index}] first frame received", flush=True)
+                            first_frame_logged = True
+                        t_proc += time.perf_counter() - t1
+                        if recording and frame_n % 1000 == 0:
+                            # wait >> proc and ~10 ms/frame -> loop keeps up (waits
+                            # for triggers); proc-bound or wait ~0 -> loop is the
+                            # bottleneck and a pool backlog is building.
+                            qd = enc_thread.queue.qsize() if enc_thread else (
+                                self._router.pending() if kick else 0)
+                            print(f"[grab{self._cam_index}] frames={frame_n} timeouts={timeout_n} "
+                                  f"avg_wait={t_wait:.2f}ms avg_proc={t_proc:.2f}ms "
+                                  f"qsize={qd} | deliv_lag={deliv_lag:+.3f}s "
+                                  f"copy={t_copy:.2f} submit={t_submit:.2f} "
+                                  f"disp={t_disp:.2f} rel={t_rel:.2f} "
+                                  f"cycle={t_cycle:.2f}ms", flush=True)
+                            t_wait = t_proc = 0.0
+                            t_copy = t_submit = t_disp = t_rel = t_cycle = 0.0
+                        now = time.perf_counter()
+                        self._fps_times.append(now)
+                        if len(self._fps_times) >= 2:
+                            dt = self._fps_times[-1] - self._fps_times[0]
+                            if dt > 0:
+                                self.current_fps = (len(self._fps_times) - 1) / dt
 
-                    if frame_n % self._display_every == 0:
-                        td0 = time.perf_counter()
-                        d = self._downsample
-                        self.latest_frame = img[::d, ::d].copy()
-                        # Full-res copy for the coverage HUD detector (calibration
-                        # only) — oblique cams (1/4) need full res to resolve the
-                        # board, same as the post-hoc calibration.
-                        if self._keep_full:
-                            self.latest_full_frame = img.copy()
-                        t_disp += time.perf_counter() - td0
+                        if frame_n % self._display_every == 0:
+                            td0 = time.perf_counter()
+                            d = self._downsample
+                            self.latest_frame = img[::d, ::d].copy()
+                            # Full-res copy for the coverage HUD detector (calibration
+                            # only) — oblique cams (1/4) need full res to resolve the
+                            # board, same as the post-hoc calibration.
+                            if self._keep_full:
+                                self.latest_full_frame = img.copy()
+                            t_disp += time.perf_counter() - td0
 
                     tr0 = time.perf_counter()
                     result.Release()

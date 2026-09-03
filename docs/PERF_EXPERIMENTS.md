@@ -138,3 +138,116 @@ to 128, which exists for correctness, has been doing pre-faulting for free all a
 full production 744 buffers (2.39 GiB). TLB/cache behavior at true production ring size,
 with 6–9 rings live and ~28 GB committed, is untested — Windows working-set trimming
 could reintroduce soft faults that the small test cannot show.
+
+---
+
+## E2 — GIL wait, measured directly (`probe_gil_wait.py`, 2026-09-03)
+
+**Question.** E1a left GIL re-acquisition wait as the only surviving explanation for the
+2.7 ms copy, but by elimination. Prove it, and find how much GIL-held work per thread
+per frame the system actually tolerates.
+
+**Method.** `QueryThreadCycleTime` gives cycles a thread actually *executed*; wall comes
+from `perf_counter`; the difference is wait. One measured thread does the production copy
+at a realistic 100 Hz duty (not continuously — that would measure bandwidth saturation),
+alongside N competitor threads each burning a fixed amount of GIL-held Python work every
+10 ms. Competitor counts map to real configurations: 5 = 6 grab threads, 11 = today
+(6 grab + 6 encoder), 17 = the 9-camera target.
+
+**Results** (per-copy wall median, ms):
+
+| GIL-held µs per competitor per frame | 0 comp | 5 | 11 | 17 |
+|---|---|---|---|---|
+| 100 µs | 0.135 | 0.145 | 0.125 | 0.223 |
+| 300 µs | 0.130 | 0.321 | 0.324 | 0.128 |
+| **1000 µs** | 0.130 | 1.031 | **10.19** | **17.14** |
+
+Worst case: wall **×127** (0.135 → 17.14 ms) while exec went **×1.6** (0.139 → 0.220 ms).
+At 17 competitors × 1000 µs, wait median was 16.82 ms of a 17.14 ms bracket.
+
+**Findings.**
+1. **CONFIRMED.** Contention inflates the *bracket*, not the work. A wall-clock timer
+   around a GIL-releasing call reports waiting as working. The production 2.7 ms was
+   never 2.7 ms of copying.
+2. **The tolerance boundary is between 300 µs and 1000 µs of GIL-held work per thread per
+   frame.** ≤300 µs is safe even at 17 threads; ~1000 µs blows the 10 ms budget at 11.
+   This is the acceptance criterion for any hot-path change from here on.
+
+---
+
+## E3 — Zero-copy frame access (`probe_zerocopy.py`, 2026-09-03)
+
+**The finding that mattered, and I did not find it — three independent audit lanes did.**
+`grab_thread.py:339` did `img = result.Array`. pypylon's `GetArray()` **allocates a fresh
+2.3 MB array and memcpys the driver buffer into it, with the GIL HELD** (pypylon is built
+with SWIG `-threads`, but `GetArray` is on the explicit `%nothread` list). That is exactly
+the ~1000 µs regime E2 identified as fatal, and it is the term that scales with camera
+count.
+
+**Method.** A/B three routes on a real camera in the production access pattern
+(NV12 ring copy + preview decimate), measuring fps, wall, and exec via
+`QueryThreadCycleTime`. Also gate two correctness risks: `GetArrayZeroCopy` reshapes the
+buffer to (H, W) without accounting for row padding, and pypylon raises on context exit
+if a reference to the view escaped.
+
+| route | exec median | vs production |
+|---|---|---|
+| `result.Array` (production) | **0.8371 ms** | — |
+| **`GetArrayZeroCopy`** (context manager) | **0.1571 ms** | **5.33× cheaper** |
+| `np.frombuffer(GetBuffer())` | 0.9016 ms | 0.93× — **no gain** |
+
+**Findings.**
+1. **`GetArrayZeroCopy` removes ~0.68 ms of GIL-held work per frame per camera** —
+   6.1 ms per 10 ms window at 9 cameras.
+2. **The context manager survives our exact six-way access pattern** (snapshot copy, NV12
+   ring copy, `os.write`, preview decimate, full-res HUD copy, encoder put). Every
+   consumer copies, so no reference escapes and no exit error is raised.
+3. **`np.frombuffer(GetBuffer())` is NOT a substitute** — measured no better than
+   `.Array`, presumably because `GetBuffer()` copies too. This mattered: it was the
+   minimal-diff option that would have avoided re-indenting 100 lines of hot path, and
+   it does not work. **Recorded so nobody retries it.**
+4. `PaddingX` is **not implemented** on the a2A1920-165g5m (`LogicalErrorException`), so
+   padding cannot be checked directly. Implemented instead as a one-time comparison of
+   the zero-copy view against `GetArray()` on the first frame of each acquisition; on
+   mismatch the camera is retired and the thread stops rather than recording sheared
+   frames.
+
+### E3 rig validation — 6 cameras, 90 s, real triggers
+
+Before, from the round-1 agents' production-shaped loop: **83 fps, cycle 12.0 ms,
+avg_proc 5.2–5.5 ms, ~30 buffers backlogged.**
+
+After, every camera, sustained for the whole run:
+
+| metric | before | after |
+|---|---|---|
+| `cycle` | 12.0 ms | **10.00 ms** (= the trigger period, exactly) |
+| `avg_proc` | 5.2–5.5 ms | **0.79–0.84 ms** |
+| `avg_wait` (slack) | ~4.1 ms | **8.48–8.66 ms** |
+| `copy` bracket | 2.7 ms | **0.71–0.75 ms** |
+| `deliv_lag` | +10.7 s @20k frames | **−0.002 to −0.037 s** |
+| `Buffer_Underrun_Count` | 245–882 | **0 on all six** |
+| coordinator lag (median / p95 / max) | median 235–479, riding the cap | **0 / 1 / 2** |
+| `forced` drops | 3413–12.34% | **0** |
+| frames per camera | unequal | **9075 on all six, identical** |
+
+`dropped=12` of 54,450 submissions (0.02%). `Failed_Buffer_Count` 4 on cams 1/4/6 and 0
+on cams 2/3/5 — the known Eth5 leg, now negligible.
+
+**THE ROTATING-LAGGARD MYSTERY IS SOLVED.** Since July the project has recorded that
+"one camera — which one varies per session — drifts ~2.4 s behind in *submission* while
+still capturing ~100% of triggers" and that it "is still unknown; it is not packet loss,
+not the encoders, and not the cameras." It was `result.Array`: a GIL-held 2.3 MB memcpy
+per frame per camera, ~837 µs, which put the pipeline in the regime E2 shows breaks at
+11+ threads. Whichever thread lost the GIL/scheduling lottery accumulated backlog fastest
+and became "the laggard" — hence the rotation. Median cross-camera lag is now **0**.
+
+**Consequence for `kick_max_lag`.** 480 was validated on 2026-08-11 as the fix for 12.34%
+loss, and it costs ring RAM linearly (`max_lag + ENCODE_QUEUE_DEPTH + 64` buffers/cam).
+With observed lag now 0/1/2, that headroom is buying nothing. Lowering it back toward 240
+(or below) should be tested — it halves the ring, which is what makes the 9-camera RAM
+budget comfortable. **Do not lower it without a rig A/B**: the pool may be absorbing real
+network jitter that this 90 s run did not sample.
+
+**Status.** Implemented in `grab_thread.py`. All three test suites pass
+(`test_frame_sync.py`, `test_stim_compiler.py`, `test_serial_handshake.py`).
