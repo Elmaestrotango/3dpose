@@ -1059,10 +1059,28 @@ class StimulationWindow(QDialog):
                     f"pin, or merge them into a single chain.")
         return None
 
+    def record_blocker(self) -> str | None:
+        """Reason a RECORDING must not start with this workflow, or None.
+
+        Record does not compile anything — it runs whatever is already on the
+        board — so this was never gated, and only Apply (:1159) and Test (:1219)
+        consulted _blocking_problem. But the canvas is what `stim_paradigm.json`
+        and `stim_trace.csv` describe, and a graph containing a forbidden pin
+        means the .ino on the board may be driving a camera trigger line, which
+        silently breaks the block-ID identity every downstream consumer assumes.
+        CLAUDE.md already claims Record warns here; this makes that true.
+        """
+        return self._blocking_problem()
+
     def provenance(self) -> dict:
         """Everything needed to reconstruct what the animal actually received."""
         blocks, edges = self._canvas.get_workflow()
-        ino = stim_compiler.compile_ino(blocks, edges, self._get_safe_pins())
+        # Must pass trigger_pins, same as _compile(). Otherwise the two compile
+        # calls disagree: this one succeeds on a forbidden-pin graph while
+        # firmware_source() raises, so stim_paradigm.json gets written and the
+        # .ino beside it does not — a half-described session.
+        ino = stim_compiler.compile_ino(blocks, edges, self._get_safe_pins(),
+                                        self._get_trigger_pins())
         # None = nothing was uploaded this session, so the GUI cannot know what
         # the board is running (it survives app restarts).
         matches = None if self._uploaded_ino is None else (ino == self._uploaded_ino)
@@ -1291,8 +1309,14 @@ class StimulationWindow(QDialog):
         if self._test_timer is not None:
             self._test_timer.stop()
             self._test_timer = None
+        stopped = True
         if self._test_serial is not None:
-            self._test_serial.stop_triggers([])
+            # The most laser-exposed stop in the application: a bench Test drives
+            # the stim pin with no cameras and no recording, and a looping chain
+            # has no end time — this single write is the ONLY thing that stops
+            # it. Reporting "Test stopped." when the write failed is worse than
+            # not reporting at all.
+            stopped = self._test_serial.stop_triggers([])
             if self._test_owns_serial:      # never close the main window's link
                 self._test_serial.close()
             self._test_serial = None
@@ -1300,7 +1324,18 @@ class StimulationWindow(QDialog):
         self._test_end_at = None
         self._test_btn.setText("Test")
         self._apply_btn.setEnabled(True)
-        self._set_status(message)
+        if not stopped:
+            self._set_status("STOP NOT CONFIRMED — stim may still be running.",
+                             error=True)
+            QMessageBox.critical(
+                self, "Stim may still be running",
+                "The trigger board did not accept the stop command.\n\n"
+                "Any stim chain — including a looping one, which never ends on "
+                "its own — may still be driving its pin.\n\n"
+                "Power-cycle the trigger board and key off the laser before "
+                "continuing.")
+        else:
+            self._set_status(message)
 
     def closeEvent(self, event):
         if self._test_timer is not None:

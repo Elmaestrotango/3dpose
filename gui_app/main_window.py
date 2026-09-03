@@ -287,6 +287,30 @@ class MainWindow(QMainWindow):
         elif self._state == State.RECORDING:
             self._stop_acquisition()
 
+    def _warn_if_not_stood_down(self, stopped: bool) -> bool:
+        """Surface a stop_triggers() failure. Returns what it was given.
+
+        CLAUDE.md's invariant is that closing the GUI can never leave a paradigm
+        or a laser running. The board is the only thing that can honour that, so
+        when it does not accept the stop the operator has to be told — a
+        swallowed failure turns a laser left running into a silent one.
+        """
+        if stopped:
+            return True
+        print("[acq] STOP NOT CONFIRMED — board may still be triggering",
+              flush=True)
+        try:
+            QMessageBox.critical(
+                self, "Trigger board did not confirm the stop",
+                "The trigger board did not accept the stop command.\n\n"
+                "It may still be triggering, and any stim paradigm — including "
+                "a looping one, which never ends on its own — may still be "
+                "driving its pin.\n\n"
+                "Power-cycle the trigger board and key off the laser.")
+        except Exception:
+            pass       # a dialog failure must not mask the printed warning
+        return False
+
     def _preflight_capacity(self) -> bool:
         """Check RAM, NVENC sessions and disk against the ACTUAL camera count.
 
@@ -345,6 +369,20 @@ class MainWindow(QMainWindow):
         # raw.bin because the driver's NVENC session cap was hit, a MemoryError
         # inside a grab thread, or a disk filling mid-session. Refuse up front
         # instead of half-recording.
+        # A stim graph on a camera trigger pin injects extra rising edges into
+        # ONE camera, so its block IDs advance faster and block-ID N stops
+        # meaning the same instant everywhere — which frame_sync, alignment.py
+        # and stim_trace all take as given. Apply and Test were gated; Record was
+        # not, and Record is the one that produces data.
+        if self._stim_window is not None:
+            blocker = self._stim_window.record_blocker()
+            if blocker:
+                print(f"[acq] refusing start, stim workflow: {blocker}", flush=True)
+                QMessageBox.critical(self, "Cannot record with this stim workflow",
+                                     blocker)
+                self._sidebar.reset_toggles()
+                return
+
         if not self._preflight_capacity():
             # reset_toggles(), not the silent variant: we are at IDLE here, so
             # letting the signal fire is a genuine no-op for the state machine
@@ -604,7 +642,10 @@ class MainWindow(QMainWindow):
         self._cancel_stim_autostop()
         # Stop the triggers but KEEP the port open: reopening it would reset the
         # board at the start of the next recording and flash a connected laser.
-        self._teensy.stop_triggers(self._profile.trigger_pins)
+        # This is the everyday stop — the one taken every session — so it is the
+        # path where a swallowed failure matters most, not least.
+        self._warn_if_not_stood_down(
+            self._teensy.stop_triggers(self._profile.trigger_pins))
 
         self._stop_coverage_hud()
         if self._detector is not None and self._detector.codet_frames:
@@ -921,10 +962,15 @@ class MainWindow(QMainWindow):
         try:
             if self._teensy is not None:
                 if self._teensy.is_open:
-                    self._teensy.stop_triggers(self._profile.trigger_pins)
+                    # Warn BEFORE the window goes, while there is still something
+                    # to show the dialog on. `is_open` is not proof of anything:
+                    # pyserial keeps it True after the USB device disappears, so
+                    # an unplugged cable looks healthy right up until the write.
+                    self._warn_if_not_stood_down(
+                        self._teensy.stop_triggers(self._profile.trigger_pins))
                 self._teensy.close()
-        except Exception:
-            pass
+        except Exception as e:
+            print(f"[quit] standing the board down failed: {e}", flush=True)
 
         if busy:
             self._abandon_and_cleanup()
