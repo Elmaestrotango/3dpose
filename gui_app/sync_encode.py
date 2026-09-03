@@ -140,28 +140,43 @@ class SyncEncodeRouter:
         (count, timestamps, block_ids)."""
         with self._lock:
             self._route(self._coord.flush())
-        for et in self._encoders:
+        for i, et in enumerate(self._encoders):
             try:
                 et.queue.put(None, timeout=30)
-            except Exception:
-                pass
+            except Exception as e:
+                # Not silent: a wedged queue means this camera never gets its
+                # sentinel, so it will not finish and everything below has to
+                # treat it as unfinished.
+                print(f"[sync] cam{i+1}: could not deliver the drain sentinel "
+                      f"({type(e).__name__}) — encoder will not finish cleanly",
+                      flush=True)
         for et in self._encoders:
             et.join(timeout=60)
-        for fd in self._fds:
+
+        # Establish ONCE who actually finished, then gate everything on it.
+        # A thread can outlive its join, and every step below is unsafe against
+        # a live one: closing its fd makes the next os.write raise EBADF, which
+        # run() reads as "the encoder died" and sends it spilling raw planes into
+        # a session being finalised; and its encoded/spilled counters are still
+        # moving, so reconciling against them truncates block_ids to a snapshot
+        # of a moving target — corrupting a recording that was still finishing
+        # correctly.
+        alive = [et.is_alive() for et in self._encoders]
+        for i, (fd, is_alive) in enumerate(zip(self._fds, alive)):
+            if is_alive:
+                print(f"[sync] cam{i+1}: encoder still running after join; "
+                      f"leaking its fd and NVENC session rather than pulling "
+                      f"them out from under a live writer", flush=True)
+                continue
             try:
                 os.close(fd)
             except Exception:
                 pass
         # Hand the NVENC sessions back now rather than whenever the router
-        # happens to become unreachable. The next acquisition needs them, and
-        # the driver cap (12 here) leaves no slack at 9 cameras. Skip any thread
-        # that outlived its join — run() dereferences the encoder per frame, so
-        # releasing under a live thread would be worse than leaking the session.
-        for et in self._encoders:
-            if et.is_alive():
-                print(f"[sync] {et.name}: encoder thread still running after "
-                      f"join; leaking its NVENC session rather than releasing it "
-                      f"under a live thread", flush=True)
+        # happens to become unreachable: the next acquisition needs them and the
+        # driver cap (12 here) leaves no slack at 9 cameras.
+        for et, is_alive in zip(self._encoders, alive):
+            if is_alive:
                 continue
             try:
                 et.release_encoder()
@@ -190,6 +205,21 @@ class SyncEncodeRouter:
         # order (FIFO queue, appended in the same order), so truncating to it is
         # the correct repair rather than a guess.
         for i, et in enumerate(self._encoders):
+            if alive[i]:
+                # Counters are still moving; any repair would be based on a
+                # snapshot of a moving target. Say the mapping is unverified
+                # rather than silently truncating a recording that may be fine.
+                msg = (f"cam{i+1}: encoder did not finish draining, so the "
+                       f"frame-to-trigger mapping is UNVERIFIED. Do not trust "
+                       f"this camera's alignment without checking the mp4 frame "
+                       f"count against blockids.npy.")
+                print(f"[sync] WARNING: {msg}", flush=True)
+                self.warnings.append(msg)
+                try:
+                    (self._dirs[i] / "WARNINGS.txt").write_text(msg + "\n")
+                except Exception:
+                    pass
+                continue
             persisted = et.encoded + et.spilled
             claimed = len(self.block_ids[i])
             if persisted == claimed:

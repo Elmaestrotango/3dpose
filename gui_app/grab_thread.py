@@ -348,8 +348,13 @@ class GrabThread(QThread):
         # rather than the rest of the session.
         STALL_TIMEOUTS = 25
         MAX_REARMS = 5         # stop thrashing if the link is genuinely dead
+        # Consecutive per-frame exceptions before this camera is written off. A
+        # camera raising every frame is not recoverable by retrying, and in kick
+        # mode it starves every OTHER camera, so failing fast beats spinning.
+        MAX_CONSEC_ERRORS = 10
+        consec_errors = 0      # reset by every successful frame
         first_frame_logged = False
-        zc_verified = False   # zero-copy view checked against GetArray once
+        zc_verified = False   # padding checked once per acquisition
         t_wait = 0.0   # cumulative s blocked in RetrieveResult (per 1000 frames)
         t_proc = 0.0   # cumulative s spent processing a frame (per 1000 frames)
         # --- lag diagnostics -------------------------------------------------
@@ -393,46 +398,49 @@ class GrabThread(QThread):
                     # at 17 threads while ~1000 us blows the budget at 11, so this
                     # single change is what makes 9 cameras arithmetically possible.
                     #
-                    # The view MUST NOT outlive this block: every consumer below
+                    # The view MUST NOT outlive this block. Every consumer below
                     # copies out of it (snapshot, NV12 ring, os.write, preview
-                    # decimate, full-res HUD copy), and pypylon raises on exit if a
-                    # reference escaped. Do NOT hoist `img` out of the with.
-                    # np.frombuffer(GetBuffer()) is NOT a substitute -- measured
-                    # 0.902 ms, i.e. no better than .Array.
-                    with result.GetArrayZeroCopy() as img:
-                        if not zc_verified:
-                            # One-time correctness gate. GetArrayZeroCopy reshapes the
-                            # raw buffer to (H, W) and does NOT account for row
-                            # padding, which would SHEAR every frame silently. The
-                            # PaddingX node is not implemented on these cameras
-                            # (LogicalErrorException), so it cannot be read directly —
-                            # instead compare once against the known-good GetArray()
-                            # path. Costs one extra copy per acquisition.
-                            zc_verified = True
-                            ref = result.Array
-                            if img.shape != ref.shape or not np.array_equal(img, ref):
-                                print(f"[grab{self._cam_index}] FATAL: zero-copy view "
-                                      f"does not match GetArray ({img.shape} vs "
-                                      f"{ref.shape}) — row padding or stride mismatch. "
-                                      f"Refusing to record sheared frames.", flush=True)
-                                self.desynced = True
-                                if kick and self._router is not None:
-                                    # Drop this camera from the alignment set so the
-                                    # others keep recording aligned instead of the
-                                    # coordinator starving on a camera that is gone.
-                                    self._router.retire(
-                                        self._cam_index,
-                                        "zero-copy frame view failed verification")
-                                self._running = False
-                            else:
-                                print(f"[grab{self._cam_index}] zero-copy view verified "
-                                      f"({img.shape} {img.dtype})", flush=True)
+                    # decimate, full-res HUD copy). pypylon's exit guard catches
+                    # EXTRA references, but structurally cannot catch the
+                    # with-target itself — that binding is inside its budget — so
+                    # `del img` below is what actually enforces this. Do NOT hoist
+                    # `img` out of the with. np.frombuffer(GetBuffer()) is NOT a
+                    # substitute: measured 0.902 ms, no better than .Array.
+                    #
+                    # Row padding is checked BEFORE the with, not inside it.
+                    # GetArrayZeroCopy reshapes the raw buffer to (H, W) and
+                    # ignores padding, and with padding present the memoryview
+                    # .cast() raises TypeError — so an inside-the-with check can
+                    # never run in the very case it exists for.
+                    if result.PaddingX or result.PaddingY:
+                        # Not a hypothetical guard: GetArray() itself reads
+                        # PaddingX to build its strides, so the code this replaced
+                        # was already consulting it 100x/s. Unpadded rows are the
+                        # precondition for the (H, W) reshape being the image.
+                        print(f"[grab{self._cam_index}] FATAL: PaddingX="
+                              f"{result.PaddingX} PaddingY={result.PaddingY} — rows "
+                              f"would shear. Refusing to record.", flush=True)
+                        self.desynced = True
+                        if kick and self._router is not None:
+                            # Drop this camera from the alignment set so the others
+                            # keep recording aligned instead of the coordinator
+                            # starving on a camera that will never publish.
+                            self._router.retire(self._cam_index,
+                                                "camera reports row padding")
+                        result.Release()
+                        break
+                    if not zc_verified:
+                        zc_verified = True
+                        print(f"[grab{self._cam_index}] zero-copy view OK "
+                              f"(PaddingX=0 PaddingY=0)", flush=True)
 
+                    with result.GetArrayZeroCopy() as img:
                         if self._snapshot_requested:
                             self.snapshot_frame = img.copy()  # full-resolution still
                             self._snapshot_requested = False
 
                         consec_timeouts = 0
+                        consec_errors = 0
                         if recording:
                             if kick:
                                 # Copy gray into the next ring slot and submit to the
@@ -532,6 +540,12 @@ class GrabThread(QThread):
                                 self.latest_full_frame = img.copy()
                             t_disp += time.perf_counter() - td0
 
+                    # Python does not unbind a with-target when the block ends, so
+                    # `img` would otherwise keep pointing at the driver buffer past
+                    # Release() — a dangling view one careless edit away from a
+                    # use-after-free. Unbind it explicitly.
+                    del img
+
                     tr0 = time.perf_counter()
                     result.Release()
                     t_rel += time.perf_counter() - tr0
@@ -561,15 +575,63 @@ class GrabThread(QThread):
                             self.desynced = True
                             self._router.retire(self._cam_index,
                                                 "stream stalled, re-arm failed")
+                    elif (consec_timeouts >= STALL_TIMEOUTS and not self.desynced
+                            and recording and kick):
+                        # Re-arms exhausted. Without this the condition above just
+                        # stays false forever: the thread keeps timing out in
+                        # silence, its frontier frozen, and the coordinator
+                        # force-drops every trigger for EVERY camera — the whole
+                        # session comes back empty with nothing but timeout lines
+                        # to show for it.
+                        self.desynced = True
+                        self._router.retire(
+                            self._cam_index,
+                            f"stream dead after {MAX_REARMS} re-arms")
+                        # Must break. Retiring sets desynced, which makes this
+                        # branch false forever after, so without the break the
+                        # thread would sit timing out for the rest of the session
+                        # — the exact silence this fix exists to end. (Caught by
+                        # test_rearm_exhaustion_retires hanging.)
+                        break
                 except Exception as e:
                     print(f"[grab{self._cam_index}] exception: {type(e).__name__}: {e}", flush=True)
                     if not self._running:
+                        break
+                    # This handler used to print, sleep and loop forever. It never
+                    # touched consec_timeouts, so the stall detector above could
+                    # not arm, and `while self._running and IsGrabbing()` stayed
+                    # true — so a camera raising every frame consumed 100 fps,
+                    # discarded all of it, and starved the coordinator into
+                    # force-dropping every trigger for every camera. Bound it.
+                    consec_errors += 1
+                    if consec_errors >= MAX_CONSEC_ERRORS:
+                        print(f"[grab{self._cam_index}] FATAL: {consec_errors} "
+                              f"consecutive frame errors, giving up on this camera",
+                              flush=True)
+                        if recording and kick and self._router is not None:
+                            self.desynced = True
+                            self._router.retire(
+                                self._cam_index,
+                                f"repeated frame-processing errors: "
+                                f"{type(e).__name__}: {e}")
                         break
                     time.sleep(0.001)
         finally:
             print(f"[grab{self._cam_index}] exiting: frames={frame_n} "
                   f"timeouts={timeout_n} drops={self.drops} rearms={self.rearms}"
                   + (" DESYNCED" if self.desynced else ""), flush=True)
+            # Catch-all. Any exit that is NOT a normal stop must retire this
+            # camera, or the coordinator waits forever for a thread that is gone
+            # and force-drops every trigger for every other camera. The explicit
+            # retires above cover the paths we know about; this covers the ones
+            # we don't — notably `IsGrabbing()` going False under us, which just
+            # falls out of the while loop with no error at all.
+            if (recording and kick and self._router is not None
+                    and not self._triggers_stopped and not self.desynced):
+                self.desynced = True
+                self._router.retire(
+                    self._cam_index,
+                    "grab thread exited before the recording was stopped")
             if recording:
                 self._log_stream_stats()  # before StopGrabbing resets counters
             if enc_thread is not None:

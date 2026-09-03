@@ -127,10 +127,14 @@ def nvenc_session_capacity(width: int, height: int, want: int,
     limit-bound. Returns -1 if NVENC is unavailable entirely.
     """
     global _nvenc_sessions, _nvenc_saturated
-    if (_nvenc_sessions is not None and not force
-            and (_nvenc_sessions >= want or not _nvenc_saturated)):
-        # Either we already confirmed enough, or we found the true ceiling.
+    if _nvenc_sessions is not None and not force and _nvenc_sessions >= want:
         return _nvenc_sessions
+    # Cached value is below what we need — ALWAYS re-probe rather than trusting
+    # it. A shortfall is often transient: another process holding sessions for a
+    # second (a browser's hardware encode, an orphaned h264_nvenc ffmpeg), or a
+    # session this app deliberately leaked because an encoder thread outlived its
+    # join. Latching that reading would block every subsequent Record with
+    # "NVENC granted only N" until the GUI is restarted.
     try:
         from gui_app import nvenc
         if not nvenc.available():
@@ -208,9 +212,17 @@ def check_capacity(n_cams: int, width: int, height: int,
     free_gb = _get_disk_free(Path(output_dir) if output_dir else Path("."))
     if free_gb >= 0:
         if need_disk_gb > free_gb:
-            blocking.append(
-                f"Not enough disk for a {minutes:g}-minute recording: "
-                f"{need_disk_gb:.0f} GiB needed, {free_gb:.0f} GiB free.")
+            # A WARNING, never a blocker. `minutes` is an assumed worst case, not
+            # a known recording length, and it is the most speculative number
+            # here — so it must not be the one the operator cannot override. It
+            # would otherwise refuse the `3dpose (raw)` profile outright, which
+            # CLAUDE.md documents as the fallback when the real-time path
+            # misbehaves: 6 cams x 100 fps x 2.3 MB x 600 s is ~772 GiB demanded
+            # for what may be a one-minute test.
+            warnings.append(
+                f"Disk may be short: a {minutes:g}-minute recording would need "
+                f"~{need_disk_gb:.0f} GiB and only {free_gb:.0f} GiB is free. "
+                f"A shorter recording is fine — this assumes {minutes:g} minutes.")
         elif need_disk_gb > 0.8 * free_gb:
             warnings.append(
                 f"Disk is tight: a {minutes:g}-minute recording needs "

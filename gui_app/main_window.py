@@ -346,7 +346,11 @@ class MainWindow(QMainWindow):
         # inside a grab thread, or a disk filling mid-session. Refuse up front
         # instead of half-recording.
         if not self._preflight_capacity():
-            self._sidebar.clear_toggles_silently()
+            # reset_toggles(), not the silent variant: we are at IDLE here, so
+            # letting the signal fire is a genuine no-op for the state machine
+            # (_on_record_toggle only acts when state == RECORDING) while still
+            # reversing the thumb animation and re-enabling the sibling toggle.
+            self._sidebar.reset_toggles()
             return
 
         self._config = self._build_config()
