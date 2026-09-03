@@ -11,6 +11,7 @@ put_nowait into queues the encoders drain faster than the 100 fps inflow, so the
 lock is held for microseconds and never blocks on a full queue. Releases are
 routed under the lock so each encoder receives its frames in trigger order.
 """
+import gc
 import os
 import threading
 from pathlib import Path
@@ -39,6 +40,12 @@ class SyncEncodeRouter:
         self._log_every = max(int(fps), 1) * 5 * self._n   # ~5 s of submissions
         self._since_log = 0
 
+        # Kept so stop() can write a WARNINGS.txt beside the affected video.
+        self._dirs = [Path(rp).parent for rp in raw_paths]
+        #: Human-readable problems found at stop(). Empty means the recording's
+        #: block-ID bookkeeping matches what was actually persisted.
+        self.warnings: list[str] = []
+
         try:
             for i, rp in enumerate(raw_paths):
                 enc = nvenc.create_h264_encoder(width, height, quality, fps=fps)
@@ -57,7 +64,21 @@ class SyncEncodeRouter:
                     os.close(fd)
                 except Exception:
                     pass
+            # Release the sessions we DID get before reporting unavailable.
+            # Closing the fds is not enough: an NVENC session is freed by the
+            # encoder object's destructor, so a partial failure used to hold
+            # every already-created session for an indeterminate time. The grab
+            # threads then fall back to creating their own encoders — against
+            # the same driver cap (12 here) — so at least one camera silently
+            # degrades to raw.bin at ~207 GB per 10 minutes with no disk guard.
+            # None of these threads were started, so releasing is safe.
+            for et in self._encoders:
+                try:
+                    et.release_encoder()
+                except Exception:
+                    pass
             self._encoders = []
+            gc.collect()
 
     def start(self):
         for et in self._encoders:
@@ -131,8 +152,62 @@ class SyncEncodeRouter:
                 os.close(fd)
             except Exception:
                 pass
+        # Hand the NVENC sessions back now rather than whenever the router
+        # happens to become unreachable. The next acquisition needs them, and
+        # the driver cap (12 here) leaves no slack at 9 cameras. Skip any thread
+        # that outlived its join — run() dereferences the encoder per frame, so
+        # releasing under a live thread would be worse than leaking the session.
+        for et in self._encoders:
+            if et.is_alive():
+                print(f"[sync] {et.name}: encoder thread still running after "
+                      f"join; leaking its NVENC session rather than releasing it "
+                      f"under a live thread", flush=True)
+                continue
+            try:
+                et.release_encoder()
+            except Exception as e:
+                print(f"[sync] encoder release failed: {e}", flush=True)
+        gc.collect()
         print(f"[sync] released={self._coord.released} dropped={self._coord.dropped} "
               f"forced={self._coord.forced} queue_full_drops={self.dropped_full}",
               flush=True)
+
+        # Reconcile bookkeeping against what was actually PERSISTED.
+        #
+        # _route() records a block ID as soon as queue.put_nowait() succeeds —
+        # but that only means the QUEUE accepted the frame, not that it was
+        # encoded. If an encoder thread dies, it silently accepts up to
+        # ENCODE_QUEUE_DEPTH more frames and encodes none of them, while their
+        # block IDs are already in the list. blockids.npy then claims frames
+        # stream.h264 does not contain, so **frame i of the mp4 maps to the
+        # wrong trigger** — and every downstream consumer (alignment.py,
+        # stim_trace, the 3D solve) takes block-ID identity as given, so nothing
+        # detects it. stim_trace's own cross-check cannot either: in kick mode
+        # the two arrays are identical by construction, so it passes while the
+        # videos disagree.
+        #
+        # encoded + spilled is the true persisted count, and both are in arrival
+        # order (FIFO queue, appended in the same order), so truncating to it is
+        # the correct repair rather than a guess.
+        for i, et in enumerate(self._encoders):
+            persisted = et.encoded + et.spilled
+            claimed = len(self.block_ids[i])
+            if persisted == claimed:
+                continue
+            msg = (f"cam{i+1}: block-ID bookkeeping claimed {claimed} frames but "
+                   f"only {persisted} were persisted (encoded={et.encoded} "
+                   f"spilled={et.spilled}, encoder_failed={et.failed}); "
+                   f"truncated to {persisted} so frame indices still map to the "
+                   f"correct triggers")
+            print(f"[sync] WARNING: {msg}", flush=True)
+            self.warnings.append(msg)
+            del self.block_ids[i][persisted:]
+            del self.timestamps[i][persisted:]
+            try:
+                (self._dirs[i] / "WARNINGS.txt").write_text(msg + "\n")
+            except Exception as e:
+                print(f"[sync] could not write WARNINGS.txt for cam{i+1}: {e}",
+                      flush=True)
+
         return [(len(self.block_ids[i]), self.timestamps[i], self.block_ids[i])
                 for i in range(self._n)]

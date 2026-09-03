@@ -55,6 +55,27 @@ class _EncoderThread(threading.Thread):
         self.spilled = 0
         self.failed = False
 
+    def release_encoder(self):
+        """Free this thread's NVENC session.
+
+        `EndEncode()` ends the bitstream; the SESSION is released by the encoder
+        object's *destructor*, so the reference has to be dropped as well.
+        Concurrent sessions are capped by the driver (measured: 12 on this rig),
+        and at 9 cameras the budget is tight enough that one leaked session can
+        push a camera onto the raw fallback at ~207 GB per 10 minutes.
+
+        ONLY call this once the thread is no longer running — before start() or
+        after join(). run() dereferences self._enc per frame.
+        """
+        enc, self._enc = self._enc, None
+        if enc is None:
+            return
+        try:
+            enc.EndEncode()
+        except Exception:
+            pass
+        del enc
+
     def run(self):
         spill_fd = None
         try:
