@@ -15,24 +15,31 @@ session, so an extra layer costs nothing and buys clarity.
 The **hot path** — retrieving a frame, 100 times a second per camera — is
 deliberately NOT wrapped in per-field accessor methods. The backend's
 `retrieve()` returns a *native* grab-result object and this module documents the
-attributes it must expose (see `GrabResultProtocol`). A new backend supplies a
-thin adapter object rather than paying an indirection per attribute.
+attributes it must expose (see `GrabResultProtocol`). For the same reason the
+grab loop drives the camera handle itself (`StartGrabbing`/`StopGrabbing`/
+`IsGrabbing`) rather than the equivalent `CameraBackend` methods — see
+`CameraHandleProtocol`. A new backend supplies a thin adapter object rather than
+paying an indirection per attribute.
 
 To be clear about the reasoning, because it would be easy to assume otherwise:
 Python call overhead is NOT why. A call is ~60 ns, so even seven per frame
-across nine cameras is ~40 microseconds per second — irrelevant. The real reason
-is that the hot path has invariants a wrapper tends to quietly break: the frame
-view must not outlive `Release()`, and it must not be copied on the way through
-(a hidden copy here is exactly the 2.3 MB GIL-held memcpy that cost this project
-years of frame loss — see docs/PERF_EXPERIMENTS.md E3). A documented duck-type
-contract keeps those invariants visible at the point they matter.
+across nine cameras at 100 fps is 6,300 calls/s ≈ 0.4 ms of CPU per second —
+0.04% of one core, irrelevant. The real reason is that the hot path has
+invariants a wrapper tends to quietly break: the frame view must not outlive
+`Release()`, and it must not be copied on the way through (a hidden copy here is
+exactly the 2.3 MB GIL-held memcpy that cost this project years of frame loss —
+see docs/PERF_EXPERIMENTS.md E3). A documented duck-type contract keeps those
+invariants visible at the point they matter.
 
 WRITING A NEW BACKEND
-1. Implement `CameraBackend` for your SDK.
-2. Return result objects satisfying `GrabResultProtocol`.
+1. Implement `CameraBackend` for your SDK — ALL of it, including the members
+   below the `set_freerun` line, which are as load-bearing as the rest.
+2. Return camera handles satisfying `CameraHandleProtocol` from `open()`, and
+   result objects satisfying `GrabResultProtocol` from `retrieve()`.
 3. Register it in `load_backend()`.
-4. Run `test_grab_failure.py` (no hardware needed) and then `probe_lag.py`
-   against real cameras, and check `cycle` equals your frame period.
+4. Run `test_grab_failure.py` (needs PyQt5 and pypylon importable, but no
+   hardware) and then `probe_lag.py` against real cameras, and check the
+   `cycle=` figure in the grab threads' log equals your frame period.
 
 The hard part is rarely the API. It is the guarantees:
   - a per-frame **monotonic trigger ordinal** that survives a stream restart
@@ -98,6 +105,30 @@ class GrabResultProtocol(Protocol):
         """Return the buffer to the driver pool. Called once per result."""
 
 
+@runtime_checkable
+class CameraHandleProtocol(Protocol):
+    """What `CameraBackend.open()` must hand back.
+
+    The handle is otherwise opaque — it is only ever passed back into the
+    backend's own methods — EXCEPT for these three, which `grab_thread` calls on
+    it directly. Same reasoning as `GrabResultProtocol`: the grab loop stays on
+    the native object. `CameraBackend` also exposes them, for callers outside the
+    grab loop; both spellings must work.
+    """
+
+    def StartGrabbing(self, strategy) -> None:
+        """Arm the stream. `strategy` is the backend's `GRAB_STRATEGY`.
+
+        Re-arming after a stall is expected to restart the block-ID counter;
+        `GrabThread._resync_offset` recovers the true ordinal from `TimeStamp`."""
+
+    def StopGrabbing(self) -> None: ...
+
+    def IsGrabbing(self) -> bool:
+        """The grab loop's `while` condition. Going False just ends the loop with
+        no error, which is why `run()` has a `finally` catch-all that retires."""
+
+
 class CameraBackend(Protocol):
     """The cold path. One instance per application, stateless w.r.t. cameras."""
 
@@ -109,29 +140,76 @@ class CameraBackend(Protocol):
     #: distinguishable from a real failure.
     TimeoutException: type
 
+    #: The argument `StartGrabbing` takes. Must deliver frames OLDEST-FIRST: that
+    #: is what makes a grab loop too slow for the trigger rate show up as
+    #: increasingly stale frames (visible in `delivery_lag_s`) rather than as
+    #: silent drops. `grab_thread` re-exports this and passes it to the handle.
+    GRAB_STRATEGY: object
+
     def enumerate_devices(self) -> list:
         """All attached cameras, in a STABLE order (sort by serial number).
 
         Order defines camera names (`cam1`...`camN`), which are baked into the
-        calibration extrinsics — so an unstable order silently mislabels data."""
+        calibration extrinsics — so an unstable order silently mislabels data.
+        The device objects are opaque apart from `GetSerialNumber()`, which
+        `camera_manager` calls to name cameras in its two failure messages."""
 
     def open(self, device, pfs_path: str, max_num_buffer: int):
-        """Open and configure one camera. Raise on any problem; the caller
-        refuses to start a partial set rather than shifting camera names."""
+        """Open and configure one camera, returning a `CameraHandleProtocol`.
+
+        Raise on any problem; the caller refuses to start a partial set rather
+        than shifting camera names. `max_num_buffer` is the driver-side pool
+        depth (`camera_manager.MAX_NUM_BUFFER`) and must be honoured — the
+        capacity preflight budgets RAM against it."""
 
     def describe(self, cam) -> dict:
         """`{"width", "height", "pixel_format", "serial"}` read back FROM THE
         CAMERA, not from config. The caller aborts unless every camera agrees
         with the profile — a mismatched pixel format is silently destructive."""
 
-    def set_freerun(self, cam, fps: float) -> None: ...
+    def set_freerun(self, cam, fps: float) -> None:
+        """Untriggered preview mode at `fps` (the app uses 30)."""
 
-    def set_triggered(self, cam, rate_limit: float) -> None:
+    def set_triggered(self, cam, rate_limit: float,
+                      announce: bool = False) -> None:
         """Hardware-trigger mode. `rate_limit` sets the camera's internal frame
         rate; note the minimum interval becomes `exposure + 1/rate_limit`, which
-        is what caps usable exposure."""
+        is what caps usable exposure. `rate_limit <= 0` means disable the limiter
+        (see `basler.set_triggered` for why that is a trap).
 
-    def start_grabbing(self, cam) -> None: ...
+        `announce` is passed True for camera 0 only, so a per-rig log line is
+        printed once rather than N times."""
+
+    def get_exposure_gain(self, cam) -> tuple:
+        """`(exposure_us, gain_db)` as currently set, or `(None, None)` if the
+        camera has no such controls. Read once at open to capture the .pfs
+        baseline, so a calibration-only exposure can be restored EXACTLY
+        afterwards instead of reconstructed."""
+
+    def set_exposure_gain(self, cam, exposure_us=None, gain_db=None) -> tuple:
+        """Apply exposure/gain; return what was actually set, for logging.
+
+        `None` means leave that control alone. The CEILING is the caller's job
+        (`camera_manager.apply_exposure_gain` clamps), because exceeding it does
+        not error — the camera simply ignores triggers it is still busy for."""
+
+    def enable_extended_block_ids(self, i: int, cam) -> bool:
+        """Try to negotiate 64-bit block IDs; return whether it took.
+
+        An optimisation, not a requirement: `alignment._unwrap_blockids` and
+        `FrameSyncCoordinator._unwrap` handle a 16-bit wrap in software. `i` is
+        the camera index, for log lines only. Return False if the concept does
+        not apply to your transport."""
+
+    def select_gige_driver(self, i: int, cam, which: str = "socket") -> None:
+        """Apply the profile's `gige_driver` setting ("socket"/"filter"/"auto").
+
+        A no-op for non-GigE transports. `i` is the camera index, for logging."""
+
+    def start_grabbing(self, cam) -> None:
+        """Cold-path spelling of `handle.StartGrabbing(GRAB_STRATEGY)`. The grab
+        loop uses the handle directly; this exists for other callers."""
+
     def stop_grabbing(self, cam) -> None: ...
     def is_grabbing(self, cam) -> bool: ...
 

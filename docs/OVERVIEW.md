@@ -437,7 +437,9 @@ doing at this moment, color-coded so it reads at a glance:
 
 The first six of those are states the application settles into and stays in. The
 last five are blocking operations: while one of them is on screen every control
-is disabled, the cursor becomes a wait cursor, and the preview freezes on its
+that could start something is disabled — all of those listed at the end of this
+page, which is everything except the Stimulation button and the two display
+sliders — the cursor becomes a wait cursor, and the preview freezes on its
 last frame. Nothing is wrong; something is being done that cannot be interrupted
 halfway.
 

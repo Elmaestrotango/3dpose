@@ -32,12 +32,19 @@ _BACKEND = load_backend("basler")
 TimeoutException = _BACKEND.TimeoutException
 GRAB_STRATEGY = _BACKEND.GRAB_STRATEGY
 
-# Frames of slack per camera between grab and encode (~2.3 MB each at
-# 1920x1200). The pylon buffer pool upstream adds ~10 s more.
+# Frames of slack per camera between grab and encode: 200 = 2 s at 100 fps. What
+# is queued is an NV12 ring slot (3.46 MB each at 1920x1200), owned by the ring
+# rather than by the queue. The pylon buffer pool upstream adds ~10 s more
+# (camera_manager.MAX_NUM_BUFFER = 1000).
 ENCODE_QUEUE_DEPTH = 200
-# How long the grab thread may block on a full queue before dropping the
-# frame. Backpressure this long means the encoder is wedged (GPU stall) —
-# blocking longer would exhaust the pylon pool and lose frames anyway.
+# How long the grab thread may block on a full queue before dropping the frame.
+# Backpressure this long means the encoder is wedged (GPU stall) rather than
+# merely behind — a 200-frame queue drains in ~2 s at 100 fps. On timeout the
+# frame is dropped and counted in self.drops, and NO block ID or timestamp is
+# recorded for it (see _put_frame's caller), so the loss shows up as a GAP in
+# blockids.npy — detectable and re-alignable — instead of shifting every later
+# frame onto the wrong trigger. Blocking indefinitely would only push the
+# backlog upstream until the pylon pool ran dry too.
 PUT_TIMEOUT_S = 2.0
 
 
@@ -45,10 +52,11 @@ class _EncoderThread(threading.Thread):
     """Drains ready-made NV12 frames from a queue into an NVENC H.264 stream.
 
     The grab thread copies each gray frame straight into a preallocated NV12
-    ring buffer (one memcpy, GIL-held ~0.3 ms) and queues the buffer; this
-    thread then only calls Encode() (releases the GIL) and os.write (ditto) —
-    so the encoder side holds the GIL for ~zero time per frame. All cameras'
-    encoder threads run truly concurrently (PoC: ~1400 fps aggregate).
+    ring buffer (one memcpy, ~0.08 ms into an already-faulted buffer, and numpy
+    releases the GIL for it — docs/PERF_EXPERIMENTS.md E1/E1a) and queues the
+    buffer; this thread then only calls Encode() (releases the GIL) and os.write
+    (ditto) — so the encoder side holds the GIL for ~zero time per frame. All
+    cameras' encoder threads run truly concurrently (PoC: ~1400 fps aggregate).
 
     If the encoder dies mid-recording, the thread switches to writing the
     remaining queued frames' Y planes (the gray data) raw to ``raw_tail.bin``
@@ -259,7 +267,7 @@ class GrabThread(QThread):
         The ring has queue-capacity + slack buffers, so a buffer can only be
         reused after the encoder has long since consumed it. Copying straight
         into NV12 here (instead of img.copy() + a second copy in the encoder)
-        halves the GIL-held memcpy work per frame."""
+        halves the memcpy work per frame."""
         buf = self._nv12_ring[self._ring_i]
         self._ring_i = (self._ring_i + 1) % len(self._nv12_ring)
         buf[:self._height, :] = img  # Y plane = gray; UV stays 128
@@ -274,8 +282,10 @@ class GrabThread(QThread):
             return False
 
     def _log_stream_stats(self):
-        """Dump pylon's per-stream counters — distinguishes network packet loss
-        (Failed_Packet/Resend) from pool exhaustion (Buffer_Underrun)."""
+        """Dump the backend's per-stream counters — distinguishes network loss
+        (Failed_Buffer/Resend_Request) from pool exhaustion (Buffer_Underrun).
+        Statistic_Failed_Packet_Count is deliberately not among them; see
+        `backends.basler.stream_stats`."""
         stats = _BACKEND.stream_stats(self._camera)
         if stats.get("error"):
             print(f"[grab{self._cam_index}] stream stats unavailable: "
@@ -307,12 +317,13 @@ class GrabThread(QThread):
                     for _ in range(ring_n)]
             except MemoryError as e:
                 # Reachable, not theoretical: the ring is 2.39 GiB per camera at
-                # max_lag=480, so 9 cameras is ~21.5 GiB of ring on top of
-                # ~20.7 GiB of pylon buffer pool. Unprotected, a MemoryError
-                # here escapes run() and takes the GUI down — and in kick mode a
-                # camera that never publishes makes the coordinator force-drop
-                # EVERY trigger for EVERY camera, so the session yields empty
-                # videos from all of them. Retire so the others record aligned.
+                # max_lag=480 (744 buffers x 3.456 MB), so 9 cameras is ~21.5 GiB
+                # of ring on top of ~19.3 GiB of pylon buffer pool (9 x 1000 x
+                # 2.304 MB). Unprotected, a MemoryError here escapes run() and
+                # takes the GUI down — and in kick mode a camera that never
+                # publishes makes the coordinator force-drop EVERY trigger for
+                # EVERY camera, so the session yields empty videos from all of
+                # them. Retire so the others record aligned.
                 gib = ring_n * self._width * (self._height * 3 // 2) / 2**30
                 print(f"[grab{self._cam_index}] FATAL: could not allocate the "
                       f"{ring_n}-buffer NV12 ring ({gib:.2f} GiB): {e}", flush=True)
@@ -392,7 +403,10 @@ class GrabThread(QThread):
         MAX_CONSEC_ERRORS = 10
         consec_errors = 0      # reset by every successful frame
         first_frame_logged = False
-        zc_verified = False   # padding checked once per acquisition
+        # Gates the one-time "padding OK" log only. The padding CHECK itself runs
+        # on every frame, below — it is one attribute read and padding could in
+        # principle be turned on mid-stream.
+        zc_verified = False
         t_wait = 0.0   # cumulative s blocked in RetrieveResult (per 1000 frames)
         t_proc = 0.0   # cumulative s spent processing a frame (per 1000 frames)
         # --- lag diagnostics -------------------------------------------------
@@ -401,15 +415,20 @@ class GrabThread(QThread):
         # it. MaxNumBuffer is 1000 (10 s at 100 fps) and GrabStrategy_OneByOne
         # hands frames over oldest-first, so a thread that stalls briefly and
         # then only just keeps up carries that backlog for the rest of the run.
-        # If that is what the coordinator sees as "lag", this number grows and
-        # stays; if the lag lives elsewhere, this stays flat.
+        # That is exactly what the coordinator used to see as "lag": E3 measured
+        # +10.7 s here at 20k frames before the GetArrayZeroCopy fix and -0.002
+        # to -0.037 s after. Kept as the live regression watch — it should stay
+        # flat, and growth means the grab loop is losing to the trigger again.
         clock_off = None          # (host - device) at the first frame
         deliv_lag = 0.0           # seconds of accumulated delivery delay
         t_copy = t_submit = t_disp = 0.0   # where the per-frame budget goes
         # t_wait + t_proc does NOT cover the whole iteration: Release(), the fps
         # bookkeeping and the loop edge sit outside both. On 2026-08-11 the
         # laggard camera had LOWER proc than its peers, so the ~1.5% deficit that
-        # walks it into the cap has to live in that gap. t_cycle closes it.
+        # walked it into the cap had to live in that gap; t_cycle closes it. The
+        # deficit was GIL wait from `result.Array` (E3), and cycle is the cleanest
+        # signal that it is gone: it now reads 10.00 ms, the trigger period
+        # exactly. Anything above the period is the regression.
         t_rel = t_cycle = 0.0
         t_prev = None
 
@@ -691,12 +710,15 @@ class GrabThread(QThread):
                     print(f"[grab{self._cam_index}] encoder thread did not exit (GPU stall?)", flush=True)
                 else:
                     print(f"[grab{self._cam_index}] encoded={enc_thread.encoded} spilled={enc_thread.spilled}", flush=True)
-                    # Hand the NVENC session back explicitly. This is the
-                    # non-kick real-time path, which relies on refcounting
-                    # otherwise — and refcounting fails in exactly the case that
-                    # matters, when the join times out and the thread object
-                    # stays reachable. This path is also the fallback used when
-                    # sessions are already scarce.
+                    # Hand the NVENC session back explicitly and NOW, rather than
+                    # whenever this thread object happens to become garbage: the
+                    # next acquisition needs the session, and this non-kick path
+                    # is itself the fallback used when sessions are scarce.
+                    # Deliberately inside the "thread exited" branch — the
+                    # is_alive() case above leaks the session on purpose, because
+                    # release_encoder() nulls self._enc while a live run() is
+                    # still dereferencing it per frame (see its docstring). Same
+                    # rule as SyncEncodeRouter.stop().
                     try:
                         enc_thread.release_encoder()
                     except Exception as e:

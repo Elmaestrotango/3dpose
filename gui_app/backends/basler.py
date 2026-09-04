@@ -162,6 +162,9 @@ class BaslerBackend:
         cost 8-15% of frames IN TRANSMISSION, because the limiter also paces
         readout and without it every camera bursts onto the link at once.
         Reverted the same day. Keep it above the trigger rate.
+
+        `announce` is set for camera 0 only: the disabled-limiter warning is a
+        property of the rig, so it is printed once rather than once per camera.
         """
         try:
             cam.StopGrabbing()

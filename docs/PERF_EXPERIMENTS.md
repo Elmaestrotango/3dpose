@@ -212,6 +212,15 @@ if a reference to the view escaped.
    mismatch the camera is retired and the thread stops rather than recording sheared
    frames.
 
+   > **SUPERSEDED by c64b38a — this finding was wrong.** It conflated two different
+   > things that share a name: `cam.PaddingX`, the *nodemap feature*, really is absent
+   > on this model and does raise `LogicalErrorException`; `result.PaddingX`, the field
+   > on the *grab result*, is always present. `GetArray()` reads it itself to build its
+   > strides. So padding can be checked directly after all, and the shipped code reads
+   > `result.PaddingX`/`PaddingY` on **every** frame before entering the `with` block,
+   > retiring the camera on a non-zero value. The first-frame `GetArray()` comparison
+   > described above was replaced. Kept here because the mistake is easy to repeat.
+
 ### E3 rig validation — 6 cameras, 90 s, real triggers
 
 Before, from the round-1 agents' production-shaped loop: **83 fps, cycle 12.0 ms,

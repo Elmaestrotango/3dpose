@@ -393,9 +393,14 @@ Plain scripts, no pytest — run directly:
   - **`img` is a VIEW over the driver buffer.** It must not escape the `with` block or
     outlive `result.Release()`. Every consumer copies out today (snapshot, NV12 ring,
     `os.write`, preview decimate, full-res HUD copy); a new consumer that stores `img`
-    itself would read freed memory. There is a first-frame check that compares the view
-    against `GetArray()` and retires the camera on mismatch, because `PaddingX` is not
-    implemented on these cameras and row padding would shear every frame silently.
+    itself would read freed memory. **`result.PaddingX`/`PaddingY` are checked on EVERY
+    frame** (before the `with`), and a non-zero value retires the camera, because row
+    padding would shear every frame silently. `zc_verified` gates only the one-off OK
+    log line, not the check. Corrected in c64b38a: the earlier text here described a
+    first-frame comparison against `GetArray()` and said padding "is not implemented on
+    these cameras" — that conflated `cam.PaddingX` (the nodemap feature, genuinely
+    absent) with `result.PaddingX` (the grab result field, which is always present and
+    is what `GetArray()` itself reads to build its strides).
   - **The NV12 ring's `np.full(..., 128, ...)` is load-bearing twice**: it sets the
     constant chroma plane AND pre-faults every page. Switching it to `np.empty`/`np.zeros`
     would put a ~0.4 ms first-touch fault back on the hot path (measured).

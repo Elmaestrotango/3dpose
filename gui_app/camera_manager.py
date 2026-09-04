@@ -1,4 +1,6 @@
-"""Manages all 6 cameras — opening, closing, and switching between free-run and trigger modes."""
+"""Manages the camera set — opening, closing, and switching between free-run and
+trigger modes. The count comes from the profile (`n_cameras`, 6 on 3dpose) and is
+enforced by `open_all(expect_cameras=...)`, not hardcoded here."""
 import numpy as np
 from pathlib import Path
 from PyQt5.QtCore import QObject, pyqtSignal
@@ -6,7 +8,7 @@ from gui_app.backends import load_backend
 from gui_app.grab_thread import GrabThread
 
 #: Driver-side buffers per camera. 1000 is 10 s of slack at 100 fps, and it
-#: costs n_cams x 1000 x 2.304 MB of RAM — 13.8 GiB at 6 cameras, 20.7 GiB at 9.
+#: costs n_cams x 1000 x 2.304 MB of RAM — 12.9 GiB at 6 cameras, 19.3 GiB at 9.
 #: Exported so the capacity preflight can do that arithmetic before a recording
 #: starts instead of discovering it as a MemoryError inside a grab thread.
 #:
@@ -14,9 +16,10 @@ from gui_app.grab_thread import GrabThread
 #: before anything went wrong (see docs/PERF_EXPERIMENTS.md): nothing errors, the
 #: pool just quietly fills and every frame retrieved gets staler. Reducing it
 #: would make that failure loud within a second — but it is ALSO what absorbs
-#: genuine GigE jitter, and pool size is not monotonic (1000 NV12 ring buffers
-#: starved capture outright in June), so it must not be changed without a rig
-#: A/B. Left at 1000 deliberately.
+#: genuine GigE jitter, and buffer depth is not monotonically good (a
+#: `kick_max_lag` of 1000, i.e. a 1264-buffer NV12 ring, starved capture outright
+#: on 2026-06-17: 24% loss), so it must not be changed without a rig A/B. Left at
+#: 1000 deliberately.
 MAX_NUM_BUFFER = 1000
 
 
@@ -206,9 +209,16 @@ class CameraManager(QObject):
     def apply_exposure_gain(self, fps: float, exposure_us=None, gain_db=None):
         """Set exposure/gain for the acquisition about to start.
 
-        Pass exposure_us=None to RESTORE the .pfs baseline — which is what a
-        recording does, so a calibration-specific exposure can never leak into
-        it. That leak matters: in trigger mode the minimum interval is
+        This WRITES ExposureTime and Gain on every open camera, every time an
+        acquisition starts. The .pfs remains the only SOURCE of a recording's
+        values (nothing here writes back into the .pfs file), but the effective
+        exposure can be below what the .pfs says — read the `[cam1] exposure=...`
+        line rather than assuming.
+
+        Pass exposure_us=None (and gain_db=None) to RESTORE the .pfs baseline
+        captured at open — which is what a recording does, so a
+        calibration-specific exposure can never leak into it. That leak matters:
+        in trigger mode the minimum interval is
         `exposure + 1/AcquisitionFrameRate`, so an exposure sized for 30 fps
         would exceed a 100 fps trigger period and silently halve the frame rate
         with no error anywhere.
@@ -265,8 +275,12 @@ class CameraManager(QObject):
             else:
                 print("[acq] kick-out unavailable, using decoupled encode", flush=True)
         self._set_trigger_mode()
-        # AFTER trigger mode: _set_trigger_mode writes AcquisitionFrameRate, and
-        # the exposure ceiling is derived from it, so ordering matters.
+        # AFTER trigger mode, and the order is load-bearing: _set_trigger_mode
+        # rewrites AcquisitionFrameRate and StopGrabbing()s the camera, so an
+        # exposure applied before it would be set against the free-run
+        # configuration that is about to be replaced. Note the ceiling below is
+        # computed from self._trigger_rate_limit — the same number
+        # _set_trigger_mode writes — and is NOT read back from the camera.
         self.apply_exposure_gain(fps, exposure_us, gain_db)
         self._start_grab_threads(raw_paths=raw_paths, display_every=display_every,
                                  realtime=realtime, width=width, height=height, quality=quality,

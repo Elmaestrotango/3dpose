@@ -348,10 +348,10 @@ Worked example — 6 cameras, 1920x1200, `kick_max_lag: 480`:
 pool  = 6 x 1000 x 2,304,000 B                   = 12.9 GiB
 ring buffers per camera = 480 + 200 + 64         = 744
 ring  = 6 x 744 x (1920 x 1800) B                = 14.4 GiB
-total                                            = 27.3 GiB
+total                                            = 27.2 GiB
 ```
 
-The same settings at 9 cameras: 19.3 + 21.5 = **40.9 GiB**. Halving the cap to
+The same settings at 9 cameras: 19.3 + 21.6 = **40.9 GiB**. Halving the cap to
 `kick_max_lag: 240` does not halve the ring, because the queue depth and the
 spare slots stay where they are: 504 buffers instead of 744, or 1.62 GiB per
 camera, which gives 22.6 GiB at 6 cameras and 33.9 GiB at 9.
@@ -361,7 +361,7 @@ has to be *available* when Record is pressed — the operating system, the GUI
 itself and anything else the machine is running all sit on top. So budget
 roughly twice the pool-plus-ring figure for your camera count rather than a
 little more than it: a six-camera rig at `kick_max_lag: 480` wants something
-like twice its 27.3 GiB, which is why the reference rig carries 63.4 GB for
+like twice its 27.2 GiB, which is why the reference rig carries 63.4 GB for
 exactly that configuration.
 
 The application does this arithmetic itself at Record time, against the actual
@@ -369,7 +369,7 @@ number of cameras open, and **refuses to start if it will not fit** in available
 memory:
 
 ```
-Not enough RAM for 9 cameras: 40.9 GiB needed (19.3 pylon pool + 21.5 NV12
+Not enough RAM for 9 cameras: 40.9 GiB needed (19.3 pylon pool + 21.6 NV12
 ring), 31.2 GiB available. Lower MaxNumBuffer or kick_max_lag, or close other
 applications.
 ```
@@ -380,7 +380,7 @@ Separately from all of that, the startup hardware check warns when the machine
 has less than 16 GB of RAM in total. That number is a floor for the application
 to run at all, and it has nothing to do with the rig you are building — a 16 GB
 machine passes the launch check happily and is then refused by every single
-six-camera recording, because 16 GB is nowhere near the 27.3 GiB the buffers
+six-camera recording, because 16 GB is nowhere near the 27.2 GiB the buffers
 ask for. The figure to size against is the one you worked out above, not the
 startup warning.
 
@@ -432,10 +432,16 @@ intended camera count is fine. `0` means NVENC is not usable on this machine at
 all, which puts you in the raw fallback described under *Disk* below — and that
 is a very different disk budget.
 
-With no working NVENC the startup check warns (`NVENC not available — encoding
-will fall back to CPU (much slower)`) and the capture path falls back to writing
-raw frames to disk. ffmpeg itself is bundled with the Python dependencies
-(`imageio-ffmpeg`); there is nothing to install separately.
+With no working NVENC the startup check warns that `NVENC not found in ffmpeg —
+there is no CPU fallback, so encoding raw.bin to mp4 and the post-hoc alignment
+re-encode will FAIL`, and the capture path falls back to writing raw frames to
+disk. Note what that warning says: there is no software encoder to fall back on,
+because every mp4 writer asks for `h264_nvenc` by name, so on such a machine the
+raw frames are captured and then cannot be turned into video at all. (The
+real-time path's `.h264` to mp4 step is a stream copy and needs no encoder, but
+that path needs NVENC to have produced the `.h264` in the first place.) ffmpeg
+itself is bundled with the Python dependencies (`imageio-ffmpeg`); there is
+nothing to install separately.
 
 ### Disk
 
@@ -453,10 +459,13 @@ only H.264 reaches the disk. At qp 21 that is about 4.6 KB per frame:
 
 A session is a few GB, and any ordinary drive keeps up.
 
-**Raw fallback (`realtime_encode: false`).** This is the mode to use when the
-GPU encoder is unavailable or misbehaving: every frame is written to disk
-uncompressed and encoded afterwards. The rate is the full sensor payload, the
-same number the network section arrived at:
+**Raw fallback (`realtime_encode: false`).** This is the mode to use when the GPU
+cannot hold one live encode session per camera, or the real-time path is
+misbehaving: every frame is written to disk uncompressed and encoded afterwards.
+It still needs NVENC — the post-hoc pass encodes with `h264_nvenc` as well — so
+it is a way around a shortage of concurrent sessions, not around a card that has
+no encoder at all. The rate is the full sensor payload, the same number the
+network section arrived at:
 
 ```
 n_cams x fps x frame_bytes
@@ -507,7 +516,7 @@ the rig [PERF_EXPERIMENTS.md](PERF_EXPERIMENTS.md) logs every performance
 measurement against, which is the place to look for the numbers behind the
 numbers. Having the machine in view explains a couple of figures quoted earlier,
 too: the "46% of a single core against a 4% average across 24 cores" is 24 cores
-of that CPU, and the 63.4 GB is what makes 27.3 GiB of buffers comfortable
+of that CPU, and the 63.4 GB is what makes 27.2 GiB of buffers comfortable
 rather than marginal. Scaling in any direction away from this means going back
 to the arithmetic in this section rather than adjusting the table.
 
@@ -618,14 +627,14 @@ runs in:
 uv sync
 ```
 
-The first run downloads a Python interpreter and about a dozen packages, and
-ends with a line like `Installed 13 packages in 42s`. Later runs are instant:
+The first run downloads a Python interpreter and about two dozen packages, and
+ends with a line like `Installed 22 packages in 42s`. Later runs are instant:
 
 ```
-Resolved 15 packages in 1ms
+Resolved 26 packages in 1ms
 warning: Skipping installation of entry points (`project.scripts`) for package
 `panopticon` because this project is not packaged; ...
-Checked 13 packages in 0.49ms
+Checked 22 packages in 0.82ms
 ```
 
 That warning is normal and harmless. The command creates a `.venv` folder inside
@@ -717,9 +726,12 @@ the profile.
 
 This step makes the first of the two. A `.pfs` — pylon's own name for it is a
 GenApi persistence file — is a plain-text list of camera features that pylon
-loads into every camera at open. **It is the only source of exposure and gain**;
-the application never sets them for a recording. Build it in pylon Viewer with
-one camera open, then save it once and reuse it for all cameras.
+loads into every camera at open. **It is the only source of a recording's
+exposure and gain** — the application never invents values of its own for one.
+It does write both to the camera at every acquisition start, but what it writes
+is the pair it read back from this file when the camera opened, capped at the
+exposure ceiling below. Build it in pylon Viewer with one camera open, then save
+it once and reuse it for all cameras.
 
 The settings that matter, and why:
 
@@ -983,19 +995,27 @@ The console shows one block per camera:
 ...
 [grab0] StartGrabbing (recording=False)
 [grab0] zero-copy view OK (PaddingX=0 PaddingY=0)
-[nvenc] warmed (first-Encode import done single-threaded)
-[hw] NVENC sessions: 8 (at least — probe stopped at its limit), needed 8
+[acq] board already carries the recording-only sketch (no stim); skipping flash
+[acq] opening teensy on COM3
 ```
+
+The last two lines arrive about a second and a half after the window does: the
+firmware check and the serial open are deliberately deferred so the window can
+paint and Windows can finish registering the taskbar entry first.
 
 What to check in that output:
 
 - one `[camN] <serial> <width>x<height> Mono8` line per camera, with the
   geometry and format you configured;
 - `zero-copy view OK (PaddingX=0 PaddingY=0)` for every camera;
-- an `[hw] NVENC sessions:` count at least equal to your camera count. The probe
-  asks for two more sessions than there are cameras and stops as soon as it gets
-  them, which is why the line above reads 8 on the six-camera reference rig even
-  though that card will grant 12 if asked for more.
+- an `[hw] NVENC sessions:` count at least equal to your camera count. That line
+  is not printed at launch — the session probe runs at the first Calibrate or
+  Record, alongside `[nvenc] warmed (first-Encode import done
+  single-threaded)` — so it is the first acquisition rather than the launch that
+  answers this. The probe asks for two more sessions than there are cameras and
+  stops as soon as it gets them, which is why it reads `[hw] NVENC sessions: 8
+  (at least — probe stopped at its limit), needed 8` on the six-camera reference
+  rig even though that card will grant 12 if asked for more.
 
 Every launch also writes the same text to `logs/panopticon_<date>_<time>.log`,
 which is where to look when the app is started from the desktop shortcut and has
@@ -1208,7 +1228,7 @@ failure that looks like success.
 | `No cameras are open. Recording would run the trigger protocol — and any baked-in stim paradigm — while saving nothing.` | Open the cameras first: pick a profile whose `pfs_path` resolves and whose cameras enumerate. |
 | `Not enough RAM for N cameras: ...` | The buffer arithmetic does not fit in available memory. The message breaks it into pool and ring. Lower `kick_max_lag`, lower `MAX_NUM_BUFFER`, or close other applications. |
 | `RAM is tight for N cameras: ...` | Over 75% of available memory. It asks before proceeding. |
-| `NVENC granted only N concurrent sessions but M cameras need one each.` | The driver's session cap is below the camera count, often because another process holds sessions (a browser's hardware encode, an orphaned ffmpeg). Close them, record fewer cameras, or set `realtime_encode: false` in the profile to put every camera on the raw path deliberately — neither shipped profile sets that, so it is a line you add. Read the *Disk* part of section 1 first: raw needs roughly 500x the space. |
+| `NVENC granted only N concurrent sessions but M cameras need one each.` | The driver's session cap is below the camera count, often because another process holds sessions (a browser's hardware encode, an orphaned ffmpeg). Close them, record fewer cameras, or set `realtime_encode: false` in the profile to put every camera on the raw path deliberately — both shipped profiles carry that field set to `true`, so it is a value you change rather than a line you add. Read the *Disk* part of section 1 first: raw needs roughly 500x the space. |
 | `NVENC granted no encode sessions, so real-time encoding cannot start.` | No sessions available at all. Set `realtime_encode: false` in the profile to write raw frames and encode afterwards — and read the *Disk* part of section 1 first, because that is a completely different disk budget. |
 | `Disk may be short: a 10-minute recording would need ~N GiB` | A warning, not a refusal: 10 minutes is an assumed worst case, not a known length. A shorter recording is fine. |
 | `Disk is tight: a 10-minute recording needs ~X GiB of Y GiB free` | The milder version of the same check, raised once a ten-minute recording would use more than 80% of the free space. It will fit, but there is no room for a second session — clear space before the day's work rather than mid-experiment. |
