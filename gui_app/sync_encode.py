@@ -244,5 +244,15 @@ class SyncEncodeRouter:
                 print(f"[sync] could not write WARNINGS.txt for cam{i+1}: {e}",
                       flush=True)
 
+        # Retirements are session-shaping and must not be stdout-only: a
+        # retired camera's video simply ends early, so the recording is no
+        # longer equal-length by construction and downstream alignment has to
+        # know. Fold them in beside the reconciliation warnings.
+        for cam, reason in self._coord.retired_reasons:
+            self.warnings.append(
+                f"cam{cam+1} was RETIRED mid-recording ({reason}). Its video "
+                f"ends at that point; the other cameras continued and stay "
+                f"aligned with each other.")
+
         return [(len(self.block_ids[i]), self.timestamps[i], self.block_ids[i])
                 for i in range(self._n)]

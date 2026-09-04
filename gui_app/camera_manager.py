@@ -31,6 +31,9 @@ class CameraManager(QObject):
         super().__init__()
         self._cameras: list = []
         self._geometry = None      # (w, h) agreed by every camera
+        #: Problems found while finalising the last recording (retired cameras,
+        #: block-ID truncation). Read by the GUI after stop_acquisition().
+        self.last_warnings: list = []
         self._grab_threads: list[GrabThread] = []
         self._router = None  # SyncEncodeRouter in real-time kick-out mode
 
@@ -243,6 +246,10 @@ class CameraManager(QObject):
             # coordinator and drain the shared encoders. Metadata (the released,
             # already-common frames) comes from the router, not the grab threads.
             results = self._router.stop()
+            # Read the warnings BEFORE dropping the router, or they are lost
+            # with it — which is how a truncated or retired camera used to
+            # degrade to a line on stdout that nobody was watching.
+            self.last_warnings = list(self._router.warnings)
             self._router = None
         else:
             results = [(gt.frame_count, gt.timestamps, gt.block_ids)

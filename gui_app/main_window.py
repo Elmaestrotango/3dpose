@@ -415,6 +415,13 @@ class MainWindow(QMainWindow):
                 return
 
         self._video_dir = video_dir
+        # Session-level warnings from a PREVIOUS run into this directory would
+        # otherwise sit beside a clean recording and be believed months later.
+        try:
+            (video_dir / "WARNINGS.txt").unlink(missing_ok=True)
+        except OSError:
+            pass
+        self._capture_warnings = []
         for cam in self._camera_names:
             cam_dir = self._video_dir / cam
             cam_dir.mkdir(parents=True, exist_ok=True)
@@ -686,6 +693,10 @@ class MainWindow(QMainWindow):
         # ENCODING and remuxed an unflushed stream.h264, then deleted the source.
         # Silently. _apply_camera_open_result already does this check; the
         # pattern was understood and simply not applied here.
+        # Capture-side problems (a retired camera, block-ID truncation) reach
+        # the operator here or not at all: camera_manager drops the router right
+        # after reading them.
+        self._capture_warnings = list(getattr(self._camera_mgr, "last_warnings", []))
         if isinstance(_result, Exception):
             print(f"[acq] FINALIZE FAILED: {type(_result).__name__}: {_result}",
                   flush=True)
@@ -802,16 +813,46 @@ class MainWindow(QMainWindow):
         min_frames = min(frame_counts) if frame_counts else 0
         max_frames = max(frame_counts) if frame_counts else 0
         count_str = str(min_frames) if min_frames == max_frames else f"{min_frames}-{max_frames}"
-        self.statusBar().showMessage(
-            f"{self._acq_type.title()} encoded: {count_str} frames, {avg_fps:.1f} fps")
 
-        # With realtime_kick the coordinator already guarantees every camera
-        # encodes the same triggers — no post-hoc alignment needed. Without
-        # kick-out, cameras may have dropped different frames independently, so
-        # block-ID alignment re-encodes to the common subset.
-        if (self._config.realtime_encode
-                and not self._config.realtime_kick
-                and self._start_alignment()):
+        # Build the summary from ALL cameras, not just the ones that worked.
+        # Skipping failures meant "encoded: 6022 frames" could describe a
+        # session where two of nine cameras produced no video at all.
+        failed = [cam for cam, _n, ok in results if not ok]
+        status = (f"{self._acq_type.title()} encoded: {count_str} frames, "
+                  f"{avg_fps:.1f} fps"
+                  + (f"  —  {len(failed)} CAMERA(S) FAILED: {', '.join(failed)}"
+                     if failed else ""))
+        self.statusBar().showMessage(status)
+
+        problems = list(getattr(self, "_capture_warnings", []))
+        if failed:
+            problems.append(
+                f"{len(failed)} camera(s) produced no usable video: "
+                f"{', '.join(failed)}. Their source files were KEPT rather than "
+                f"deleted — look for raw.bin / stream.h264 and encode_error.log "
+                f"in those camera directories.")
+        if problems:
+            # Write it down as well as showing it: a dialog is dismissed and
+            # forgotten, and this is exactly what someone needs months later
+            # when the data looks odd.
+            warnings_path = self._video_dir / "WARNINGS.txt"
+            body = "\n\n".join(problems)
+            try:
+                warnings_path.write_text(body + "\n", encoding="utf-8")
+            except Exception as e:
+                print(f"[acq] could not write WARNINGS.txt: {e}", flush=True)
+            QMessageBox.warning(
+                self, "Recording completed with problems",
+                f"{body}\n\nThis has also been written to:\n{warnings_path}")
+
+        # Kick-out normally guarantees every camera encoded the same triggers,
+        # so alignment is skipped. But a retirement or a truncation breaks that
+        # guarantee mid-recording — those videos are NOT equal-length, and
+        # skipping the one pass that would trim them to the common set leaves
+        # them permanently disjoint. _start_alignment() no-ops when the videos
+        # already agree, so running it here costs nothing in the normal case.
+        needs_align = (not self._config.realtime_kick) or bool(problems)
+        if self._config.realtime_encode and needs_align and self._start_alignment():
             return
         self._finish_to_idle()
 
