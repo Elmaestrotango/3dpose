@@ -1,4 +1,9 @@
-"""Teensy trigger serial controller."""
+"""Serial controller for the camera-trigger / stim board.
+
+The board is an Arduino Mega 2560 (see stim_compiler.FQBN), not a Teensy — the
+class name is legacy from campy and is kept because tests, probe scripts and
+main_window all refer to it.
+"""
 import time
 import serial
 
@@ -10,7 +15,10 @@ class TeensyController:
     which auto-resets the board, and for the ~1-2 s of reset + bootloader every
     pin is high-Z — long enough for a connected laser driver to read its floating
     modulation input as ON. Keeping the port open across recordings moves that
-    reset out of the experiment; it then happens only at first use and on upload.
+    reset out of the experiment: main_window opens this EAGERLY at launch
+    (_warm_serial) and holds it until quit, so the reset happens at launch and
+    on upload, never at the start of a recording. Opening it lazily instead
+    would just move the flash into recording #1.
 
     Because the board is no longer guaranteed to be freshly reset when a start
     command arrives, every start is confirmed by an `RDY <n_cams> <fps>` ack from
@@ -18,15 +26,19 @@ class TeensyController:
     a good one until the recording comes back empty.
     """
 
-    # The sketch's readFPS() ends in a parseFloat that can burn its 1 s timeout,
-    # followed by delay(500), so the ack legitimately takes ~1.5 s to appear.
+    # Headroom, not an estimate. The sketch's config path spends two delay(500)s
+    # before announceReady(), and after a forced reopen the board's bootloader
+    # wait comes on top — so an ack can legitimately take 1-2 s. (It used to be
+    # worse: without the trailing newline _send() now appends, the final
+    # parseFloat() burned its own 1 s timeout as well.)
     ACK_TIMEOUT = 4.0
 
     def __init__(self, port: str = "COM3", baudrate: int = 115200):
         self._port = port
         self._baudrate = baudrate
         self._ser = None
-        # None until we learn whether this board's firmware acks at all.
+        # False until this board is seen to ack at all; distinguishes
+        # pre-RDY firmware from a board that has stopped responding.
         self._acks = False
 
     def open(self, retries: int = 10) -> bool:

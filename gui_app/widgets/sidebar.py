@@ -317,8 +317,12 @@ class SidebarWidget(QWidget):
         self._profile_combo.setEnabled(editable)
 
     def set_busy(self, busy: bool):
-        """Disable all controls during a blocking background op (camera switch /
-        finishing). The status label stays legible so the user sees progress."""
+        """Disable the acquisition controls during a blocking background op
+        (camera switch, finishing, firmware flash).
+
+        Everything in the list below except the Stimulation button, which is
+        deliberately left alone so the editor can still be opened. The status
+        label stays legible so the user sees progress."""
         for w in (self._profile_combo, self._dir_button, self._calibrate_toggle,
                   self._record_toggle, self._run_calib_btn, self._snapshot_btn):
             w.setEnabled(not busy)

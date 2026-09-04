@@ -22,12 +22,17 @@ class RigProfile:
     realtime_encode: bool = True
     # Real-time frame kick-out: gate frames through the cross-camera coordinator
     # during capture so only frames every camera caught get encoded — videos come
-    # out already trigger-aligned, no post-hoc re-encode. Experimental; default off.
+    # out already trigger-aligned, no post-hoc re-encode. BOTH shipped profiles
+    # set this true; the field default stays False so a profile written before
+    # the field existed keeps the post-hoc alignment path (gui_app/alignment.py).
     realtime_kick: bool = False
     # Kick-out coordinator buffer depth (frames). A camera may lag the others by
-    # this many frames (e.g. while recovering lost packets via resends) before
-    # its missing triggers are force-dropped to keep the pipeline flowing. Higher
-    # = fewer late frames sacrificed, but more RAM held (ring scales with it).
+    # this many frames before its missing triggers are force-dropped to keep the
+    # pipeline flowing. Higher = fewer late frames sacrificed, but more RAM held
+    # (the NV12 ring is max_lag + 264 buffers per camera). Observed cross-camera
+    # lag is 0-2 frames since the grab loop stopped copying with the GIL held, so
+    # the headroom the 3dpose profile carries is precautionary — see the note
+    # there before changing it either way.
     kick_max_lag: int = 240
     # GigE receive driver: "socket" (user-space, robust packet resends — the
     # proven path), "filter" (in-kernel pylon GigE Vision driver, less CPU but
@@ -55,7 +60,10 @@ class RigProfile:
     # keep a wireless optostim receiver from triggering. Calibration can afford
     # it: in trigger mode the minimum interval is
     # `exposure + 1/AcquisitionFrameRate`, so at 100 fps exposure is capped near
-    # 3.94 ms, but at the 30 fps calibration rate the ceiling is ~27 ms. These
+    # 3.94 ms, but at the 30 fps calibration rate the ceiling is ~27 ms.
+    # camera_manager.apply_exposure_gain() enforces 90% of that ceiling, so the
+    # values that actually survive are ~3.55 ms and ~24.5 ms — a larger request
+    # is clamped, with a `CLAMPED from ...` log line. These
     # are applied for calibration only and the .pfs values are restored for
     # recording, so a long calibration exposure can never leak into a 100 fps
     # session (where it would silently halve the frame rate).

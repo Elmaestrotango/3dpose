@@ -1,19 +1,31 @@
 """Live ChArUco coverage detector for the calibration HUD.
 
-Runs lightweight ChArUco detection on the per-camera *preview* frames (already
-downsampled, grayscale) and tracks:
+Runs lightweight ChArUco detection on whatever frames ``coverage_worker`` hands
+it — full-resolution grayscale while the grab threads are keeping full frames
+(the normal case, because oblique cameras resolve badly at preview size), and
+the downsampled preview for a given camera until its first full frame lands.
+Tracks:
 
   - ``glow``          : per-camera decaying pulse, set to 1.0 on each detection
   - ``shared``        : pairwise co-detection counts (board seen by both cams in
-                        the same display tick)
+                        the same detection tick)
   - ``per_cam_covis`` : per-camera co-visibility coverage (ticks where this cam
                         detected the board AND at least one other cam did too)
-  - ``ready``         : the co-visibility graph is one connected component (via
-                        edges >= ``min_edge``) AND every camera has
-                        >= ``min_per_cam_shared`` co-visible detections.
+  - ``grid_cells_hit``: how many of the 2x2 FOV cells that camera has seen the
+                        board in, binned by the marker centroid
+  - ``ready``         : ALL THREE of — every camera has >= ``min_per_cam_shared``
+                        co-visible detections; every camera has hit
+                        >= ``MIN_GRID_CELLS`` of its 4 grid cells; and the
+                        co-visibility graph is ONE CONNECTED COMPONENT over the
+                        pairs with >= ``min_edge`` co-detections. Note the last
+                        one is a connectivity test, not a per-pair test: the
+                        board is one-sided, so opposed cameras can never
+                        co-detect and "every pair connected" could never fill.
+                        Once ``ready`` goes true ``update()`` stops counting.
 
-Counts are at the *display sample rate*, so the thresholds are relative coverage
-signals, not recorded-frame totals — tune them on the rig.
+Counts are at the detection tick rate (``coverage_worker``'s ~30 Hz), not the
+recorded-frame rate, so the thresholds are relative coverage signals rather than
+frame totals — tune them on the rig.
 
 Works across both the pre-4.7 and >=4.7 OpenCV ArUco APIs.
 """

@@ -1,9 +1,13 @@
 """Background worker that runs ChArUco coverage detection off the UI thread.
 
-The detector is fed the per-camera preview frames at ~30 Hz (matching the
-calibration capture rate) so the coverage graph fills as fast as data is
-recorded, without blocking the Qt UI thread — six charuco detections per tick
-would otherwise blow the display-refresh budget and stutter the live preview.
+The detector is fed one frame per camera at ~30 Hz (matching the calibration
+capture rate) so the coverage graph fills as fast as data is recorded, without
+blocking the Qt UI thread — six charuco detections per tick would otherwise blow
+the display-refresh budget and stutter the live preview.
+
+Full-resolution frames are preferred (that is what resolves the board for the
+oblique cameras, and it matches what the post-hoc solve sees); the downsampled
+preview is only a stand-in for a camera whose first full frame has not arrived.
 """
 import time
 

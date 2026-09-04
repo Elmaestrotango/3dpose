@@ -1,9 +1,14 @@
 """Tiny helper to run a blocking callable off the Qt main thread.
 
-Used for the camera open/close/reconfigure operations that otherwise freeze the
-UI (the window goes "not responding") because they make many synchronous GigE
-round-trips. The callable runs in this QThread; its return value (or the raised
-exception) is delivered back on the main thread via the ``done`` signal.
+Used for the operations that otherwise freeze the UI (the window goes "not
+responding"): camera open/close/reconfigure, which make many synchronous GigE
+round-trips, and the ~30 s arduino-cli firmware flash in main_window's
+``_ensure_clean_firmware`` / ``_ensure_sketch_for``.
+
+The callable runs in this QThread; its return value (or the raised exception) is
+delivered back on the main thread via the ``done`` signal. Callers MUST check
+whether the result is an Exception — see main_window._on_acquisition_finalized
+for what silently ignoring it cost.
 """
 import traceback
 from PyQt5.QtCore import QThread, pyqtSignal

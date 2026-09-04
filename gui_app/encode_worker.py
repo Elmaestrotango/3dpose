@@ -1,9 +1,16 @@
-"""Background encoding worker — converts raw.bin files to H.264 MP4 via NVENC.
+"""Background worker that turns each camera's capture file into an mp4.
 
-Cameras are encoded concurrently (a pool of up to ``max_parallel`` ffmpeg/NVENC
-processes). NVENC offloads the compression to the GPU, so the CPU mostly feeds
-raw bytes; running several at once is bounded by disk read bandwidth and the
-NVENC concurrent-session limit, not the CPU. That limit is REAL and finite --
+Two source shapes, picked per camera in run():
+
+- ``stream.h264`` (the DEFAULT, real-time encode path): the GPU already encoded
+  every frame during capture, so this is a stream-copy remux — seconds, no
+  re-encode, no NVENC session.
+- ``raw.bin`` (``realtime_encode: false``, or a camera whose NVENC init failed
+  mid-session): a real h264_nvenc encode of the raw mono8 frames.
+
+Cameras are processed concurrently, up to ``max_parallel`` ffmpeg processes. For
+the raw branch that concurrency is bounded by disk read bandwidth and the NVENC
+concurrent-session limit rather than the CPU. That limit is REAL and finite --
 measured 12 on this rig's driver, and NVIDIA has moved it (2 -> 3 -> 5 -> 8 -> 12),
 so probe it via nvenc.probe_max_sessions rather than assuming a number.
 """

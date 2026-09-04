@@ -132,7 +132,9 @@ class MainWindow(QMainWindow):
         # Windows finishes registering the taskbar entry first. The serial
         # open in _warm_serial blocks the main thread for ~1 s (Arduino
         # reset settle); if that lands before the taskbar setup completes,
-        # Windows falls back to the python.exe default icon.
+        # Windows falls back to the python.exe default icon. 1.5 s, not
+        # singleShot(0): one event-loop turn is not enough for the shell to
+        # take the icon, which is the bug this delay exists to fix.
         # (1) Put the board back to the recording-only sketch, so a
         # paradigm can never survive from a previous session -- stim is opt-in
         # per launch. (2) Then claim the serial port: opening it resets the
@@ -801,7 +803,12 @@ class MainWindow(QMainWindow):
     def _warm_serial(self):
         """Claim the port at startup so the board's reset lands here.
 
-        Non-fatal: a single attempt, and the lazy path retries properly later.
+        This eager open is the whole point and must not become lazy: first use
+        would then BE the first Record, which just moves the reset flash into
+        recording #1 (observed 2026-07-27).
+
+        Non-fatal, though: one attempt here, and if the board is not reachable
+        yet the next _teensy_connection() call retries with the full count.
         """
         if self._teensy_connection(retries=1) is None:
             print(f"[acq] trigger board not reachable on {self._profile.serial_port} "
@@ -812,8 +819,9 @@ class MainWindow(QMainWindow):
 
         Opening the port resets the Arduino, and during the reset + bootloader
         every pin floats — long enough for a connected laser to fire. Holding
-        the connection open means that only happens at first use and on upload,
-        never at the start of a recording.
+        the connection open means that only happens at GUI launch (_warm_serial
+        claims the port eagerly) and on upload, never at the start of a
+        recording.
         """
         if self._teensy is not None and self._teensy.port != self._profile.serial_port:
             self._teensy.close()          # profile switched to a different port
@@ -827,7 +835,14 @@ class MainWindow(QMainWindow):
         return self._teensy
 
     def release_serial_port(self):
-        """Hand COM3 back so arduino-cli can upload; it reopens on next use."""
+        """Hand the port back so arduino-cli can upload.
+
+        The caller MUST reclaim it via _teensy_connection() as soon as the
+        upload finishes (_ensure_sketch_for's done() and the stim editor's
+        _on_upload_done both do). Leaving it to reopen lazily would put the
+        open — and the board reset, and the laser flash — back at the start of
+        the next recording.
+        """
         if self._teensy is not None and self._teensy.is_open:
             print("[acq] releasing serial port for upload", flush=True)
             self._teensy.close()
@@ -928,7 +943,7 @@ class MainWindow(QMainWindow):
     def _on_acquisition_finalized(self, _result):
         self._end_busy()
         # CallableWorker delivers a raised exception AS the result
-        # (ui_workers.py:22-25), and this slot used to ignore its argument. So if
+        # (CallableWorker.run), and this slot used to ignore its argument. So if
         # _finalize raised — a full disk at np.save, anything inside
         # _router.stop() — camera_manager.stop_acquisition() never reached
         # `self._router = None`, the encoder threads never got their sentinel and
@@ -1194,7 +1209,7 @@ class MainWindow(QMainWindow):
         self._sidebar.set_status("CALIBRATING...", "#aa88ff")
         self._sidebar.set_toggles_enabled(False)
         # set_toggles_enabled touches only the two toggles, not the Solve button
-        # (sidebar.py:341-343), so disable it explicitly for the duration.
+        # (sidebar.set_toggles_enabled), so disable it explicitly here.
         self._sidebar.set_solve_enabled(False)
         self.statusBar().showMessage("Solving calibration...")
 

@@ -92,15 +92,25 @@ def run_hardware_check(output_dir: str = "") -> HardwareReport:
         )
     if report.disk_free_gb >= 0 and report.disk_free_gb < 500:
         report.warnings.append(
-            f"Disk: {report.disk_free_gb:.0f} GB free (500 GB+ recommended for raw capture)"
+            f"Disk: {report.disk_free_gb:.0f} GB free (500 GB+ recommended — the "
+            f"default real-time encode needs far less, but the raw fallback "
+            f"writes ~129 GiB per camera per 10 min)"
         )
     if report.disk_write_mb_s >= 0 and report.disk_write_mb_s < 500:
         report.warnings.append(
             f"Disk write speed: {report.disk_write_mb_s:.0f} MB/s (NVMe SSD with 1000+ MB/s recommended)"
         )
     if not report.has_nvenc:
+        # There is NO CPU fallback: every mp4 writer hardcodes `-c:v h264_nvenc`
+        # (encode_worker._cmd, encode_worker._append_raw_tail,
+        # alignment.extract_aligned). Without it those passes fail outright, so
+        # do not describe this as merely slower.
         report.warnings.append(
-            "NVENC not available — encoding will fall back to CPU (much slower)"
+            "NVENC not found in ffmpeg — there is no CPU fallback, so encoding "
+            "raw.bin to mp4 and the post-hoc alignment re-encode will FAIL. "
+            "(The real-time path's .h264 -> mp4 step is a stream copy and is "
+            "unaffected, but a recording that falls back to raw would be "
+            "stranded.)"
         )
 
     return report

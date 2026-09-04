@@ -830,8 +830,12 @@ class StimulationWindow(QDialog):
         self._test_owns_serial = False
         self._selected_block: BlockItem | None   = None
         self._upload_worker:  _UploadWorker | None = None
-        # The .ino last successfully uploaded, so Test can tell when the canvas
-        # has drifted away from what the board is actually running.
+        # The .ino this editor last successfully uploaded, so Test can tell when
+        # the canvas has drifted away from it. NOT the same as "what the board
+        # is running": main_window swaps the board between the recording-only
+        # and recording+stim sketches per acquisition, so after a calibration
+        # the board holds the stim-free sketch while this still holds the
+        # paradigm. invalidate_upload() clears it when a reflash fails.
         self._uploaded_ino:   str | None = None
         self._test_after_upload = False
         self._test_serial: TeensyController | None = None
@@ -1092,10 +1096,11 @@ class StimulationWindow(QDialog):
     def record_blocker(self) -> str | None:
         """Reason a RECORDING must not start with this workflow, or None.
 
-        Record does not compile anything — it runs whatever is already on the
-        board — so this was never gated, and only Apply (:1159) and Test (:1219)
-        consulted _blocking_problem. But the canvas is what `stim_paradigm.json`
-        and `stim_trace.csv` describe, and a graph containing a forbidden pin
+        Record does not compile anything — it runs whatever `_ensure_sketch_for`
+        put on the board — so this was never gated, and only `_on_apply` and
+        `_on_test` consulted _blocking_problem. But the canvas is what
+        `stim_paradigm.json` and `stim_trace.csv` describe, and a graph
+        containing a forbidden pin
         means the .ino on the board may be driving a camera trigger line, which
         silently breaks the block-ID identity every downstream consumer assumes.
         CLAUDE.md already claims Record warns here; this makes that true.
@@ -1221,7 +1226,8 @@ class StimulationWindow(QDialog):
         self._apply_btn.setEnabled(False)
         self._test_btn.setEnabled(False)
         self._set_status("Compiling + uploading… (~30 s)")
-        # arduino-cli needs COM3 to itself; the main window reopens it on demand.
+        # arduino-cli needs the serial port to itself. NOT reopened lazily —
+        # _on_upload_done retakes it immediately; see the comment there.
         self._release_serial()
         self._upload_worker = _UploadWorker(ino, self._get_port())
         self._upload_worker.done.connect(self._on_upload_done)
