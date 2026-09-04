@@ -279,7 +279,6 @@ class BaslerBackend:
                         "Statistic_Failed_Buffer_Count",
                         "Statistic_Buffer_Underrun_Count",
                         "Statistic_Total_Packet_Count",
-                        "Statistic_Failed_Packet_Count",
                         "Statistic_Resend_Request_Count",
                         "Statistic_Resend_Packet_Count"):
                 node = sg.GetNode(key)

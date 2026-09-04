@@ -515,6 +515,25 @@ class MainWindow(QMainWindow):
                      if acq_type == "calibration"
                      and self._config.calibration_gain_db >= 0 else None))
 
+        # Starting the board starts whatever paradigm is flashed on it, and that
+        # happens for a calibration exactly as it does for a recording. A
+        # calibration is the acquisition performed with a PERSON inside the
+        # arena holding the board, so confirm before putting a live stim pin —
+        # possibly a laser — into that situation.
+        if acq_type == "calibration" and self._board_has_paradigm():
+            reply = QMessageBox.warning(
+                self, "Stimulation is loaded on the board",
+                "A stimulation paradigm is currently flashed on the trigger "
+                "board.\n\nStarting a calibration will run it from t=0, and a "
+                "calibration is normally done with a person inside the arena "
+                "holding the target.\n\nKey off the laser, or open Stimulation "
+                "and Apply an empty canvas, before calibrating.\n\n"
+                "Start the calibration anyway?",
+                QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+            if reply != QMessageBox.Yes:
+                self._sidebar.reset_toggles()
+                return
+
         teensy = self._teensy_connection()
         if teensy is None:
             self._rollback_acquisition(
@@ -536,6 +555,11 @@ class MainWindow(QMainWindow):
         if acq_type == "calibration":
             self._state = State.CALIBRATING
             self._sidebar.set_status("CALIBRATING", "#4488ff")
+            # Provenance is written for a calibration too when a paradigm is
+            # live. The board runs it either way, so without this a paradigm
+            # that fired during a calibration would leave no trace on disk.
+            if self._board_has_paradigm():
+                self._save_stim_paradigm()
             self._start_coverage_hud()
         else:
             self._state = State.RECORDING
@@ -611,6 +635,31 @@ class MainWindow(QMainWindow):
             self._stim_end_timer = None
 
     # ── shared trigger-board link ─────────────────────────────────────────────
+    def _board_has_paradigm(self) -> bool:
+        """True if the flashed sketch is not the stim-free recording sketch.
+
+        Compares the hash recorded at the last upload against the hash of the
+        recording-only sketch. Errs towards True: if the board's contents cannot
+        be established, treat it as possibly armed rather than assume it is safe.
+        """
+        try:
+            from PyQt5.QtCore import QSettings
+            from gui_app import stim_compiler
+            blank = stim_compiler.recording_only_sketch(
+                self._profile.stim_safe_pins, self._profile.trigger_pins)
+            stored = QSettings("Salk", "Panopticon").value(
+                "board_sketch_sha", "", type=str)
+            if not stored:
+                # Startup records the hash only when the clearing flash
+                # SUCCEEDS, so an empty value means the board's contents were
+                # never established — which is precisely the case where it may
+                # still hold a paradigm. Treat unknown as armed.
+                return True
+            return stored != stim_compiler.sketch_sha(blank)
+        except Exception as e:
+            print(f"[acq] could not determine the board's sketch: {e}", flush=True)
+            return True
+
     def _ensure_clean_firmware(self):
         """Put the board back to the recording-only sketch at every launch.
 
@@ -1020,6 +1069,13 @@ class MainWindow(QMainWindow):
             self.statusBar().showMessage(
                 f"Alignment failed: {summary['error']} — videos left as-is")
         elif summary.get("replaced"):
+            # The align pass rewrote each camera's blockids.npy / frametimes.npy
+            # to the common set and replaced the mp4s. stim_trace.csv was
+            # written during _finalize, i.e. BEFORE that, so its frame column no
+            # longer matches the videos. Regenerate it against the aligned data;
+            # otherwise the file is silently offset in exactly the sessions that
+            # had trouble, and every file involved still looks self-consistent.
+            self._write_stim_trace()
             self.statusBar().showMessage(
                 f"Aligned: {summary['common_frames']} synchronized frames per camera")
         elif summary.get("warnings"):
@@ -1073,7 +1129,7 @@ class MainWindow(QMainWindow):
         # set_toggles_enabled touches only the two toggles, not the Solve button
         # (sidebar.py:341-343), so disable it explicitly for the duration.
         self._sidebar.set_solve_enabled(False)
-        self.statusBar().showMessage("Running sleap-anipose calibration...")
+        self.statusBar().showMessage("Solving calibration...")
 
         self._calib_worker = CalibrationWorker(
             config.session_dir, CALIBRATION_SCRIPT, board_cfg)
@@ -1091,8 +1147,26 @@ class MainWindow(QMainWindow):
             dst = config.video_dir("recording") / "calibration.toml"
             if src.exists():
                 dst.parent.mkdir(parents=True, exist_ok=True)
-                shutil.copy2(src, dst)
-                status = f"Calibration solved — copied to {dst}"
+                # Copying unconditionally rewrites the calibration attached to a
+                # recording that may already have been shot with a different
+                # one, which changes that session's provenance after the fact.
+                replace = True
+                if dst.exists() and dst.read_bytes() != src.read_bytes():
+                    replace = QMessageBox.question(
+                        self, "Replace the recording's calibration?",
+                        f"{dst}\n\nalready holds a DIFFERENT calibration. If a "
+                        f"recording in that folder was made with it, replacing "
+                        f"it changes which calibration that data claims to have "
+                        f"been shot with.\n\nReplace it?",
+                        QMessageBox.Yes | QMessageBox.No,
+                        QMessageBox.No) == QMessageBox.Yes
+                if replace:
+                    shutil.copy2(src, dst)
+                    status = f"Calibration solved — copied to {dst}"
+                else:
+                    status = (f"Calibration solved — kept in "
+                              f"{src.parent.name}/, recording's copy left "
+                              f"unchanged")
             else:
                 status = "Calibration solved (no toml found to copy)"
             if msg:

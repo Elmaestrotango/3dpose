@@ -125,7 +125,8 @@ class SidebarWidget(QWidget):
         calib_row.addWidget(self._calibrate_toggle, stretch=1)
         self._run_calib_btn = QPushButton("Solve")
         self._run_calib_btn.setFixedSize(50, 28)
-        self._run_calib_btn.setToolTip("Run sleap-anipose calibration on recorded videos")
+        self._run_calib_btn.setToolTip(
+            "Solve the camera calibration from the recorded calibration videos")
         self._run_calib_btn.setStyleSheet(
             "QPushButton { background: #2a2a4a; color: #88aadd; border: 1px solid #444; "
             "border-radius: 3px; font-size: 10px; }"

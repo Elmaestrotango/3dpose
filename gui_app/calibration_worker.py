@@ -1,4 +1,8 @@
-"""Background worker for running sleap-anipose calibration via uv run."""
+"""Background worker that runs the ChArUco calibration solve via uv run.
+
+1_calibrate.py is a PEP 723 script with its own pinned dependency set, so it
+resolves into an isolated environment rather than the project venv.
+"""
 import subprocess
 import shutil
 import sys
