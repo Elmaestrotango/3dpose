@@ -19,6 +19,10 @@ from pathlib import Path
 
 import numpy as np
 
+# Stdlib-only module (collections.deque), so it does not widen what this file
+# needs — 2_align.py runs in an isolated env with numpy/cv2/imageio-ffmpeg.
+from gui_app.frame_sync import block_rate_warnings as _block_rate_warnings
+
 # GigE Vision 16-bit block IDs cycle through 1..65535 (0 is reserved "no block
 # id"), so they wrap 65535 -> 1 every 65535 triggers unless extended 64-bit IDs
 # are enabled. camera_manager tries to enable the 64-bit mode; this is the
@@ -82,6 +86,40 @@ def load_blockids(rec_dir: Path):
         blocks.append(b)
         videos.append(video_for(cd))
     return names, blocks, videos
+
+
+def block_rate_warnings(rec_dir: Path, names, blocks, fps: int) -> list:
+    """Check each camera's block IDs really are trigger ordinals.
+
+    The intersection below matches on block ID and nothing else, so it is only
+    an alignment if every camera consumed one block ID per trigger. A camera
+    that ignored triggers (exposure over the ceiling) still writes gapless
+    block IDs and still ends up with the same frame count as everyone else, so
+    this pass would report "already aligned" on a recording that is skewed by
+    seconds. ``frame_sync.check_block_id_rate`` catches it by comparing the
+    block-ID counter against the camera's own device clock.
+
+    Timestamps come from ``frametimes.npy`` row 1 (device seconds, shifted to
+    start at zero). A camera missing that file is skipped, not failed — old
+    recordings should still align.
+    """
+    ids, times, have = [], [], []
+    for nm, b in zip(names, blocks):
+        ft_path = rec_dir / nm / "frametimes.npy"
+        if not ft_path.exists():
+            continue
+        try:
+            ft = np.load(ft_path)
+        except Exception:
+            continue
+        if ft.ndim != 2 or ft.shape[0] < 2 or ft.shape[1] < b.size:
+            continue
+        ids.append(b)
+        times.append(ft[1])
+        have.append(nm)
+    if not have:
+        return []
+    return _block_rate_warnings(ids, times, fps, have)
 
 
 def compute_alignment(blocks: list[np.ndarray]):
@@ -213,9 +251,17 @@ def align_recording(rec_dir, fps: int = 100, quality: int = 21,
     with open(out / "alignment.json", "w") as f:
         json.dump(manifest, f, indent=2)
 
+    # Runs before the early returns below, because the dangerous case reports
+    # "already aligned": a camera ignoring triggers keeps its block IDs
+    # gapless, so the intersection is total and nothing here looks wrong.
+    rate_warnings = block_rate_warnings(rec_dir, names, blocks, fps)
+    for msg in rate_warnings:
+        print(f"[align] WARNING: {msg}", flush=True)
+
     summary = dict(common_frames=int(common.size), trigger_span=full_span,
                    needed=need, replaced=False, camera_names=names,
-                   per_camera=manifest["per_camera"], warnings=[])
+                   per_camera=manifest["per_camera"],
+                   warnings=list(rate_warnings))
 
     total = len(names)
     if not need:

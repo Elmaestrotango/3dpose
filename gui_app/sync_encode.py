@@ -33,6 +33,7 @@ class SyncEncodeRouter:
                  fps: int = 100, max_lag: int = 240):
         self._n = len(raw_paths)
         self._w, self._h, self._q = width, height, quality
+        self._fps = int(fps)   # stop() checks block-ID rate against it
         self.max_lag = max_lag  # grab threads read this to size their NV12 ring
         self._coord = FrameSyncCoordinator(self._n, max_lag=max_lag)
         self._lock = threading.Lock()
@@ -243,6 +244,18 @@ class SyncEncodeRouter:
             except Exception as e:
                 print(f"[sync] could not write WARNINGS.txt for cam{i+1}: {e}",
                       flush=True)
+
+        # Does each camera's block-ID counter actually keep step with the
+        # trigger board? Every other loss mode leaves a gap in blockids.npy;
+        # a camera that IGNORES triggers (exposure over the ceiling) does not,
+        # and the release rule here matches on block ID alone. So this is the
+        # one failure that survives everything above while corrupting exactly
+        # the invariant the whole path rests on. Cheap to check: the device
+        # clock is independent of the block-ID counter.
+        for msg in self._coord.block_rate_warnings(self.timestamps,
+                                                   self.block_ids, self._fps):
+            print(f"[sync] WARNING: {msg}", flush=True)
+            self.warnings.append(msg)
 
         # Retirements are session-shaping and must not be stdout-only: a
         # retired camera's video simply ends early, so the recording is no

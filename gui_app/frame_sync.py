@@ -152,6 +152,14 @@ class FrameSyncCoordinator:
             self._decided_upto = t
         return ready
 
+    def block_rate_warnings(self, timestamps, block_ids, fps: int,
+                            names=None) -> list:
+        """Run the block-ID rate check over every camera in this session."""
+        names = names or [f"cam{i + 1}" for i in range(self.n)]
+        return block_rate_warnings(
+            [block_ids[i] for i in range(self.n)],
+            [timestamps[i] for i in range(self.n)], fps, names)
+
     def flush(self):
         """End of recording: no more frames will arrive, so decide every
         remaining trigger. Returns the final ready list."""
@@ -176,3 +184,129 @@ class FrameSyncCoordinator:
                 self.dropped += len(havers)
             self._decided_upto = t
         return ready
+
+
+#: Fractional tolerance on the measured block-ID rate.
+#:
+#: Measured, not guessed: across 74 camera-sessions of real data (2026-06-12
+#: through 2026-09-03, both 30 and 100 fps, including the sessions that lost
+#: 24% and 43% of frames) the rate lands between +220 and +250 ppm of the
+#: configured value, every time. That is the fixed offset between the trigger
+#: board's resonator and the cameras' oscillators, and it is stable enough that
+#: the band is 30 ppm wide.
+#:
+#: 0.3% sits 12x above that worst case and still catches a camera skipping one
+#: trigger in a hundred (10,000 ppm) with 3x to spare — and that is the case
+#: worth catching, because nothing else in the pipeline can see it. 1% was
+#: tried first and landed exactly on top of the 1-in-100 case.
+BLOCK_RATE_TOL = 0.003
+#: Below this many frames / seconds the span-over-duration arithmetic cannot
+#: separate a skipped trigger from end-effects, so the check abstains rather
+#: than cry wolf on a two-second test clip.
+BLOCK_RATE_MIN_FRAMES = 300
+BLOCK_RATE_MIN_SECONDS = 2.0
+
+
+def check_block_id_rate(block_ids, timestamps, fps: int, name: str = "camera"):
+    """Verify that a camera's block IDs really are trigger ordinals.
+
+    Everything downstream takes "same block ID" to mean "same instant" —
+    kick-out release, post-hoc intersection, ``stim_trace``'s
+    ``t = (blockid - 1) / fps``, and the 3D solve. That identity holds only
+    while the camera produces exactly one frame per trigger.
+
+    A camera whose exposure exceeds the ceiling (``exposure + 1/limiter``
+    must stay under ``1/fps``) is still busy when the next pulse arrives and
+    simply *ignores* it. No frame is acquired, so no block ID is consumed, and
+    from then on its block ID N is trigger N+k. Nothing else in the pipeline
+    can see this: the IDs stay gapless, the frame counts stay equal across
+    cameras because only common IDs are kept, and no packet or buffer counter
+    moves. The videos come out looking perfect and are misaligned in time.
+
+    The camera's device clock is a free-running hardware oscillator,
+    independent of its block-ID counter, so the two together are a check: over
+    any span, block IDs must advance at the trigger rate. ``timestamps`` are
+    device seconds (``frametimes.npy`` row 1, or the router's per-camera list);
+    only differences are used, so an origin-shifted series is fine.
+
+    Returns None if the rate checks out or there is too little data to judge,
+    otherwise a description of the discrepancy.
+    """
+    if fps <= 0 or len(block_ids) < BLOCK_RATE_MIN_FRAMES:
+        return None
+    if len(timestamps) < len(block_ids):
+        return None
+    span = float(block_ids[-1]) - float(block_ids[0])
+    dur = float(timestamps[len(block_ids) - 1]) - float(timestamps[0])
+    if dur < BLOCK_RATE_MIN_SECONDS or span <= 0:
+        return None
+
+    measured = span / dur
+    if abs(measured - fps) <= BLOCK_RATE_TOL * fps:
+        return None
+
+    # Triggers the board fired over this span, against block IDs consumed.
+    expected = fps * dur
+    missed = expected - span
+    drift = abs(missed) / fps
+
+    head = (f"{name}: block IDs advanced at {measured:.2f}/s while the trigger "
+            f"board runs at {fps}/s, over {dur:.1f} s of this camera's own "
+            f"device clock.")
+    if measured < fps:
+        return (
+            f"{head} That means it did NOT produce one frame per trigger — it "
+            f"ignored roughly {missed:.0f} of them. Its block IDs are therefore "
+            f"not trigger ordinals, so every frame it contributed is paired "
+            f"with the other cameras' frames from a DIFFERENT instant, drifting "
+            f"to about {drift:.1f} s by the end. Equal frame counts and gapless "
+            f"block IDs do not rule this out. The usual cause is an exposure "
+            f"over the ceiling: ExposureTime + 1/trigger_rate_limit must stay "
+            f"under 1/{fps} s, so check ExposureTime in the .pfs. DO NOT use "
+            f"this recording for 3D reconstruction.")
+    return (
+        f"{head} Block IDs cannot outrun the trigger, so this is not a capture "
+        f"fault: either the recording fps ({fps}) is not what the board was "
+        f"actually driving, a stream re-arm mid-recording resynchronised this "
+        f"camera to the wrong ordinal, or this camera model does not report its "
+        f"device timestamp in nanoseconds (grab_thread assumes it does — check "
+        f"GevTimestampTickFrequency, which is 1e9 on the Basler ace models this "
+        f"was built against). Cross-camera alignment for {name} is unverified "
+        f"until that is resolved.")
+
+
+def block_rate_warnings(block_ids, timestamps, fps: int, names) -> list:
+    """check_block_id_rate() over every camera, plus one cross-camera read.
+
+    A single camera off the trigger rate is a camera fault. *Every* camera off
+    it by the same amount is not — nine cameras do not independently decide to
+    skip the same fraction of triggers. That pattern means the reference is
+    wrong rather than the cameras: the recording fps does not match what the
+    board was driving, or this camera model does not report device timestamps
+    in nanoseconds. Saying so costs one comparison and stops a fleet-wide
+    misconfiguration from reading as nine separate exposure problems.
+    """
+    msgs, rates = [], []
+    for b, ts, nm in zip(block_ids, timestamps, names):
+        msg = check_block_id_rate(b, ts, fps, nm)
+        if msg:
+            msgs.append(msg)
+        if len(b) >= BLOCK_RATE_MIN_FRAMES and len(ts) >= len(b):
+            dur = float(ts[len(b) - 1]) - float(ts[0])
+            span = float(b[-1]) - float(b[0])
+            if dur >= BLOCK_RATE_MIN_SECONDS and span > 0:
+                rates.append(span / dur)
+
+    if len(msgs) == len(rates) and len(rates) > 1:
+        lo, hi = min(rates), max(rates)
+        if lo > 0 and (hi - lo) <= BLOCK_RATE_TOL * lo:
+            msgs.append(
+                f"All {len(rates)} cameras report the same block-ID rate "
+                f"({lo:.2f}/s), which is off the configured {fps}/s by the same "
+                f"amount. Cameras do not fail identically, so suspect the "
+                f"reference rather than the cameras: check that the profile's "
+                f"frame rate matches what the trigger board is driving, and "
+                f"that these cameras report device timestamps in nanoseconds. "
+                f"The videos are probably aligned with each other; it is the "
+                f"absolute timebase that is in question.")
+    return msgs

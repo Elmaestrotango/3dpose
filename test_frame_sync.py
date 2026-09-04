@@ -11,7 +11,7 @@ randomized but per-camera-ordered interleaving, and check:
 """
 import random
 from collections import defaultdict
-from gui_app.frame_sync import FrameSyncCoordinator
+from gui_app.frame_sync import FrameSyncCoordinator, check_block_id_rate
 
 
 def feed(n, delivered, max_lag, raw=None, max_skew=None):
@@ -137,6 +137,7 @@ def main():
     test_retire_keeps_survivors_aligned()
     test_retired_camera_submissions_ignored()
     test_forced_drops_are_attributed()
+    test_block_rate_catches_skipped_triggers()
 
     print("\nALL FRAMESYNC EQUIVALENCE TESTS PASS")
 
@@ -200,6 +201,50 @@ def test_forced_drops_are_attributed():
     assert co.forced_by[0] == 0 and co.forced_by[1] == 0, "blamed the wrong camera"
     assert "c3:" in co.lag_report()
     print("9) forced drops are attributed to the lagging camera: PASS")
+
+
+# ── block ID == trigger ordinal (added 2026-09-04) ───────────────────────────
+# The release rule matches on block ID alone. A camera that IGNORES triggers
+# (exposure over the ceiling) keeps its block IDs gapless and ends up with the
+# same frame count as everyone else, so the coordinator, the intersection and
+# every packet counter all report a clean session while the videos are skewed
+# by seconds. The device clock is the only independent witness.
+
+def test_block_rate_catches_skipped_triggers():
+    fps = 100
+    n = 6000                                  # 60 s at 100 fps
+    ids = list(range(1, n + 1))
+
+    healthy = [i / fps for i in range(n)]
+    assert check_block_id_rate(ids, healthy, fps, "cam1") is None, \
+        "false positive on a clean camera"
+
+    # Crystal-level disagreement between the two clocks must not trip it.
+    drifted = [i / fps * 1.0005 for i in range(n)]
+    assert check_block_id_rate(ids, drifted, fps, "cam1") is None, \
+        "tolerance is too tight for real oscillator drift"
+
+    # Every second trigger ignored: block ID k happened at 2k periods.
+    halved = [i * 2 / fps for i in range(n)]
+    msg = check_block_id_rate(ids, halved, fps, "cam3")
+    assert msg and "cam3" in msg, "missed a camera running at half rate"
+    assert "60.0 s" in msg, f"drift not reported correctly: {msg}"
+
+    # The dangerous regime: one trigger in a hundred, no gaps, equal counts.
+    subtle = [i / fps * (100 / 99) for i in range(n)]
+    msg = check_block_id_rate(ids, subtle, fps, "cam2")
+    assert msg, "missed a 1%% skip — that is the case nothing else can see"
+
+    # Too short to judge => abstain rather than guess.
+    assert check_block_id_rate(ids[:100], halved[:100], fps, "cam1") is None
+    assert check_block_id_rate([], [], fps, "cam1") is None
+
+    # Block IDs cannot outrun the trigger; say so differently.
+    fast = [i / (fps * 1.5) for i in range(n)]
+    msg = check_block_id_rate(ids, fast, fps, "cam4")
+    assert msg and "cannot outrun" in msg, f"wrong diagnosis: {msg}"
+
+    print("10) block-ID rate check catches ignored triggers: PASS")
 
 
 if __name__ == "__main__":
