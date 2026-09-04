@@ -13,7 +13,12 @@ dependencies = [
     "imageio-ffmpeg>=0.5",
     "psutil>=5.9",
     "pillow>=10.0",
-    "opencv-contrib-python>=4.6",
+    # >=4.7, not >=4.6: 1_calibrate.py needs CharucoBoard.setLegacyPattern,
+    # which 4.6 lacks, and 4.6 moved chessboardCorners to a method.
+    "opencv-contrib-python>=4.7",
+    # Reprojection-error histogram in 1_calibrate.py. Skipped if absent,
+    # but included so a fresh install can produce it offline.
+    "matplotlib>=3.5",
     "pynvvideocodec>=2.1.0",
     "nvidia-cuda-runtime-cu12>=12.9.79",
 ]

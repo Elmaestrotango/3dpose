@@ -1,14 +1,15 @@
-# /// script
-# requires-python = ">=3.10"
-# dependencies = [
-#     "numpy<2",
-#     "pyyaml>=6.0",
-#     # >=4.7 for CharucoBoard.setLegacyPattern. The 3dpose board is legacy;
-#     # without that call OpenCV returns 0 charuco corners silently.
-#     "opencv-contrib-python>=4.7",
-#     "matplotlib>=3.5",
-# ]
-# ///
+# Runs in the PROJECT environment (uv sync), NOT an isolated PEP 723 one.
+# It used to carry inline dependency metadata, which made `uv run` resolve a
+# separate environment on first use -- so a rig with no network could install
+# completely and then fail at the first solve. Its requirements live in
+# pyproject.toml instead, which makes `uv sync` a one-shot install.
+#
+# Two of those requirements are load-bearing:
+#   opencv-contrib-python >= 4.7 -- CharucoBoard.setLegacyPattern exists only
+#     from 4.7. A legacy board silently returns 0 charuco corners without it,
+#     and 4.6 moved chessboardCorners from an attribute to a method.
+#   matplotlib -- only for the reprojection histogram, which is skipped if
+#     absent. Nothing else needs it.
 """Multi-view camera calibration using ArUco marker corners directly.
 
 Run with: uv run 1_calibrate.py <session_dir> --board-config <board.yaml>

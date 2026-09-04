@@ -809,6 +809,7 @@ class StimulationWindow(QDialog):
                  get_trigger_pins: Callable[[], list] = lambda: [],
                  get_serial: Callable[[], object] = lambda: None,
                  release_serial: Callable[[], None] = lambda: None,
+                 on_applied: Callable[[str], None] = lambda ino: None,
                  parent=None):
         super().__init__(parent)
         self._get_port       = get_port
@@ -822,6 +823,10 @@ class StimulationWindow(QDialog):
         self._get_trigger_pins = get_trigger_pins
         self._get_serial     = get_serial
         self._release_serial = release_serial
+        # Called with the .ino source after a successful Apply. The main window
+        # keeps it for the session so it can put this paradigm back on the board
+        # after a calibration has reflashed it away.
+        self._on_applied = on_applied
         self._test_owns_serial = False
         self._selected_block: BlockItem | None   = None
         self._upload_worker:  _UploadWorker | None = None
@@ -1234,15 +1239,14 @@ class StimulationWindow(QDialog):
             QMessageBox.critical(self, "Upload failed", msg)
             return
         self._uploaded_ino = ino
-        # Record what the board now holds. main_window compares this at startup
-        # and reflashes the recording-only sketch when it does not match, which
-        # is what makes stim opt-in per session rather than sticky flash state.
+        # Hand the applied paradigm to the main window. It records what the
+        # board now holds and keeps the source for the session, so a later
+        # calibration can reflash it away and a later recording can put it back
+        # without the user pressing Apply again.
         try:
-            from PyQt5.QtCore import QSettings
-            QSettings("Salk", "Panopticon").setValue(
-                "board_sketch_sha", stim_compiler.sketch_sha(ino))
+            self._on_applied(ino)
         except Exception as e:
-            print(f"[stim] could not record the uploaded sketch hash: {e}",
+            print(f"[stim] could not register the applied paradigm: {e}",
                   flush=True)
         # Retake the port straight away. Reopening resets the board, so letting
         # the next Record do it would put that flash back into the experiment;
