@@ -48,10 +48,12 @@ class MainWindow(QMainWindow):
         super().__init__()
         self.setWindowTitle("Panopticon")
         self.setMinimumSize(1000, 400)
+        self._apply_theme()
         icon_path = Path(__file__).parent.parent / "panopticon.ico"
         if icon_path.exists():
-            self.setWindowIcon(QIcon(str(icon_path)))
-        self._apply_theme()
+            icon = QIcon(str(icon_path))
+            self.setWindowIcon(icon)
+            QApplication.instance().setWindowIcon(icon)
 
         self._state = State.IDLE
         self._acq_type = ""
@@ -126,14 +128,18 @@ class MainWindow(QMainWindow):
         self._size_to_screen()
         self._sidebar.set_status("IDLE", "#888")
         self._run_hardware_check()
-        # Two things, in this order, deferred one tick so the window paints
-        # first. (1) Put the board back to the recording-only sketch, so a
+        # Two things, in this order, deferred so the window paints and
+        # Windows finishes registering the taskbar entry first. The serial
+        # open in _warm_serial blocks the main thread for ~1 s (Arduino
+        # reset settle); if that lands before the taskbar setup completes,
+        # Windows falls back to the python.exe default icon.
+        # (1) Put the board back to the recording-only sketch, so a
         # paradigm can never survive from a previous session -- stim is opt-in
         # per launch. (2) Then claim the serial port: opening it resets the
         # Arduino, and during the reset + bootloader every pin floats, which
         # fires a connected laser. Doing it at launch keeps that flash out of
         # the experiment. arduino-cli needs the port to itself, hence the order.
-        QTimer.singleShot(0, self._ensure_clean_firmware)
+        QTimer.singleShot(1500, self._ensure_clean_firmware)
 
     def _open_cameras(self):
         """Open cameras for the current profile (synchronous — startup only)."""

@@ -97,8 +97,21 @@ def main():
     sys.setswitchinterval(0.001)
     log_path = _setup_logging()
 
+    # Without this, Windows groups the taskbar entry under python.exe and shows
+    # its icon instead of Panopticon's.
+    try:
+        import ctypes
+        ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(
+            "salk.talmo.panopticon")
+    except Exception:
+        pass
+
     app = QApplication(sys.argv)
     app.setApplicationName("Panopticon Acquisition")
+    icon_path = Path(__file__).parent / "panopticon.ico"
+    if icon_path.exists():
+        from PyQt5.QtGui import QIcon
+        app.setWindowIcon(QIcon(str(icon_path)))
 
     _install_excepthook(log_path)
 
