@@ -58,6 +58,11 @@ class CameraManager(QObject):
         return [gt.latest_full_frame for gt in self._grab_threads]
 
     @property
+    def delivery_lags(self) -> list[float]:
+        """Per-camera seconds behind real time. See GrabThread.delivery_lag_s."""
+        return [gt.delivery_lag_s for gt in self._grab_threads]
+
+    @property
     def frame_counts(self) -> list[int]:
         return [gt.frame_count for gt in self._grab_threads]
 

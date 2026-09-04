@@ -259,6 +259,45 @@ class MainWindow(QMainWindow):
         if self._display_tick % 10 == 0:
             for i, fps in enumerate(self._camera_mgr.current_fps):
                 self._camera_grid.update_fps(i, fps)
+            self._refresh_capture_health()
+
+    def _refresh_capture_health(self):
+        """Show how far behind real time capture is running, WHILE it happens.
+
+        This is the one failure this pipeline cannot show you any other way. A
+        grab loop that is a fraction of a millisecond over budget loses nothing
+        at first — the driver's buffer pool absorbs the deficit — so there is no
+        error, no dropped frame, and no clue, for as long as ten minutes. What
+        actually happens is that every frame retrieved gets progressively
+        staler, and by the time the pool is exhausted the session is spoiled.
+        A live number is the only warning available before that point.
+
+        Also worth knowing while aiming the rig: a large lag means the preview
+        is showing you the past, not the present.
+        """
+        if self._state != State.RECORDING:
+            return
+        try:
+            lags = self._camera_mgr.delivery_lags
+        except Exception:
+            return
+        if not lags:
+            return
+        worst = max(lags)
+        if worst < 0.25:
+            self.statusBar().showMessage(
+                f"Capture healthy — keeping up with the trigger "
+                f"(max lag {worst * 1000:.0f} ms)")
+        elif worst < 1.0:
+            self.statusBar().showMessage(
+                f"CAPTURE FALLING BEHIND: cam{lags.index(worst) + 1} is "
+                f"{worst:.2f} s behind real time and growing. Close other "
+                f"applications.")
+        else:
+            self.statusBar().showMessage(
+                f"CAPTURE {worst:.1f} s BEHIND REAL TIME (cam"
+                f"{lags.index(worst) + 1}). Frames will be lost when the buffer "
+                f"pool fills. Stop and investigate.")
 
     def _build_config(self) -> SessionConfig:
         vals = self._sidebar.get_field_values()

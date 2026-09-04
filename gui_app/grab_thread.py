@@ -204,6 +204,9 @@ class GrabThread(QThread):
         self._last_ts = None          # device timestamp of the last good frame
         self._last_bid_eff = -1       # its globally-consistent block ID
         self.rearms = 0               # stream restarts this run
+        #: Seconds this camera is behind real time (kick mode). ~0 is healthy;
+        #: sustained growth means the grab loop is losing to the trigger.
+        self.delivery_lag_s = 0.0
         self.desynced = False         # stalled and could not be realigned
 
     def _rearm_stream(self, attempt: int) -> bool:
@@ -495,6 +498,14 @@ class GrabThread(QThread):
                                 if clock_off is None:
                                     clock_off = t1 - dev_ts
                                 deliv_lag = (t1 - dev_ts) - clock_off
+                                # Published live. This is the honest health
+                                # signal: how far behind real time this camera
+                                # is RIGHT NOW. The failure it catches is silent
+                                # by construction — the buffer pool absorbs a
+                                # per-frame deficit for minutes before anything
+                                # errors, so by the time frames are lost the
+                                # session is already spoiled.
+                                self.delivery_lag_s = deliv_lag
                                 if awaiting_resync:
                                     awaiting_resync = False
                                     off = self._resync_offset(raw_bid, dev_ts)
