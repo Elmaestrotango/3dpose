@@ -20,6 +20,16 @@ with [3dface](https://github.com/Elmaestrotango/3dface); only the rig profile di
 
 ---
 
+## The interface
+
+New to the rig? **[docs/UI_GUIDE.md](docs/UI_GUIDE.md)** is an annotated
+screenshot with every control numbered and explained, plus a first-session
+walkthrough.
+
+[![Panopticon interface](docs/images/ui_annotated.png)](docs/UI_GUIDE.md)
+
+---
+
 ## Will this run on my hardware?
 
 Honest answer up front, because the compatibility surface is narrow in one specific
