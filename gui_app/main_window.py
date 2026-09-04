@@ -65,6 +65,7 @@ class MainWindow(QMainWindow):
         self._video_dir: Path | None = None
         self._busy = False                 # a blocking camera op is running
         self._cam_op: CallableWorker | None = None
+        self._fw_op: CallableWorker | None = None
 
         self._camera_mgr = CameraManager()
         self._teensy = TeensyController()
@@ -121,11 +122,14 @@ class MainWindow(QMainWindow):
         self._size_to_screen()
         self._sidebar.set_status("IDLE", "#888")
         self._run_hardware_check()
-        # Take the serial port now rather than on the first Record. Opening it
-        # resets the Arduino, and during the reset + bootloader every pin floats
-        # — which fires a connected laser. Doing it at launch keeps that flash
-        # out of the experiment. Deferred one tick so the window paints first.
-        QTimer.singleShot(0, self._warm_serial)
+        # Two things, in this order, deferred one tick so the window paints
+        # first. (1) Put the board back to the recording-only sketch, so a
+        # paradigm can never survive from a previous session -- stim is opt-in
+        # per launch. (2) Then claim the serial port: opening it resets the
+        # Arduino, and during the reset + bootloader every pin floats, which
+        # fires a connected laser. Doing it at launch keeps that flash out of
+        # the experiment. arduino-cli needs the port to itself, hence the order.
+        QTimer.singleShot(0, self._ensure_clean_firmware)
 
     def _open_cameras(self):
         """Open cameras for the current profile (synchronous — startup only)."""
@@ -604,6 +608,71 @@ class MainWindow(QMainWindow):
             self._stim_end_timer = None
 
     # ── shared trigger-board link ─────────────────────────────────────────────
+    def _ensure_clean_firmware(self):
+        """Put the board back to the recording-only sketch at every launch.
+
+        A paradigm lives in the Arduino's FLASH, so it survives closing the GUI,
+        power cycles and USB unplugs — while the canvas comes up empty and
+        nothing can read the firmware back over serial. That combination means a
+        blank-looking editor over a fully armed board, and Record would then
+        fire a paradigm nobody chose. Stim is therefore opt-in per session:
+        unless it was Applied since this launch, the board carries no stim.
+
+        Flashing takes ~30 s, so the SHA of whatever we last uploaded is kept in
+        QSettings: if the board already has the recording-only sketch we skip.
+        The slow path is only hit on the first launch after a session that used
+        stim, which is exactly when it is worth paying for.
+
+        Runs BEFORE _warm_serial: arduino-cli needs the port to itself.
+        """
+        from PyQt5.QtCore import QSettings
+        self._settings = QSettings("Salk", "Panopticon")
+        try:
+            from gui_app import stim_compiler
+            blank = stim_compiler.recording_only_sketch(
+                self._profile.stim_safe_pins, self._profile.trigger_pins)
+            self._pending_sha = stim_compiler.sketch_sha(blank)
+        except Exception as e:
+            print(f"[acq] could not build the recording-only sketch: {e}", flush=True)
+            self._warm_serial()
+            return
+
+        if self._settings.value("board_sketch_sha", "", type=str) == self._pending_sha:
+            print("[acq] board already carries the recording-only sketch "
+                  "(no stim); skipping flash", flush=True)
+            self._warm_serial()
+            return
+
+        print("[acq] board may carry a stim paradigm from a previous session — "
+              "flashing the recording-only sketch", flush=True)
+        self._begin_busy("Clearing stim firmware…")
+        port = self._profile.serial_port
+        self._fw_op = CallableWorker(
+            lambda: __import__("gui_app.stim_compiler", fromlist=["upload"])
+            .upload(blank, port))
+        self._fw_op.done.connect(self._on_clean_firmware_done)
+        self._fw_op.start()
+
+    def _on_clean_firmware_done(self, result):
+        self._end_busy()
+        ok, msg = result if isinstance(result, tuple) else (False, str(result))
+        if ok:
+            self._settings.setValue("board_sketch_sha", self._pending_sha)
+            print("[acq] board flashed with the recording-only sketch; stim is "
+                  "off until you Apply one", flush=True)
+        else:
+            # Do NOT record the SHA — we do not know what the board holds, and
+            # claiming it is clean would be worse than saying nothing.
+            print(f"[acq] could not clear stim firmware: {msg}", flush=True)
+            QMessageBox.warning(
+                self, "Could not clear stim firmware",
+                "Panopticon could not reflash the trigger board, so it may "
+                "still be carrying a stimulation paradigm from a previous "
+                "session — including one that loops and never ends.\n\n"
+                "Open Stimulation and press Apply (an empty canvas is fine) "
+                "before recording, or key off the laser.\n\n" + msg)
+        self._warm_serial()
+
     def _warm_serial(self):
         """Claim the port at startup so the board's reset lands here.
 

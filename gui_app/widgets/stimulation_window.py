@@ -1220,6 +1220,16 @@ class StimulationWindow(QDialog):
             QMessageBox.critical(self, "Upload failed", msg)
             return
         self._uploaded_ino = ino
+        # Record what the board now holds. main_window compares this at startup
+        # and reflashes the recording-only sketch when it does not match, which
+        # is what makes stim opt-in per session rather than sticky flash state.
+        try:
+            from PyQt5.QtCore import QSettings
+            QSettings("Salk", "Panopticon").setValue(
+                "board_sketch_sha", stim_compiler.sketch_sha(ino))
+        except Exception as e:
+            print(f"[stim] could not record the uploaded sketch hash: {e}",
+                  flush=True)
         # Retake the port straight away. Reopening resets the board, so letting
         # the next Record do it would put that flash back into the experiment;
         # here it lands during Apply, alongside the reset avrdude already did.

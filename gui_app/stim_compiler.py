@@ -550,6 +550,23 @@ void loop() {{
 """
 
 
+def recording_only_sketch(safe_pins=DEFAULT_SAFE_LOW_PINS, trigger_pins=()) -> str:
+    """The sketch with NO stimulation: camera triggers plus the safe-pin guard.
+
+    This is the state the board should be in unless a paradigm was deliberately
+    Applied. Flashing it is the only way to be *sure* the board carries no stim:
+    the paradigm lives in flash memory, so it survives closing the GUI, power
+    cycles and USB unplugs, and there is no way to read it back over serial.
+    """
+    return compile_ino([], [], safe_pins, trigger_pins)
+
+
+def sketch_sha(ino_content: str) -> str:
+    """Stable identity for a sketch, so we can tell what the board last took."""
+    import hashlib
+    return hashlib.sha256(ino_content.encode("utf-8")).hexdigest()
+
+
 def upload(ino_content: str, port: str) -> tuple[bool, str]:
     """Compile and upload the .ino to the Arduino. Returns (success, message)."""
     # Resolve at call time, not import time: the tool may be installed while the

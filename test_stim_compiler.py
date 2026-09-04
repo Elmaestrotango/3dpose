@@ -164,6 +164,38 @@ def test_forbidden_pins():
     print("5b) forbidden pins: trigger lines + RX0/TX0 refused at compile: PASS")
 
 
+def test_recording_only_sketch():
+    """Stim must be opt-in per launch, not sticky flash state.
+
+    A paradigm lives in the Arduino's flash, so it survives closing the GUI,
+    power cycles and USB unplugs — while the canvas comes up empty and nothing
+    can read the firmware back over serial. main_window therefore reflashes this
+    sketch at startup whenever the stored hash says the board holds something
+    else. These are the properties that makes that safe.
+    """
+    TRIG = [2, 4, 6, 8, 10, 12]
+    blank = sc.recording_only_sketch([53], TRIG)
+
+    # Carries the camera protocol and the safe-pin guard...
+    assert "void setup()" in blank and "FRAME_START" in blank
+    assert "allStimLow();" in blank
+    assert "const uint8_t STIM_PINS[] = {53};" in blank   # declared to be held LOW
+    # ...and the guard still runs before Serial.begin, or the pin floats while
+    # setup() blocks on the handshake.
+    setup = blank.split("void setup()")[1]
+    assert setup.index("allStimLow();") < setup.index("Serial.begin")
+
+    # Deterministic, or the startup check would reflash on every launch forever.
+    assert sc.sketch_sha(blank) == sc.sketch_sha(
+        sc.recording_only_sketch([53], TRIG))
+
+    # And distinguishable from a real paradigm, or an Apply would not force the
+    # reflash that clears it next launch.
+    paradigm = sc.compile_ino([B("A", pin=53)], [], [53], TRIG)
+    assert sc.sketch_sha(paradigm) != sc.sketch_sha(blank)
+    print("5c) recording-only sketch: guard intact, deterministic, distinct: PASS")
+
+
 def test_durations():
     # end_time_s = cumulative duration up to and including the flagged block.
     assert sc.end_time_s([B("A", 5), B("B", 3, end=True)], [E("A", "B")]) == 8.0
@@ -320,6 +352,7 @@ def main():
     test_safe_pins()
     test_pin_conflicts()
     test_forbidden_pins()
+    test_recording_only_sketch()
     test_durations()
     test_describe()
     test_generated_sketch_is_wellformed()
