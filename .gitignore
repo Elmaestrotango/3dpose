@@ -3,8 +3,13 @@ logs/
 __pycache__/
 *.pyc
 .ipynb_checkpoints/
-_gen_pfs.py
-_*.py
+# Throwaway probes and one-off analysis scripts, which all live at the repo
+# root. The leading slash is load-bearing: an unanchored `_*.py` also matches
+# `__init__.py`, which silently kept gui_app/backends/__init__.py out of a
+# commit and broke the package on a fresh clone. The negation below is a second
+# line of defence, because that failure is invisible to `git add`.
+/_*.py
+!**/__init__.py
 campy/.git/
 .venv/
 probe_out/
