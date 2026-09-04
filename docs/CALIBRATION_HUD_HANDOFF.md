@@ -1,8 +1,17 @@
 # Session handoff — calibration coverage HUD PR
 
-This doc lets a Claude session **on the rig (Windows acquisition machine)** pick up
-where the off-rig session left off, without re-deriving context. It was written
-2026-05-29.
+> **Historical note, kept for provenance.** Written 2026-05-29 to hand this work
+> between machines. Everything it describes has since been merged and validated on
+> the rig, so the branch, PR and "your job" instructions below are of their moment
+> and no longer actions for anyone. It is preserved because it records the original
+> design rationale for the coverage HUD and the reasoning behind the readiness
+> criteria, which the merged code does not explain in one place.
+>
+> This is **not** user documentation and is not part of the documentation set — for
+> how the coverage HUD behaves now see [OVERVIEW.md](OVERVIEW.md) and
+> [WORKFLOW.md](WORKFLOW.md); for how it works see [INTERNALS.md](INTERNALS.md).
+> Where this file and those disagree, those are right: the readiness criteria in
+> particular were tightened after this was written.
 
 ## TL;DR
 
@@ -93,12 +102,12 @@ change to the **3dface repo** (calibration is config-driven — set
 
 Context that lives in the off-rig session's memory, summarized so you have it:
 - The actual multi-view calibration (turning calibration videos into
-  `calibration.toml`) runs on the **Linux processing box**, not the rig, via
-  `sleap-anipose`. The reliable path is **full videos, all cameras** (script
-  `/snlkt/isaac/3dpose/calibrate_full.py` on that box) → sub-pixel reprojection
-  error (3dpose 0.37 px, 3dface 0.063 px on 2026-05-28). The GUI's "Solve" button
-  / `1_calibrate.py` subsample+3-pass path **degrades** the solve — prefer full
-  videos.
+  `calibration.toml`) ran on a separate Linux processing box, not the rig, via
+  `sleap-anipose`. The reliable path was **full videos, all cameras** — a
+  `sleap-anipose` wrapper script kept on that box — giving sub-pixel reprojection
+  error (0.37 px on this rig, 0.063 px on the other, 2026-05-28). The GUI's
+  "Solve" button / `1_calibrate.py` subsample path **degrades** the solve relative
+  to that, so where the best possible calibration matters, solve from full videos.
 - Known trap there: `slap.calibrate` globs `camN/*/*calibration.mp4` and
   `calibration_images/` sorts before `full/`, so a stale `calibration_images/`
   silently shadows the real video. Not relevant to the GUI itself, but explains

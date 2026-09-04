@@ -306,7 +306,11 @@ During **capture** only the 9 camera sessions are live → 9 of 12, comfortable.
 mode the stop path is an ffmpeg `-c copy` remux, which uses no NVENC session at all. The
 danger is **overlap**: if capture sessions are not torn down before an encode begins,
 9 + 3 = 12 is exactly at the cap with zero margin, and the failure mode is a camera
-silently degrading to `raw.bin` at ~207 GB/10 min with no disk guard.
+silently degrading to `raw.bin` at ~129 GiB/10 min with no disk guard.
+(Corrected 2026-09-04: this was written as 207 GB, which is the NV12 ring
+frame size. `raw.bin` holds the mono8 frame the camera sent — 1920x1200 =
+2,304,000 bytes — so it is 128.7 GiB per camera per 10 minutes at 100 fps,
+about 500x the H.264 size rather than 100x.)
 
 **So 9 cameras fits — but only because the warm-session leak is fixed, and only if
 capture and encode sessions never overlap.** Still to do: a startup preflight that probes
