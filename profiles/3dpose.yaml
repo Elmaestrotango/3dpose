@@ -28,6 +28,28 @@ kick_max_lag: 480            # Coordinator buffer, in frames. RAISED 2026-08-11 
 # switch and cameras 7-9 are installed.
 n_cameras: 6
 
+# --- Calibration-only exposure / gain -----------------------------------------
+# The ChArUco board needs far more light than the experiment does, especially
+# with the room dimmed to keep the wireless optostim receiver from triggering.
+# Calibration can AFFORD it. In trigger mode the minimum interval is
+# `exposure + 1/AcquisitionFrameRate`, so:
+#     100 fps recording  -> period 10.0 ms -> exposure ceiling ~3.5 ms
+#      30 fps calibration -> period 33.3 ms -> exposure ceiling ~24.5 ms
+# i.e. calibration has ~7x the light budget of a recording, for free.
+#
+# These apply to the CALIBRATION acquisition only; the .pfs values are restored
+# for recording, so a long calibration exposure can never leak into a 100 fps
+# session (where it would silently halve the frame rate). The ceiling is
+# enforced in code and a too-large value is clamped with a loud log line.
+#
+# The real limit here is MOTION BLUR, not the ceiling: at 15 ms a board moved
+# briskly smears and ChArUco corners stop resolving. Move the board slowly and
+# pause at each pose. If it is still too dark, raise calibration_gain_db next
+# (each +6 dB doubles signal, and noise with it) -- exposure first, gain second.
+# 0 / -1 mean "leave the .pfs value alone".
+calibration_exposure_us: 15000     # 15 ms = 5x the 3 ms recording exposure
+calibration_gain_db: -1            # -1 = keep the .pfs gain (6 dB)
+
 pfs_path: "configs/mono8_1920x1200.pfs"
 output_dir: "data"
 board_config: "configs/boards/charuco_8x8_15mm.yaml"

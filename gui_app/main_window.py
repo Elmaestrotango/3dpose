@@ -496,7 +496,17 @@ class MainWindow(QMainWindow):
             raw_paths, display_every=display_every,
             realtime=rt, width=self._config.frame_width,
             height=self._config.frame_height, quality=self._config.quality,
-            fps=fps, realtime_kick=kick, kick_max_lag=self._config.kick_max_lag)
+            fps=fps, realtime_kick=kick, kick_max_lag=self._config.kick_max_lag,
+            # Calibration gets its own exposure/gain when the profile sets them;
+            # a recording passes None, which RESTORES the .pfs values. Restoring
+            # rather than re-deriving is what guarantees a long calibration
+            # exposure can never leak into a 100 fps session, where it would
+            # silently halve the frame rate.
+            exposure_us=(self._config.calibration_exposure_us or None
+                         if acq_type == "calibration" else None),
+            gain_db=(self._config.calibration_gain_db
+                     if acq_type == "calibration"
+                     and self._config.calibration_gain_db >= 0 else None))
 
         teensy = self._teensy_connection()
         if teensy is None:

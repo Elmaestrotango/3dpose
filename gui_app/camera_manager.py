@@ -31,6 +31,8 @@ class CameraManager(QObject):
         super().__init__()
         self._cameras: list = []
         self._geometry = None      # (w, h) agreed by every camera
+        #: (exposure_us, gain_db) per camera as loaded from the .pfs.
+        self._baseline_exp_gain: list = []
         #: Problems found while finalising the last recording (retired cameras,
         #: block-ID truncation). Read by the GUI after stop_acquisition().
         self.last_warnings: list = []
@@ -84,6 +86,7 @@ class CameraManager(QObject):
         expect_cameras: if nonzero, refuse to start unless exactly this many
         cameras enumerate."""
         self._trigger_rate_limit = trigger_rate_limit
+        self._baseline_exp_gain = []
         devices = self._backend.enumerate_devices()
         if len(devices) == 0:
             self.error.emit("No cameras found")
@@ -139,6 +142,12 @@ class CameraManager(QObject):
                         f"cameras must match.")
                 self._geometry = (w, h)
                 print(f"[cam{i+1}] {info['serial']} {w}x{h} {pf}", flush=True)
+                # Remember what the .pfs applied, so a calibration-specific
+                # exposure can be RESTORED exactly afterwards rather than
+                # reconstructed. Leaking a calibration exposure into a 100 fps
+                # recording would silently halve the frame rate.
+                self._baseline_exp_gain.append(
+                    self._backend.get_exposure_gain(cam))
                 self._backend.enable_extended_block_ids(i, cam)
                 self._backend.select_gige_driver(i, cam, gige_driver)
             except Exception as e:
@@ -194,11 +203,51 @@ class CameraManager(QObject):
             gt.wait(5000)
         self._grab_threads.clear()
 
+    def apply_exposure_gain(self, fps: float, exposure_us=None, gain_db=None):
+        """Set exposure/gain for the acquisition about to start.
+
+        Pass exposure_us=None to RESTORE the .pfs baseline — which is what a
+        recording does, so a calibration-specific exposure can never leak into
+        it. That leak matters: in trigger mode the minimum interval is
+        `exposure + 1/AcquisitionFrameRate`, so an exposure sized for 30 fps
+        would exceed a 100 fps trigger period and silently halve the frame rate
+        with no error anywhere.
+
+        The ceiling is computed and ENFORCED here rather than trusted to the
+        profile, because exceeding it fails silently.
+        """
+        limit = getattr(self, "_trigger_rate_limit", 165.0) or 165.0
+        # Period minus the camera's own post-exposure timer, with 10% margin.
+        ceiling_us = (1e6 / float(fps) - 1e6 / float(limit)) * 0.9
+        for i, cam in enumerate(self._cameras):
+            base_exp, base_gain = (self._baseline_exp_gain[i]
+                                   if i < len(self._baseline_exp_gain)
+                                   else (None, None))
+            want_exp = base_exp if exposure_us is None else float(exposure_us)
+            want_gain = base_gain if gain_db is None else float(gain_db)
+            note = ""
+            if want_exp is not None and want_exp > ceiling_us:
+                note = (f" CLAMPED from {want_exp:.0f} us: at {fps:g} fps with "
+                        f"AcquisitionFrameRate={limit:g} the ceiling is "
+                        f"{ceiling_us:.0f} us, and exceeding it would halve the "
+                        f"frame rate silently")
+                want_exp = ceiling_us
+            try:
+                exp, gain = self._backend.set_exposure_gain(cam, want_exp, want_gain)
+                if i == 0 or note:
+                    print(f"[cam{i+1}] exposure={exp if exp is None else f'{exp:.0f}'} us "
+                          f"gain={gain if gain is None else f'{gain:.1f}'} dB "
+                          f"(ceiling {ceiling_us:.0f} us at {fps:g} fps){note}",
+                          flush=True)
+            except Exception as e:
+                print(f"[cam{i+1}] exposure/gain set failed: {e}", flush=True)
+
     def start_acquisition(self, raw_paths: list[Path], display_every: int = 10,
                           realtime: bool = False, width: int = 0, height: int = 0,
                           quality: int = 21, fps: int = 100,
                           realtime_kick: bool = False,
-                          kick_max_lag: int = 240):
+                          kick_max_lag: int = 240,
+                          exposure_us=None, gain_db=None):
         self._stop_grab_threads()
         self._router = None
         if realtime and realtime_kick:
@@ -216,6 +265,9 @@ class CameraManager(QObject):
             else:
                 print("[acq] kick-out unavailable, using decoupled encode", flush=True)
         self._set_trigger_mode()
+        # AFTER trigger mode: _set_trigger_mode writes AcquisitionFrameRate, and
+        # the exposure ceiling is derived from it, so ordering matters.
+        self.apply_exposure_gain(fps, exposure_us, gain_db)
         self._start_grab_threads(raw_paths=raw_paths, display_every=display_every,
                                  realtime=realtime, width=width, height=height, quality=quality,
                                  fps=fps)

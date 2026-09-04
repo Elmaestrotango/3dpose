@@ -14,6 +14,10 @@ realtime_encode: false       # <-- proven raw-to-disk + post-hoc encode
 # Same rig as `3dpose`; see that profile for the rationale.
 n_cameras: 6
 
+# Same rig as `3dpose`; see that profile for the reasoning.
+calibration_exposure_us: 15000
+calibration_gain_db: -1
+
 pfs_path: "configs/mono8_1920x1200.pfs"
 output_dir: "data"
 board_config: "configs/boards/charuco_8x8_15mm.yaml"

@@ -180,6 +180,66 @@ class BaslerBackend:
                 print("[cam] trigger-rate limiter DISABLED "
                       "(exposure bounded by sensor readout only)", flush=True)
 
+    # ------------------------------------------------------------ exposure/gain
+    @staticmethod
+    def get_exposure_gain(cam) -> tuple:
+        """(exposure_us, gain_db) as the .pfs left them, or (None, None).
+
+        Read once at open so the recording settings can be RESTORED exactly
+        rather than reconstructed. Node names differ across pylon generations,
+        hence the fallbacks.
+        """
+        exp = gain = None
+        for n in ("ExposureTime", "ExposureTimeAbs"):
+            try:
+                exp = getattr(cam, n).GetValue()
+                break
+            except Exception:
+                continue
+        for n in ("Gain", "GainRaw"):
+            try:
+                gain = getattr(cam, n).GetValue()
+                break
+            except Exception:
+                continue
+        return exp, gain
+
+    @staticmethod
+    def set_exposure_gain(cam, exposure_us=None, gain_db=None) -> tuple:
+        """Apply exposure/gain. Returns what was actually set, for logging.
+
+        The caller is responsible for the exposure CEILING — in trigger mode the
+        frame-rate timer starts after exposure ends, so the minimum interval is
+        `exposure + 1/AcquisitionFrameRate`, and exceeding the trigger period
+        silently halves the frame rate rather than erroring.
+        """
+        applied_exp = applied_gain = None
+        if exposure_us is not None:
+            for n in ("ExposureTime", "ExposureTimeAbs"):
+                try:
+                    node = getattr(cam, n)
+                    lo = getattr(node, "Min", None)
+                    hi = getattr(node, "Max", None)
+                    v = float(exposure_us)
+                    if lo is not None and hi is not None:
+                        v = max(lo.GetValue() if hasattr(lo, "GetValue") else lo,
+                                min(v, hi.GetValue() if hasattr(hi, "GetValue") else hi))
+                    node.SetValue(v)
+                    applied_exp = node.GetValue()
+                    break
+                except Exception:
+                    continue
+        if gain_db is not None:
+            for n in ("Gain", "GainRaw"):
+                try:
+                    node = getattr(cam, n)
+                    node.SetValue(float(gain_db))
+                    applied_gain = node.GetValue()
+                    break
+                except Exception:
+                    continue
+        return applied_exp, applied_gain
+
     # ----------------------------------------------------------------- grabbing
     def start_grabbing(self, cam) -> None:
         cam.StartGrabbing(self.GRAB_STRATEGY)

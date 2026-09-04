@@ -50,6 +50,18 @@ class RigProfile:
     # the stimulation workflow are added automatically; list here anything that
     # must be safe even when no paradigm is loaded.
     stim_safe_pins: list = field(default_factory=lambda: [53])
+    # Calibration-only exposure/gain. The ChArUco board often needs far more
+    # light than the experiment does -- especially when the room is dimmed to
+    # keep a wireless optostim receiver from triggering. Calibration can afford
+    # it: in trigger mode the minimum interval is
+    # `exposure + 1/AcquisitionFrameRate`, so at 100 fps exposure is capped near
+    # 3.94 ms, but at the 30 fps calibration rate the ceiling is ~27 ms. These
+    # are applied for calibration only and the .pfs values are restored for
+    # recording, so a long calibration exposure can never leak into a 100 fps
+    # session (where it would silently halve the frame rate).
+    # 0 / -1 mean "leave the .pfs value alone".
+    calibration_exposure_us: float = 0.0
+    calibration_gain_db: float = -1.0
     # AcquisitionFrameRate applied in trigger mode, or 0 to disable the limiter.
     # While externally triggered the camera's internal rate generator serves no
     # purpose, but it still enforces a minimum interval of
@@ -89,6 +101,8 @@ class RigProfile:
             trigger_pins=data.get("trigger_pins", [2, 4, 6, 8, 10, 12]),
             n_cameras=data.get("n_cameras", 0),
             stim_safe_pins=data.get("stim_safe_pins", [53]),
+            calibration_exposure_us=float(data.get("calibration_exposure_us", 0.0)),
+            calibration_gain_db=float(data.get("calibration_gain_db", -1.0)),
             trigger_rate_limit=float(data.get("trigger_rate_limit", 165.0)),
         )
 
@@ -168,6 +182,8 @@ class SessionConfig:
     realtime_encode: bool = True
     realtime_kick: bool = False
     kick_max_lag: int = 240
+    calibration_exposure_us: float = 0.0
+    calibration_gain_db: float = -1.0
 
     def __post_init__(self):
         if not self.date:
@@ -193,6 +209,8 @@ class SessionConfig:
             realtime_encode=profile.realtime_encode,
             realtime_kick=profile.realtime_kick,
             kick_max_lag=profile.kick_max_lag,
+            calibration_exposure_us=profile.calibration_exposure_us,
+            calibration_gain_db=profile.calibration_gain_db,
         )
         defaults.update(overrides)
         return cls(**defaults)
