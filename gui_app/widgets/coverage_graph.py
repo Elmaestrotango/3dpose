@@ -7,6 +7,7 @@ at the detector's ``optimal_shared``. When the coverage graph is connected and
 every camera is sufficiently covered, the whole graph freezes solid white.
 """
 import math
+import time
 
 import numpy as np
 from PyQt5.QtWidgets import QWidget
@@ -24,15 +25,24 @@ class CoverageGraphWidget(QWidget):
         self._shared = None
         self._per_cam = None
         self._optimal = 50
-        self._target = 100   # placeholder until a BoardDetector snapshot arrives (see update_from)
+        self._target = 40
         self._ready = False
+        self._grid_covered = None
+        self._grid_cells_hit = None
+        self._min_grid_cells = 3
+        self._start_time = None
+        self._elapsed_s = 0.0
 
     def setup(self, n_cams: int):
         self._n = int(n_cams)
         self._glow = np.zeros(self._n)
         self._shared = np.zeros((self._n, self._n), dtype=int)
         self._per_cam = np.zeros(self._n, dtype=int)
+        self._grid_covered = None
+        self._grid_cells_hit = np.zeros(self._n, dtype=int)
         self._ready = False
+        self._start_time = time.monotonic()
+        self._elapsed_s = 0.0
         self.update()
 
     def update_from(self, det):
@@ -42,8 +52,14 @@ class CoverageGraphWidget(QWidget):
         self._shared = np.asarray(det.shared, dtype=int).copy()
         self._per_cam = np.asarray(det.per_cam_covis, dtype=int).copy()
         self._optimal = det.optimal_shared or 1
-        self._target = getattr(det, "min_per_cam_shared", 100)
-        self._ready = bool(det.ready)
+        self._target = getattr(det, "min_per_cam_shared", 40)
+        self._grid_covered = np.asarray(det.grid_covered, dtype=bool).copy()
+        self._grid_cells_hit = np.asarray(det.grid_cells_hit, dtype=int).copy()
+        self._min_grid_cells = getattr(det, "MIN_GRID_CELLS", 3)
+        ready_now = bool(det.ready)
+        if self._start_time is not None and not ready_now:
+            self._elapsed_s = time.monotonic() - self._start_time
+        self._ready = ready_now
         self.update()
 
     def _node_positions(self, w, h, r):
@@ -82,8 +98,9 @@ class CoverageGraphWidget(QWidget):
                 p.setPen(pen)
                 p.drawLine(pos[i], pos[j])
 
-        # --- nodes ---
+        # --- nodes with camera number + spatial grid badge ---
         node_r = 15.0
+        grid_rows, grid_cols = 2, 2
         for i in range(self._n):
             glow = float(self._glow[i]) if self._glow is not None else 0.0
             if ready:
@@ -97,19 +114,44 @@ class CoverageGraphWidget(QWidget):
             pen.setWidthF(2.0)
             p.setPen(pen)
             p.drawEllipse(pos[i], node_r, node_r)
+
+            # Camera number always visible
             p.setPen(QPen(txt))
             p.setFont(QFont("Segoe UI", 10, QFont.Bold))
-            p.drawText(QRectF(pos[i].x() - node_r, pos[i].y() - node_r, 2 * node_r, 2 * node_r),
+            p.drawText(QRectF(pos[i].x() - node_r, pos[i].y() - node_r,
+                              2 * node_r, 2 * node_r),
                        Qt.AlignCenter, str(i + 1))
 
-        # --- caption ---
+            # 2x2 grid badge in bottom-right of node
+            if self._grid_covered is not None and not ready:
+                gs = 10.0
+                gx = pos[i].x() + node_r * 0.3
+                gy = pos[i].y() + node_r * 0.3
+                cw, ch = gs / grid_cols, gs / grid_rows
+                for gr in range(grid_rows):
+                    for gc in range(grid_cols):
+                        if self._grid_covered[i, gr, gc]:
+                            cell_color = QColor(100, 220, 140, 200)
+                        else:
+                            cell_color = QColor(40, 40, 60, 140)
+                        p.setBrush(QBrush(cell_color))
+                        p.setPen(QPen(QColor(60, 60, 80, 100), 0.5))
+                        p.drawRect(QRectF(gx + gc * cw, gy + gr * ch, cw, ch))
+
+        # --- caption with timer ---
+        elapsed = self._elapsed_s
+        mins, secs = int(elapsed) // 60, int(elapsed) % 60
+        timer_str = f"{mins}:{secs:02d}"
+
         p.setFont(QFont("Segoe UI", 9, QFont.Bold))
         if ready:
             p.setPen(QPen(QColor(255, 255, 255)))
-            p.drawText(QRectF(0, h - 18, w, 16), Qt.AlignCenter, "READY — coverage complete")
+            p.drawText(QRectF(0, h - 18, w, 16), Qt.AlignCenter,
+                       f"READY — {timer_str}")
         else:
             mn = int(self._per_cam.min()) if (self._per_cam is not None and self._n) else 0
+            min_grid = int(self._grid_cells_hit.min()) if (self._grid_cells_hit is not None and self._n) else 0
             p.setPen(QPen(QColor(150, 150, 170)))
             p.drawText(QRectF(0, h - 18, w, 16), Qt.AlignCenter,
-                       f"weakest cam {mn}/{self._target} paired")
+                       f"{timer_str}  paired {mn}/{self._target}  grid {min_grid}/{self._min_grid_cells}")
         p.end()
