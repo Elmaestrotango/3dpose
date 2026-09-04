@@ -169,6 +169,9 @@ class MainWindow(QMainWindow):
         QApplication.setOverrideCursor(QCursor(Qt.WaitCursor))
 
     def _end_busy(self):
+        """Undo _begin_busy. NOTE: does NOT restore the status text — the caller
+        owns that, because most callers move to a new state (ENCODING, etc.).
+        A caller with no new state to show must set it back to IDLE itself."""
         QApplication.restoreOverrideCursor()
         self._sidebar.set_busy(False)
         self._busy = False
@@ -655,6 +658,12 @@ class MainWindow(QMainWindow):
 
     def _on_clean_firmware_done(self, result):
         self._end_busy()
+        # _end_busy() restores the cursor and re-enables the UI but deliberately
+        # leaves the status text alone, because most callers replace it with a
+        # new state. This one has no new state to show, so it must put the
+        # sidebar back to IDLE itself — otherwise "Clearing stim firmware…"
+        # stays on screen for the rest of the session.
+        self._sidebar.set_status("IDLE", "#888")
         ok, msg = result if isinstance(result, tuple) else (False, str(result))
         if ok:
             self._settings.setValue("board_sketch_sha", self._pending_sha)
