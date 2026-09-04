@@ -30,18 +30,11 @@ Rig-validated fixes layered on top of the original PR (all on master):
 - **`coverage_worker.py`** runs detection off the UI thread at ~30 Hz on full-res
   frames (`GrabThread.set_keep_full`).
 - **`encode_parallel`** profile field (default 3) caps concurrent NVENC jobs.
-- READY thresholds (`board_detector.py` constructor defaults): `min_per_cam_shared = 100`
-  co-visible frames/cam, `min_edge = 40` graph-connectivity, `optimal_shared = 200`
-  edge-width max — raised hard on 2026-07-09 (`acac97e`) after 20 proved far too lenient
-  and let under-covered cameras produce degenerate intrinsics (fx≠fy, extreme distortion).
-  Shared by both rigs and tuned on 3dface; **if the 6-cam 3dpose rig can't reach 100
-  co-visible/cam, dial these back** (they're constructor defaults, not yet profile fields).
-- `1_calibrate.py` (post-`acac97e`) constrains intrinsics (`CALIB_FIX_ASPECT_RATIO` /
-  `FIX_K3` / `ZERO_TANGENT_DIST`), requires ≥20 frames/cam, caps intrinsics+stereo at 30
-  frames, and writes `reprojection_error_histogram.png` (matplotlib — a PEP 723 inline dep
-  auto-installed by `uv run`; guarded/skipped if absent). The HUD saves `codet_frames.json`
-  on calibration stop so the script seeks to co-detection frames instead of scanning full
-  videos.
+- READY requires three conditions: `min_per_cam_shared = 250` co-detection ticks
+  per camera, `min_edge = 80` per pair, AND `MIN_GRID_CELLS = 3` out of 4
+  spatial grid cells covered per camera (prevents degenerate intrinsics from
+  waving the board in one spot). The 2×2 grid divides each camera's FOV by the
+  marker centroid and shows as a badge on each HUD node.
 
 3dface mirror of `gui_app/` is deferred — this rig only runs 3dpose for now.
 
@@ -263,13 +256,40 @@ Plain scripts, no pytest — run directly:
   the laggard drifts to *whatever* the cap is (it sat at 479/480 here), so a higher cap
   buys little, costs ~5 GB of ring per 240, and 1000 starved capture outright in June.
   3dface stays at 240; it has different cameras and an unknown RAM budget.
-- **The laggard rotates between sessions and is unexplained.** cam1 (2026-07-27),
-  cam5 (2026-08-11 13:55), cam2 (2026-08-11 14:32) — and it is NOT the heavy-resend
-  group: cam2 and cam5 both sit in the light group (~160 resend requests vs ~186,000
-  for cams 4/6). Whatever makes one camera drift ~2.4 s behind in *submission* while
-  still capturing ~100% of triggers is still unknown; it is not packet loss, not the
-  encoders (`queue_full_drops=0`), and not the cameras. 480 makes it cheap rather than
-  fixing it.
+- **SOLVED 2026-09-03: the rotating laggard was `result.Array`.** It is fixed; the text
+  below is kept only so the old reasoning is traceable. `img = result.Array` in the grab
+  loop was **not** zero-copy — pypylon's `GetArray()` allocates a fresh 2.3 MB array and
+  memcpys the driver buffer into it **with the GIL held** (pypylon is built with SWIG
+  `-threads`, but `GetArray` is on the explicit `%nothread` list). Measured **0.837 ms of
+  GIL-held work per frame per camera**, against a 10 ms budget shared by every grab
+  thread. Whichever thread lost the GIL/scheduling lottery accumulated buffer-pool
+  backlog fastest and became "the laggard" — which is exactly why the identity rotated
+  and why it correlated with nothing physical.
+
+  `with result.GetArrayZeroCopy() as img:` costs **0.157 ms** (5.33×). Rig result, 6
+  cameras: `cycle` 12.0 → **10.00 ms** (the trigger period exactly), `avg_proc` 5.2–5.5 →
+  **0.79–0.84 ms**, slack ~4.1 → **8.5 ms**, `deliv_lag` +10.7 s → ~0, underruns 245–882
+  → **0**, cross-camera lag median 235–479 → **median 0 / p95 1 / max 2**, forced drops
+  up to 12.34% → **0**. A 60 s run captured **100.00% with zero loss**.
+
+  Two consequences worth internalising:
+  - **`kick_max_lag: 480` now buys nothing** (observed lag is 0–2). It still costs ring
+    RAM linearly, and the ring is what makes the 9-camera budget tight. Lowering it is
+    deferred by Isaac's decision (2026-09-03), not because it is wrong.
+  - **Never bracket a GIL-releasing call with a plain wall-clock timer.** numpy releases
+    the GIL for the memcpy and must re-acquire before returning, so the re-acquisition
+    wait lands *inside* the bracket. That is how a 0.08 ms copy was reported as 2.7 ms,
+    and it misled this project twice. Split executing from waiting with
+    `QueryThreadCycleTime` — see `docs/PERF_EXPERIMENTS.md` (E2) and `probe_gil_wait.py`.
+    Acceptance criterion from E2: **≤300 µs of GIL-held work per thread per frame is
+    safe even at 17 threads; ~1000 µs blows the 10 ms budget at 11.**
+- **Historical, now explained (kept for traceability): the laggard rotated.** cam1
+  (2026-07-27), cam5 (2026-08-11 13:55), cam2 (2026-08-11 14:32) — and it was NOT the
+  heavy-resend group: cam2 and cam5 both sit in the light group (~160 resend requests vs
+  ~186,000 for cams 4/6). At the time this looked inexplicable: one camera drifting
+  ~2.4 s behind in *submission* while still capturing ~100% of triggers, with packet
+  loss, the encoders (`queue_full_drops=0`) and the cameras all ruled out. The missing
+  candidate was the grab loop itself.
 - Historical detail on the original 240 investigation. One
   camera — **which one varies per session** — drifts to the cap and oscillates across it,
   force-dropping frames every camera captured: 12.3% on 2026-08-11 with cam5 at median
@@ -304,6 +324,37 @@ Plain scripts, no pytest — run directly:
   remuxes to mp4 (`ffmpeg -c copy`). Inline encode starved GigE packet reassembly and
   dropped ~28% of frames — do NOT put work back on the grab loop's critical path. Deps:
   `PyNvVideoCodec`, `nvidia-cuda-runtime-cu12`.
+- **Grab-loop invariants (added 2026-09-03 — breaking any of these is silent).**
+  - **Never write `result.Array` in the grab loop.** It is a GIL-held 2.3 MB memcpy
+    (0.837 ms/frame/camera) and it was the root cause of years of frame loss. Use
+    `with result.GetArrayZeroCopy() as img:`. `np.frombuffer(GetBuffer())` is **not** a
+    substitute — measured 0.902 ms, no better than `.Array`.
+  - **`img` is a VIEW over the driver buffer.** It must not escape the `with` block or
+    outlive `result.Release()`. Every consumer copies out today (snapshot, NV12 ring,
+    `os.write`, preview decimate, full-res HUD copy); a new consumer that stores `img`
+    itself would read freed memory. There is a first-frame check that compares the view
+    against `GetArray()` and retires the camera on mismatch, because `PaddingX` is not
+    implemented on these cameras and row padding would shear every frame silently.
+  - **The NV12 ring's `np.full(..., 128, ...)` is load-bearing twice**: it sets the
+    constant chroma plane AND pre-faults every page. Switching it to `np.empty`/`np.zeros`
+    would put a ~0.4 ms first-touch fault back on the hot path (measured).
+  - **A camera that cannot start MUST be retired** (`router.retire`). In kick mode the
+    coordinator waits for every camera, so one camera that never publishes force-drops
+    every trigger for *all* of them — one dead camera silently produces an empty
+    recording from all nine.
+  - **NVENC concurrent sessions are capped by the driver — measured 12 here** (the cap
+    has moved 2→3→5→8→12, so probe it, never hardcode it: `nvenc.probe_max_sessions`).
+    Budget is one per camera plus `encode_parallel` plus any warm-up session. `EndEncode()`
+    does NOT free a session — the object's **destructor** does, so encoders must be
+    `del`'d (`_EncoderThread.release_encoder()`). NVENCSTATUS **21 is the session limit,
+    not a config error**: never descend a kwarg fallback ladder on it, and keep
+    `gopLength`/`idrPeriod` on every rung — losing the GOP yields one IDR for a whole
+    recording, which is unseekable in LUC3D.
+  - **`blockids.npy` must only record frames that were actually persisted.** A successful
+    `queue.put_nowait` means the queue accepted the frame, not that it was encoded; a dead
+    encoder silently accepts a queue's worth and encodes none, which makes frame *i* of
+    the mp4 map to the wrong trigger. `sync_encode.stop()` reconciles against
+    `encoded + spilled` and writes `WARNINGS.txt` on a mismatch.
 - **Cameras drop frames independently (GigE packet loss), so frame i is NOT the same
   trigger across cameras.** Every recorded frame is tagged with its GigE BlockID (=
   trigger ordinal) in `blockids.npy`. Two ways the videos are made trigger-aligned:
@@ -350,11 +401,19 @@ Plain scripts, no pytest — run directly:
     `max_lag=240`, above 200 in 75% of reports, i.e. permanently ~2.3 s behind
     and riding the cap, so anything that tips it over force-drops frames every
     camera captured. cam1 is also the camera that stalled outright earlier that
-    day. **Next step is physical: the switch/NIC port carrying cams 1/4/6, cam1's
-    cable specifically, and MTU 9014 + max Receive Buffers on that leg.** Raising
+    day. **SUPERSEDED 2026-09-03 — do NOT do the physical triage.** After the
+    `GetArrayZeroCopy` fix, a 60 s 6-camera run had `Failed_Buffer_Count = 0` on
+    **all six**, cams 1/4/6 included, at 100.00% capture. Those cameras still
+    issue ~920 resend requests / ~5,300 resend packets per minute — the physical
+    asymmetry is real and unchanged — but they now **recover every one**.
+    Resends were never the mechanism: what converted them into lost frames was a
+    grab loop too slow to drain the buffer pool while waiting on them. The
+    cable/switch/SFP swap is not needed. (Caveat: 60 s does not sample Eth5's
+    bad moods and loss here has always been bimodal by session, so a 20-minute
+    run is pending.) The original text follows. Raising
     `kick_max_lag` would only paper over it (ring RAM is `max_lag+264` NV12
     buffers/cam ≈ 10.4 GB at 240, 15.4 GB at 480).
-- `3dpose (raw)` profile (`realtime_encode: false`) = the proven raw.bin + post-hoc
+- **Raw fallback** (`realtime_encode: false`) = the proven raw.bin + post-hoc
   NVENC fallback (no GPU encode during capture).
 - Blocking camera ops (open/close/reconfigure) run off the Qt main thread via
   `gui_app/ui_workers.py` `CallableWorker` (else the window goes "not responding").

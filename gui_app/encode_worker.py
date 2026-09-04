@@ -3,7 +3,9 @@
 Cameras are encoded concurrently (a pool of up to ``max_parallel`` ffmpeg/NVENC
 processes). NVENC offloads the compression to the GPU, so the CPU mostly feeds
 raw bytes; running several at once is bounded by disk read bandwidth and the
-NVENC concurrent-session limit (8 on current GeForce drivers), not the CPU.
+NVENC concurrent-session limit, not the CPU. That limit is REAL and finite --
+measured 12 on this rig's driver, and NVIDIA has moved it (2 -> 3 -> 5 -> 8 -> 12),
+so probe it via nvenc.probe_max_sessions rather than assuming a number.
 """
 import os
 import subprocess
@@ -139,7 +141,15 @@ class EncodeWorker(QThread):
             if self._realtime and h264_path.exists():
                 tail_bin = cam_dir / "raw_tail.bin"
                 if tail_bin.exists() and tail_bin.stat().st_size > 0:
-                    self._append_raw_tail(cam, h264_path, tail_bin)
+                    if not self._append_raw_tail(cam, h264_path, tail_bin):
+                        # The tail is safe on disk but NOT in the mp4, while
+                        # n_frames below is read from frametimes.npy -- i.e. what
+                        # the pipeline intended, not what the video contains. Say
+                        # so loudly; a silent over-claim here means frame indices
+                        # past the splice point map to the wrong triggers.
+                        print(f"[encode] {cam}: WARNING mp4 will contain FEWER "
+                              f"frames than frametimes.npy claims; unmerged tail "
+                              f"remains at {tail_bin}", flush=True)
                 raw_path = h264_path
                 ft = cam_dir / "frametimes.npy"
                 try:
@@ -176,20 +186,37 @@ class EncodeWorker(QThread):
                         self._cmd(raw_path, mp4_path),
                         stdout=subprocess.DEVNULL, stderr=err_fd,
                         startupinfo=_STARTUPINFO)
-                    running[i] = (proc, cam, raw_path, n_frames, err_fd, err_path)
+                    running[i] = (proc, cam, raw_path, mp4_path, n_frames, err_fd, err_path)
                 except Exception as e:
+                    # Close the stderr fd on the launch-failure path. On Windows
+                    # a leaked handle keeps encode_error.log open, so the camera
+                    # directory cannot be deleted (including by
+                    # _abandon_and_cleanup) and the next recording's stale-artifact
+                    # unlink fails too.
+                    try:
+                        err_fd.close()
+                    except Exception:
+                        pass
                     print(f"[encode] {cam}: ffmpeg launch failed: {e}", flush=True)
                     results[i] = (cam, n_frames, False)
                     done += 1
                     self.progress.emit(done, total)
 
             for i in list(running.keys()):
-                proc, cam, raw_path, n_frames, err_fd, err_path = running[i]
+                proc, cam, raw_path, mp4_path, n_frames, err_fd, err_path = running[i]
                 ret = proc.poll()
                 if ret is None:
                     continue
                 err_fd.close()
-                ok = (ret == 0)
+                # A zero exit code is not proof of an output file. Stat the mp4
+                # before deleting the ONLY other copy of the data — the source is
+                # removed below and cannot be recovered.
+                ok = (ret == 0 and mp4_path.exists()
+                      and mp4_path.stat().st_size > 1024)
+                if ret == 0 and not ok:
+                    print(f"[encode] {cam}: ffmpeg reported success but "
+                          f"{mp4_path.name} is missing or empty; KEEPING "
+                          f"{raw_path.name}", flush=True)
                 if ok:
                     try:
                         os.remove(raw_path)

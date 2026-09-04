@@ -10,7 +10,8 @@ from PyQt5.QtWidgets import QMainWindow, QWidget, QHBoxLayout, QApplication, QMe
 from PyQt5.QtCore import QTimer, Qt
 from PyQt5.QtGui import QPalette, QColor, QIcon, QCursor
 
-from gui_app.camera_manager import CameraManager
+from gui_app.camera_manager import CameraManager, MAX_NUM_BUFFER
+from gui_app.grab_thread import ENCODE_QUEUE_DEPTH
 from gui_app.serial_controller import TeensyController
 from gui_app.encode_worker import EncodeWorker
 from gui_app.align_worker import AlignWorker
@@ -18,7 +19,8 @@ from gui_app.ui_workers import CallableWorker
 from gui_app import alignment
 from gui_app import stim_trace
 from gui_app.calibration_worker import CalibrationWorker
-from gui_app.hardware_check import HardwareCheckThread, format_report
+from gui_app.hardware_check import (HardwareCheckThread, format_report,
+                                    check_capacity)
 from gui_app.coverage_worker import CoverageWorker
 from gui_app.session_config import SessionConfig, RigProfile
 from gui_app.widgets.camera_grid import CameraGridWidget
@@ -63,6 +65,7 @@ class MainWindow(QMainWindow):
         self._video_dir: Path | None = None
         self._busy = False                 # a blocking camera op is running
         self._cam_op: CallableWorker | None = None
+        self._fw_op: CallableWorker | None = None
 
         self._camera_mgr = CameraManager()
         self._teensy = TeensyController()
@@ -119,11 +122,14 @@ class MainWindow(QMainWindow):
         self._size_to_screen()
         self._sidebar.set_status("IDLE", "#888")
         self._run_hardware_check()
-        # Take the serial port now rather than on the first Record. Opening it
-        # resets the Arduino, and during the reset + bootloader every pin floats
-        # — which fires a connected laser. Doing it at launch keeps that flash
-        # out of the experiment. Deferred one tick so the window paints first.
-        QTimer.singleShot(0, self._warm_serial)
+        # Two things, in this order, deferred one tick so the window paints
+        # first. (1) Put the board back to the recording-only sketch, so a
+        # paradigm can never survive from a previous session -- stim is opt-in
+        # per launch. (2) Then claim the serial port: opening it resets the
+        # Arduino, and during the reset + bootloader every pin floats, which
+        # fires a connected laser. Doing it at launch keeps that flash out of
+        # the experiment. arduino-cli needs the port to itself, hence the order.
+        QTimer.singleShot(0, self._ensure_clean_firmware)
 
     def _open_cameras(self):
         """Open cameras for the current profile (synchronous — startup only)."""
@@ -136,7 +142,8 @@ class MainWindow(QMainWindow):
         if pfs and Path(pfs).exists():
             return self._camera_mgr.open_all(
                 pfs, gige_driver=self._profile.gige_driver,
-                trigger_rate_limit=self._profile.trigger_rate_limit)
+                trigger_rate_limit=self._profile.trigger_rate_limit,
+                expect_cameras=self._profile.n_cameras)
         return False
 
     def _apply_camera_open_result(self, ok):
@@ -162,6 +169,9 @@ class MainWindow(QMainWindow):
         QApplication.setOverrideCursor(QCursor(Qt.WaitCursor))
 
     def _end_busy(self):
+        """Undo _begin_busy. NOTE: does NOT restore the status text — the caller
+        owns that, because most callers move to a new state (ENCODING, etc.).
+        A caller with no new state to show must set it back to IDLE itself."""
         QApplication.restoreOverrideCursor()
         self._sidebar.set_busy(False)
         self._busy = False
@@ -256,6 +266,45 @@ class MainWindow(QMainWindow):
         if self._display_tick % 10 == 0:
             for i, fps in enumerate(self._camera_mgr.current_fps):
                 self._camera_grid.update_fps(i, fps)
+            self._refresh_capture_health()
+
+    def _refresh_capture_health(self):
+        """Show how far behind real time capture is running, WHILE it happens.
+
+        This is the one failure this pipeline cannot show you any other way. A
+        grab loop that is a fraction of a millisecond over budget loses nothing
+        at first — the driver's buffer pool absorbs the deficit — so there is no
+        error, no dropped frame, and no clue, for as long as ten minutes. What
+        actually happens is that every frame retrieved gets progressively
+        staler, and by the time the pool is exhausted the session is spoiled.
+        A live number is the only warning available before that point.
+
+        Also worth knowing while aiming the rig: a large lag means the preview
+        is showing you the past, not the present.
+        """
+        if self._state != State.RECORDING:
+            return
+        try:
+            lags = self._camera_mgr.delivery_lags
+        except Exception:
+            return
+        if not lags:
+            return
+        worst = max(lags)
+        if worst < 0.25:
+            self.statusBar().showMessage(
+                f"Capture healthy — keeping up with the trigger "
+                f"(max lag {worst * 1000:.0f} ms)")
+        elif worst < 1.0:
+            self.statusBar().showMessage(
+                f"CAPTURE FALLING BEHIND: cam{lags.index(worst) + 1} is "
+                f"{worst:.2f} s behind real time and growing. Close other "
+                f"applications.")
+        else:
+            self.statusBar().showMessage(
+                f"CAPTURE {worst:.1f} s BEHIND REAL TIME (cam"
+                f"{lags.index(worst) + 1}). Frames will be lost when the buffer "
+                f"pool fills. Stop and investigate.")
 
     def _build_config(self) -> SessionConfig:
         vals = self._sidebar.get_field_values()
@@ -285,14 +334,122 @@ class MainWindow(QMainWindow):
         elif self._state == State.RECORDING:
             self._stop_acquisition()
 
+    def _warn_if_not_stood_down(self, stopped: bool) -> bool:
+        """Surface a stop_triggers() failure. Returns what it was given.
+
+        CLAUDE.md's invariant is that closing the GUI can never leave a paradigm
+        or a laser running. The board is the only thing that can honour that, so
+        when it does not accept the stop the operator has to be told — a
+        swallowed failure turns a laser left running into a silent one.
+        """
+        if stopped:
+            return True
+        print("[acq] STOP NOT CONFIRMED — board may still be triggering",
+              flush=True)
+        try:
+            QMessageBox.critical(
+                self, "Trigger board did not confirm the stop",
+                "The trigger board did not accept the stop command.\n\n"
+                "It may still be triggering, and any stim paradigm — including "
+                "a looping one, which never ends on its own — may still be "
+                "driving its pin.\n\n"
+                "Power-cycle the trigger board and key off the laser.")
+        except Exception:
+            pass       # a dialog failure must not mask the printed warning
+        return False
+
+    def _preflight_capacity(self) -> bool:
+        """Check RAM, NVENC sessions and disk against the ACTUAL camera count.
+
+        False means refuse to start. Cheap arithmetic plus a cached NVENC session
+        probe, so it costs nothing per recording after the first.
+        """
+        p = self._profile
+        realtime = bool(getattr(p, "realtime_encode", True))
+        kick = realtime and bool(getattr(p, "realtime_kick", False))
+        # Mirrors grab_thread: the kick-mode ring must outlast a frame's whole
+        # journey (coordinator up to max_lag, then the encoder queue).
+        ring_n = ((p.kick_max_lag + ENCODE_QUEUE_DEPTH + 64) if kick
+                  else (ENCODE_QUEUE_DEPTH + 4))
+        try:
+            blocking, warnings = check_capacity(
+                n_cams=self._camera_mgr.num_cameras,
+                width=p.frame_width, height=p.frame_height,
+                ring_n=ring_n, max_num_buffer=MAX_NUM_BUFFER,
+                realtime=realtime, output_dir=self._sidebar.output_dir,
+                fps=p.frame_rate)
+        except Exception as e:
+            # A broken preflight must never be what stops a recording.
+            print(f"[acq] capacity preflight failed to run: {e}", flush=True)
+            return True
+        for w in warnings:
+            print(f"[acq] capacity warning: {w}", flush=True)
+        if blocking:
+            print("[acq] REFUSING to start:\n  " + "\n  ".join(blocking), flush=True)
+            QMessageBox.critical(
+                self, "Cannot start",
+                "\n\n".join(blocking)
+                + ("\n\nWarnings:\n- " + "\n- ".join(warnings) if warnings else ""))
+            return False
+        if warnings:
+            reply = QMessageBox.warning(
+                self, "Proceed?", "\n\n".join(warnings) + "\n\nStart anyway?",
+                QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+            if reply == QMessageBox.No:
+                return False
+        return True
+
     def _start_acquisition(self, acq_type: str):
+        # Refuse to start on top of a live or still-finalising acquisition. The
+        # sidebar already disables the toggles while busy, so a user cannot
+        # reach this — but any programmatic path that bypasses the widget starts
+        # a SECOND acquisition whose state the machine then loses track of
+        # (proven 2026-08-11: cameras kept streaming while _state read IDLE).
+        if self._state != State.IDLE or self._busy:
+            print(f"[acq] refusing start: state={self._state.value} "
+                  f"busy={self._busy}", flush=True)
+            self._sidebar.clear_toggles_silently()
+            return
+
+        # Capacity preflight. Every limit here scales linearly with camera
+        # count, and each one currently fails SILENTLY — a camera dropping to
+        # raw.bin because the driver's NVENC session cap was hit, a MemoryError
+        # inside a grab thread, or a disk filling mid-session. Refuse up front
+        # instead of half-recording.
+        # A stim graph on a camera trigger pin injects extra rising edges into
+        # ONE camera, so its block IDs advance faster and block-ID N stops
+        # meaning the same instant everywhere — which frame_sync, alignment.py
+        # and stim_trace all take as given. Apply and Test were gated; Record was
+        # not, and Record is the one that produces data.
+        if self._stim_window is not None:
+            blocker = self._stim_window.record_blocker()
+            if blocker:
+                print(f"[acq] refusing start, stim workflow: {blocker}", flush=True)
+                QMessageBox.critical(self, "Cannot record with this stim workflow",
+                                     blocker)
+                self._sidebar.reset_toggles()
+                return
+
+        if not self._preflight_capacity():
+            # reset_toggles(), not the silent variant: we are at IDLE here, so
+            # letting the signal fire is a genuine no-op for the state machine
+            # (_on_record_toggle only acts when state == RECORDING) while still
+            # reversing the thumb animation and re-enabling the sibling toggle.
+            self._sidebar.reset_toggles()
+            return
+
         self._config = self._build_config()
         self._acq_type = acq_type
         video_dir = self._config.video_dir(acq_type)
 
+        # blockids/frametimes/aligned count as data too: a directory whose mp4s
+        # were moved away for labelling still holds the metadata that makes them
+        # interpretable, and without these patterns it reads as empty and gets
+        # silently overwritten.
         has_data = video_dir.exists() and any(
             next(video_dir.rglob(pat), None) is not None
-            for pat in ("*.mp4", "raw.bin", "stream.h264"))
+            for pat in ("*.mp4", "raw.bin", "stream.h264",
+                        "blockids.npy", "frametimes.npy", "alignment.npz"))
         if has_data:
             reply = QMessageBox.question(
                 self, "Overwrite?",
@@ -304,14 +461,24 @@ class MainWindow(QMainWindow):
                 return
 
         self._video_dir = video_dir
+        # Session-level warnings from a PREVIOUS run into this directory would
+        # otherwise sit beside a clean recording and be believed months later.
+        try:
+            (video_dir / "WARNINGS.txt").unlink(missing_ok=True)
+        except OSError:
+            pass
+        self._capture_warnings = []
         for cam in self._camera_names:
             cam_dir = self._video_dir / cam
             cam_dir.mkdir(parents=True, exist_ok=True)
             # Remove stale capture artifacts from a previous run in this dir —
             # a leftover raw_tail.bin would otherwise be appended to the NEW
             # recording's stream at stop.
+            # WARNINGS.txt is swept too: it is the only durable trace of a
+            # block-ID reconciliation, so a stale one left beside a clean
+            # recording is exactly what someone would trust months later.
             for stale in ("raw.bin", "raw_tail.bin", "stream.h264",
-                          "tail.h264", "encode_error.log"):
+                          "tail.h264", "encode_error.log", "WARNINGS.txt"):
                 try:
                     (cam_dir / stale).unlink(missing_ok=True)
                 except OSError:
@@ -336,7 +503,17 @@ class MainWindow(QMainWindow):
             raw_paths, display_every=display_every,
             realtime=rt, width=self._config.frame_width,
             height=self._config.frame_height, quality=self._config.quality,
-            fps=fps, realtime_kick=kick, kick_max_lag=self._config.kick_max_lag)
+            fps=fps, realtime_kick=kick, kick_max_lag=self._config.kick_max_lag,
+            # Calibration gets its own exposure/gain when the profile sets them;
+            # a recording passes None, which RESTORES the .pfs values. Restoring
+            # rather than re-deriving is what guarantees a long calibration
+            # exposure can never leak into a 100 fps session, where it would
+            # silently halve the frame rate.
+            exposure_us=(self._config.calibration_exposure_us or None
+                         if acq_type == "calibration" else None),
+            gain_db=(self._config.calibration_gain_db
+                     if acq_type == "calibration"
+                     and self._config.calibration_gain_db >= 0 else None))
 
         teensy = self._teensy_connection()
         if teensy is None:
@@ -434,6 +611,77 @@ class MainWindow(QMainWindow):
             self._stim_end_timer = None
 
     # ── shared trigger-board link ─────────────────────────────────────────────
+    def _ensure_clean_firmware(self):
+        """Put the board back to the recording-only sketch at every launch.
+
+        A paradigm lives in the Arduino's FLASH, so it survives closing the GUI,
+        power cycles and USB unplugs — while the canvas comes up empty and
+        nothing can read the firmware back over serial. That combination means a
+        blank-looking editor over a fully armed board, and Record would then
+        fire a paradigm nobody chose. Stim is therefore opt-in per session:
+        unless it was Applied since this launch, the board carries no stim.
+
+        Flashing takes ~30 s, so the SHA of whatever we last uploaded is kept in
+        QSettings: if the board already has the recording-only sketch we skip.
+        The slow path is only hit on the first launch after a session that used
+        stim, which is exactly when it is worth paying for.
+
+        Runs BEFORE _warm_serial: arduino-cli needs the port to itself.
+        """
+        from PyQt5.QtCore import QSettings
+        self._settings = QSettings("Salk", "Panopticon")
+        try:
+            from gui_app import stim_compiler
+            blank = stim_compiler.recording_only_sketch(
+                self._profile.stim_safe_pins, self._profile.trigger_pins)
+            self._pending_sha = stim_compiler.sketch_sha(blank)
+        except Exception as e:
+            print(f"[acq] could not build the recording-only sketch: {e}", flush=True)
+            self._warm_serial()
+            return
+
+        if self._settings.value("board_sketch_sha", "", type=str) == self._pending_sha:
+            print("[acq] board already carries the recording-only sketch "
+                  "(no stim); skipping flash", flush=True)
+            self._warm_serial()
+            return
+
+        print("[acq] board may carry a stim paradigm from a previous session — "
+              "flashing the recording-only sketch", flush=True)
+        self._begin_busy("Clearing stim firmware…")
+        port = self._profile.serial_port
+        self._fw_op = CallableWorker(
+            lambda: __import__("gui_app.stim_compiler", fromlist=["upload"])
+            .upload(blank, port))
+        self._fw_op.done.connect(self._on_clean_firmware_done)
+        self._fw_op.start()
+
+    def _on_clean_firmware_done(self, result):
+        self._end_busy()
+        # _end_busy() restores the cursor and re-enables the UI but deliberately
+        # leaves the status text alone, because most callers replace it with a
+        # new state. This one has no new state to show, so it must put the
+        # sidebar back to IDLE itself — otherwise "Clearing stim firmware…"
+        # stays on screen for the rest of the session.
+        self._sidebar.set_status("IDLE", "#888")
+        ok, msg = result if isinstance(result, tuple) else (False, str(result))
+        if ok:
+            self._settings.setValue("board_sketch_sha", self._pending_sha)
+            print("[acq] board flashed with the recording-only sketch; stim is "
+                  "off until you Apply one", flush=True)
+        else:
+            # Do NOT record the SHA — we do not know what the board holds, and
+            # claiming it is clean would be worse than saying nothing.
+            print(f"[acq] could not clear stim firmware: {msg}", flush=True)
+            QMessageBox.warning(
+                self, "Could not clear stim firmware",
+                "Panopticon could not reflash the trigger board, so it may "
+                "still be carrying a stimulation paradigm from a previous "
+                "session — including one that loops and never ends.\n\n"
+                "Open Stimulation and press Apply (an empty canvas is fine) "
+                "before recording, or key off the laser.\n\n" + msg)
+        self._warm_serial()
+
     def _warm_serial(self):
         """Claim the port at startup so the board's reset lands here.
 
@@ -470,7 +718,22 @@ class MainWindow(QMainWindow):
 
     def _rollback_acquisition(self, message: str):
         """Undo a half-started acquisition. The cameras are already grabbing in
-        trigger mode, so without this they sit waiting for triggers forever."""
+        trigger mode, so without this they sit waiting for triggers forever.
+
+        Stand the BOARD down first, before the cameras. This runs from the
+        `start_triggers() == False` branch, which is precisely the case where the
+        board may have consumed the config, begun triggering and run initStim()
+        but failed to ack — so a stim paradigm (and the laser pin) can be live
+        right now. Rolling back only the cameras leaves it running while the GUI
+        returns to IDLE showing "did not acknowledge", which reads to the user as
+        "nothing happened".
+        """
+        if self._teensy is not None:
+            if not self._teensy.stop_triggers(self._profile.trigger_pins):
+                message += ("\n\nWARNING: the trigger board did not accept the stop "
+                            "command. It may still be triggering and any stim "
+                            "paradigm may still be running. Power-cycle the board "
+                            "and key off the laser before continuing.")
         self._camera_mgr.stop_acquisition()
         self._camera_mgr.resume_preview()
         self._sidebar.reset_toggles()
@@ -517,7 +780,10 @@ class MainWindow(QMainWindow):
         self._cancel_stim_autostop()
         # Stop the triggers but KEEP the port open: reopening it would reset the
         # board at the start of the next recording and flash a connected laser.
-        self._teensy.stop_triggers(self._profile.trigger_pins)
+        # This is the everyday stop — the one taken every session — so it is the
+        # path where a swallowed failure matters most, not least.
+        self._warn_if_not_stood_down(
+            self._teensy.stop_triggers(self._profile.trigger_pins))
 
         self._stop_coverage_hud()
         if self._detector is not None and self._detector.codet_frames:
@@ -545,6 +811,38 @@ class MainWindow(QMainWindow):
 
     def _on_acquisition_finalized(self, _result):
         self._end_busy()
+        # CallableWorker delivers a raised exception AS the result
+        # (ui_workers.py:22-25), and this slot used to ignore its argument. So if
+        # _finalize raised — a full disk at np.save, anything inside
+        # _router.stop() — camera_manager.stop_acquisition() never reached
+        # `self._router = None`, the encoder threads never got their sentinel and
+        # blocked forever holding NVENC sessions, and the GUI marched on to
+        # ENCODING and remuxed an unflushed stream.h264, then deleted the source.
+        # Silently. _apply_camera_open_result already does this check; the
+        # pattern was understood and simply not applied here.
+        # Capture-side problems (a retired camera, block-ID truncation) reach
+        # the operator here or not at all: camera_manager drops the router right
+        # after reading them.
+        self._capture_warnings = list(getattr(self._camera_mgr, "last_warnings", []))
+        if isinstance(_result, Exception):
+            print(f"[acq] FINALIZE FAILED: {type(_result).__name__}: {_result}",
+                  flush=True)
+            try:
+                self._camera_mgr.abandon()
+            except Exception as e:
+                print(f"[acq] abandon after failed finalize also failed: {e}",
+                      flush=True)
+            self._state = State.IDLE
+            self._sidebar.set_status("IDLE", "#888888")
+            self._sidebar.set_toggles_enabled(True)
+            self._sidebar.reset_toggles()
+            QMessageBox.critical(
+                self, "Recording did not finish cleanly",
+                f"Saving the recording failed:\n\n{type(_result).__name__}: "
+                f"{_result}\n\nThe raw capture files are still in:\n"
+                f"{self._video_dir}\n\nThey have NOT been encoded or deleted. Do "
+                f"not start another recording into that directory.")
+            return
         self._state = State.ENCODING
         self._sidebar.set_status("ENCODING", "#ffaa00")
         self._sidebar.set_toggles_enabled(False)
@@ -642,16 +940,46 @@ class MainWindow(QMainWindow):
         min_frames = min(frame_counts) if frame_counts else 0
         max_frames = max(frame_counts) if frame_counts else 0
         count_str = str(min_frames) if min_frames == max_frames else f"{min_frames}-{max_frames}"
-        self.statusBar().showMessage(
-            f"{self._acq_type.title()} encoded: {count_str} frames, {avg_fps:.1f} fps")
 
-        # With realtime_kick the coordinator already guarantees every camera
-        # encodes the same triggers — no post-hoc alignment needed. Without
-        # kick-out, cameras may have dropped different frames independently, so
-        # block-ID alignment re-encodes to the common subset.
-        if (self._config.realtime_encode
-                and not self._config.realtime_kick
-                and self._start_alignment()):
+        # Build the summary from ALL cameras, not just the ones that worked.
+        # Skipping failures meant "encoded: 6022 frames" could describe a
+        # session where two of nine cameras produced no video at all.
+        failed = [cam for cam, _n, ok in results if not ok]
+        status = (f"{self._acq_type.title()} encoded: {count_str} frames, "
+                  f"{avg_fps:.1f} fps"
+                  + (f"  —  {len(failed)} CAMERA(S) FAILED: {', '.join(failed)}"
+                     if failed else ""))
+        self.statusBar().showMessage(status)
+
+        problems = list(getattr(self, "_capture_warnings", []))
+        if failed:
+            problems.append(
+                f"{len(failed)} camera(s) produced no usable video: "
+                f"{', '.join(failed)}. Their source files were KEPT rather than "
+                f"deleted — look for raw.bin / stream.h264 and encode_error.log "
+                f"in those camera directories.")
+        if problems:
+            # Write it down as well as showing it: a dialog is dismissed and
+            # forgotten, and this is exactly what someone needs months later
+            # when the data looks odd.
+            warnings_path = self._video_dir / "WARNINGS.txt"
+            body = "\n\n".join(problems)
+            try:
+                warnings_path.write_text(body + "\n", encoding="utf-8")
+            except Exception as e:
+                print(f"[acq] could not write WARNINGS.txt: {e}", flush=True)
+            QMessageBox.warning(
+                self, "Recording completed with problems",
+                f"{body}\n\nThis has also been written to:\n{warnings_path}")
+
+        # Kick-out normally guarantees every camera encoded the same triggers,
+        # so alignment is skipped. But a retirement or a truncation breaks that
+        # guarantee mid-recording — those videos are NOT equal-length, and
+        # skipping the one pass that would trim them to the common set leaves
+        # them permanently disjoint. _start_alignment() no-ops when the videos
+        # already agree, so running it here costs nothing in the normal case.
+        needs_align = (not self._config.realtime_kick) or bool(problems)
+        if self._config.realtime_encode and needs_align and self._start_alignment():
             return
         self._finish_to_idle()
 
@@ -709,6 +1037,17 @@ class MainWindow(QMainWindow):
         if self._state != State.IDLE:
             self.statusBar().showMessage("Solve unavailable while acquiring/encoding")
             return
+        # A solve takes 4-5 minutes and never changes _state, so the guard above
+        # does not cover a second click — and the only feedback is a status-bar
+        # message, which makes a second click likely. That click would rebind
+        # self._calib_worker below, dropping the ONLY Python reference to a
+        # running QThread: sip deletes the C++ object underneath it and Qt calls
+        # qFatal("QThread: Destroyed while thread is still running"), which
+        # sys.excepthook cannot intercept. Instant process death, mid-solve.
+        # (Two solves would also race on the same calibration.toml.)
+        if self._calib_worker is not None and self._calib_worker.isRunning():
+            self.statusBar().showMessage("A solve is already running")
+            return
         config = self._build_config()
         calib_dir = config.video_dir("calibration")
 
@@ -731,6 +1070,9 @@ class MainWindow(QMainWindow):
 
         self._sidebar.set_status("CALIBRATING...", "#aa88ff")
         self._sidebar.set_toggles_enabled(False)
+        # set_toggles_enabled touches only the two toggles, not the Solve button
+        # (sidebar.py:341-343), so disable it explicitly for the duration.
+        self._sidebar.set_solve_enabled(False)
         self.statusBar().showMessage("Running sleap-anipose calibration...")
 
         self._calib_worker = CalibrationWorker(
@@ -741,6 +1083,7 @@ class MainWindow(QMainWindow):
 
     def _on_calibration_done(self, success: bool, msg: str):
         self._sidebar.set_toggles_enabled(True)
+        self._sidebar.set_solve_enabled(True)
         self._sidebar.set_status("IDLE", "#888")
         if success:
             config = self._build_config()
@@ -795,6 +1138,7 @@ class MainWindow(QMainWindow):
                 get_fps=lambda: self._profile.frame_rate,
                 is_busy=lambda: self._state in (State.RECORDING, State.CALIBRATING),
                 get_safe_pins=lambda: self._profile.stim_safe_pins,
+                get_trigger_pins=lambda: self._profile.trigger_pins,
                 get_serial=self._teensy_connection,
                 release_serial=self.release_serial_port,
                 parent=self,
@@ -806,8 +1150,16 @@ class MainWindow(QMainWindow):
         QMessageBox.critical(self, "Error", msg)
 
     def _workers_running(self) -> bool:
+        # _cam_op and _coverage_worker are usually masked by self._busy, but the
+        # stim editor's upload is NOT: an Apply runs with _state IDLE and _busy
+        # False, so quitting during a ~30 s arduino-cli flash would destroy a
+        # running QThread and can kill avrdude mid-write — leaving a Mega with
+        # no allStimLow() boot guard, i.e. a laser pin floating on next power-up.
+        if self._stim_window is not None and self._stim_window.is_uploading():
+            return True
         return any(w is not None and w.isRunning() for w in
-                   (self._encode_worker, self._align_worker, self._calib_worker))
+                   (self._encode_worker, self._align_worker, self._calib_worker,
+                    self._cam_op, self._coverage_worker))
 
     def closeEvent(self, event):
         # Quitting mid-session can't be finalized — confirm, then ABANDON the
@@ -833,10 +1185,15 @@ class MainWindow(QMainWindow):
         try:
             if self._teensy is not None:
                 if self._teensy.is_open:
-                    self._teensy.stop_triggers(self._profile.trigger_pins)
+                    # Warn BEFORE the window goes, while there is still something
+                    # to show the dialog on. `is_open` is not proof of anything:
+                    # pyserial keeps it True after the USB device disappears, so
+                    # an unplugged cable looks healthy right up until the write.
+                    self._warn_if_not_stood_down(
+                        self._teensy.stop_triggers(self._profile.trigger_pins))
                 self._teensy.close()
-        except Exception:
-            pass
+        except Exception as e:
+            print(f"[quit] standing the board down failed: {e}", flush=True)
 
         if busy:
             self._abandon_and_cleanup()
@@ -863,14 +1220,28 @@ class MainWindow(QMainWindow):
                     pass
         except Exception:
             pass
-        try:
-            self._camera_mgr.abandon()
-        except Exception:
-            pass
+        # Wait for the workers BEFORE tearing the cameras down. abandon() calls
+        # StopGrabbing()/Close() on every InstantCamera from the Qt main thread,
+        # while _cam_op is the thread running _finalize — possibly inside
+        # _router.stop() or resume_preview(). Two threads making native pylon
+        # calls on the same device is an access violation, not an exception, so
+        # excepthook cannot save us. Killing the child processes above is what
+        # lets these waits actually return.
         for w in (self._cam_op, self._encode_worker, self._align_worker,
-                  self._calib_worker):
+                  self._calib_worker, self._coverage_worker):
             if w is not None and w.isRunning():
                 w.wait(3000)
+        if self._cam_op is not None and self._cam_op.isRunning():
+            # Still inside pylon after 3 s. Leaking the camera handles costs
+            # nothing at process exit; closing them under a live native call
+            # crashes. Skip the teardown entirely.
+            print("[quit] _cam_op still running — leaking camera handles rather "
+                  "than closing under a live pylon call", flush=True)
+        else:
+            try:
+                self._camera_mgr.abandon()
+            except Exception as e:
+                print(f"[quit] abandon failed: {e}", flush=True)
         if delete_data and self._video_dir and Path(self._video_dir).exists():
             shutil.rmtree(self._video_dir, ignore_errors=True)
             print(f"[quit] deleted incomplete session data: {self._video_dir}", flush=True)

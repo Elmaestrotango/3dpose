@@ -806,6 +806,7 @@ class StimulationWindow(QDialog):
                  is_busy: Callable[[], bool] = lambda: False,
                  get_safe_pins: Callable[[], list] = lambda: list(
                      stim_compiler.DEFAULT_SAFE_LOW_PINS),
+                 get_trigger_pins: Callable[[], list] = lambda: [],
                  get_serial: Callable[[], object] = lambda: None,
                  release_serial: Callable[[], None] = lambda: None,
                  parent=None):
@@ -815,6 +816,10 @@ class StimulationWindow(QDialog):
         self._get_fps        = get_fps
         self._is_busy        = is_busy
         self._get_safe_pins  = get_safe_pins
+        # Needed to refuse a stim chain on a camera trigger line, which would
+        # silently break cross-camera block-ID alignment. Defaults to empty so a
+        # bare editor still works, but main_window MUST pass the profile's pins.
+        self._get_trigger_pins = get_trigger_pins
         self._get_serial     = get_serial
         self._release_serial = release_serial
         self._test_owns_serial = False
@@ -1026,7 +1031,8 @@ class StimulationWindow(QDialog):
 
     def _compile(self) -> str:
         blocks, edges = self._canvas.get_workflow()
-        return stim_compiler.compile_ino(blocks, edges, self._get_safe_pins())
+        return stim_compiler.compile_ino(blocks, edges, self._get_safe_pins(),
+                                         self._get_trigger_pins())
 
     def _blocking_problem(self) -> str | None:
         """Reason this workflow must not be uploaded or run, or None."""
@@ -1035,6 +1041,15 @@ class StimulationWindow(QDialog):
         if needs:
             return (f"{len(needs)} block(s) form a loop with no starting block, "
                     f"so they would never run.\n\nSelect one and tick 'Starting'.")
+        # Refuse before compile_ino raises, so the user gets an explanation
+        # rather than a traceback. This is the only known way to silently break
+        # the rig's core assumption that block ID N is the same instant on every
+        # camera, so it blocks Apply, Test and Record.
+        bad = stim_compiler.forbidden_pin_uses(blocks, self._get_trigger_pins())
+        if bad:
+            return "\n\n".join(
+                [f"Pin {p} cannot carry a stim waveform: {why}." for p, why in bad]
+                + ["Move the block to a free pin."])
         clash = stim_compiler.pin_conflicts(blocks, edges)
         if clash:
             pins = ", ".join(str(p) for p in clash)
@@ -1044,10 +1059,39 @@ class StimulationWindow(QDialog):
                     f"pin, or merge them into a single chain.")
         return None
 
+    def is_uploading(self) -> bool:
+        """True while arduino-cli is compiling/flashing the board.
+
+        An Apply runs with the main window at IDLE and not busy, so nothing else
+        knows it is happening. Quitting during the ~30 s flash would destroy a
+        running QThread and can kill avrdude mid-write, leaving the Mega with no
+        `allStimLow()` boot guard — a laser pin floating on the next power-up.
+        """
+        return (self._upload_worker is not None
+                and self._upload_worker.isRunning())
+
+    def record_blocker(self) -> str | None:
+        """Reason a RECORDING must not start with this workflow, or None.
+
+        Record does not compile anything — it runs whatever is already on the
+        board — so this was never gated, and only Apply (:1159) and Test (:1219)
+        consulted _blocking_problem. But the canvas is what `stim_paradigm.json`
+        and `stim_trace.csv` describe, and a graph containing a forbidden pin
+        means the .ino on the board may be driving a camera trigger line, which
+        silently breaks the block-ID identity every downstream consumer assumes.
+        CLAUDE.md already claims Record warns here; this makes that true.
+        """
+        return self._blocking_problem()
+
     def provenance(self) -> dict:
         """Everything needed to reconstruct what the animal actually received."""
         blocks, edges = self._canvas.get_workflow()
-        ino = stim_compiler.compile_ino(blocks, edges, self._get_safe_pins())
+        # Must pass trigger_pins, same as _compile(). Otherwise the two compile
+        # calls disagree: this one succeeds on a forbidden-pin graph while
+        # firmware_source() raises, so stim_paradigm.json gets written and the
+        # .ino beside it does not — a half-described session.
+        ino = stim_compiler.compile_ino(blocks, edges, self._get_safe_pins(),
+                                        self._get_trigger_pins())
         # None = nothing was uploaded this session, so the GUI cannot know what
         # the board is running (it survives app restarts).
         matches = None if self._uploaded_ino is None else (ino == self._uploaded_ino)
@@ -1083,7 +1127,14 @@ class StimulationWindow(QDialog):
     # ── create ────────────────────────────────────────────────────────────────
     def _on_create(self):
         try:
-            pin  = int(self._f_pin.text()   or "0")
+            # No default for the pin. Coercing a blank field to "0" silently
+            # created a block on pin 0 = UART RX0, which garbles the link to the
+            # trigger board; and on a rig whose trigger pins start at 2 a
+            # mistyped pin is far better refused than guessed.
+            if not self._f_pin.text().strip():
+                self._set_status("Enter a pin number.", error=True)
+                return
+            pin  = int(self._f_pin.text())
             freq = float(self._f_freq.text() or "0")
             pw   = float(self._f_pw.text()   or "0")
             dur  = float(self._f_dur.text()  or "1")
@@ -1169,6 +1220,16 @@ class StimulationWindow(QDialog):
             QMessageBox.critical(self, "Upload failed", msg)
             return
         self._uploaded_ino = ino
+        # Record what the board now holds. main_window compares this at startup
+        # and reflashes the recording-only sketch when it does not match, which
+        # is what makes stim opt-in per session rather than sticky flash state.
+        try:
+            from PyQt5.QtCore import QSettings
+            QSettings("Salk", "Panopticon").setValue(
+                "board_sketch_sha", stim_compiler.sketch_sha(ino))
+        except Exception as e:
+            print(f"[stim] could not record the uploaded sketch hash: {e}",
+                  flush=True)
         # Retake the port straight away. Reopening resets the board, so letting
         # the next Record do it would put that flash back into the experiment;
         # here it lands during Apply, alongside the reset avrdude already did.
@@ -1269,8 +1330,14 @@ class StimulationWindow(QDialog):
         if self._test_timer is not None:
             self._test_timer.stop()
             self._test_timer = None
+        stopped = True
         if self._test_serial is not None:
-            self._test_serial.stop_triggers([])
+            # The most laser-exposed stop in the application: a bench Test drives
+            # the stim pin with no cameras and no recording, and a looping chain
+            # has no end time — this single write is the ONLY thing that stops
+            # it. Reporting "Test stopped." when the write failed is worse than
+            # not reporting at all.
+            stopped = self._test_serial.stop_triggers([])
             if self._test_owns_serial:      # never close the main window's link
                 self._test_serial.close()
             self._test_serial = None
@@ -1278,7 +1345,18 @@ class StimulationWindow(QDialog):
         self._test_end_at = None
         self._test_btn.setText("Test")
         self._apply_btn.setEnabled(True)
-        self._set_status(message)
+        if not stopped:
+            self._set_status("STOP NOT CONFIRMED — stim may still be running.",
+                             error=True)
+            QMessageBox.critical(
+                self, "Stim may still be running",
+                "The trigger board did not accept the stop command.\n\n"
+                "Any stim chain — including a looping one, which never ends on "
+                "its own — may still be driving its pin.\n\n"
+                "Power-cycle the trigger board and key off the laser before "
+                "continuing.")
+        else:
+            self._set_status(message)
 
     def closeEvent(self, event):
         if self._test_timer is not None:

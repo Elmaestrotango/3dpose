@@ -40,6 +40,10 @@ class FrameSyncCoordinator:
         self._wrap_off = [0] * self.n
         self._decided_upto = 0                # highest block ID whose fate is set
         self._retired = [False] * self.n      # cameras dropped from the align set
+        #: (cam_index, reason) for every retirement, in order. A retirement is
+        #: the difference between losing one camera and losing the session, so
+        #: it must reach the operator — not just stdout.
+        self.retired_reasons: list = []
         # stats
         self.released = 0                     # common frames passed to encoders
         self.released_triggers = 0            # triggers released (cam-count agnostic)
@@ -65,6 +69,7 @@ class FrameSyncCoordinator:
         if self._retired[cam]:
             return
         self._retired[cam] = True
+        self.retired_reasons.append((cam, reason))
         self._pending[cam].clear()
         print(f"[sync] cam{cam + 1} RETIRED from the alignment set: {reason}. "
               f"Remaining cameras stay aligned; this one's video ends here.",

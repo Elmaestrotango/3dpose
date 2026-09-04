@@ -53,36 +53,47 @@ class _CharucoEngine:
                 self._board.setLegacyPattern(True)
             self._params = aruco.DetectorParameters_create()
 
-    def count(self, gray):
-        """Number of ArUco *markers* of this board visible in the frame.
+    def detect(self, gray):
+        """Return (marker_count, centroid_xy_normalized) for a frame.
 
-        We count markers, NOT interpolated charuco corners, to match the
-        post-hoc calibration prescan (1_calibrate.py uses ``len(ids) >= 4``).
-        For oblique cameras the markers detect well even when corner
-        interpolation between them fails, so a charuco-corner count made the HUD
-        far stricter than the actual calibration-eligibility gate (e.g. cam1:
-        107 marker-frames vs only 28 charuco-corner-frames in one session).
+        centroid_xy is the mean of all detected marker corners, normalized to
+        [0, 1] by the frame dimensions. Returns (0, None) when nothing is found.
         """
         if gray is None:
-            return 0
+            return 0, None
         if gray.ndim == 3:
             gray = cv2.cvtColor(gray, cv2.COLOR_BGR2GRAY)
         if not gray.flags["C_CONTIGUOUS"]:
             gray = np.ascontiguousarray(gray)
+        h, w = gray.shape[:2]
         try:
             if self._new_api:
-                _ch_corners, _ch_ids, _m_corners, m_ids = self._detector.detectBoard(gray)
-                return 0 if m_ids is None else int(len(m_ids))
-            corners, ids, _ = cv2.aruco.detectMarkers(gray, self._dict, parameters=self._params)
-            return 0 if ids is None else int(len(ids))
+                _ch_corners, _ch_ids, m_corners, m_ids = self._detector.detectBoard(gray)
+            else:
+                m_corners, m_ids, _ = cv2.aruco.detectMarkers(
+                    gray, self._dict, parameters=self._params)
+            if m_ids is None or len(m_ids) == 0:
+                return 0, None
+            n = int(len(m_ids))
+            all_pts = np.concatenate([c.reshape(-1, 2) for c in m_corners])
+            cx = float(all_pts[:, 0].mean()) / max(w, 1)
+            cy = float(all_pts[:, 1].mean()) / max(h, 1)
+            return n, (cx, cy)
         except cv2.error:
-            return 0
+            return 0, None
+
+    def count(self, gray):
+        return self.detect(gray)[0]
 
 
 class BoardDetector:
+    GRID_ROWS = 2
+    GRID_COLS = 2
+    MIN_GRID_CELLS = 3  # out of 4
+
     def __init__(self, n_cams, board_config_path,
                  glow_threshold=4, edge_threshold=5,
-                 optimal_shared=200, min_edge=40, min_per_cam_shared=100,
+                 optimal_shared=200, min_edge=80, min_per_cam_shared=250,
                  glow_decay_s=0.4):
         self.n = int(n_cams)
         self.glow_threshold = glow_threshold
@@ -106,9 +117,16 @@ class BoardDetector:
         self.glow = np.zeros(n)
         self.shared = np.zeros((n, n), dtype=int)
         self.per_cam_covis = np.zeros(n, dtype=int)
+        self.grid_covered = np.zeros((n, self.GRID_ROWS, self.GRID_COLS), dtype=bool)
+        self.grid_cells_hit = np.zeros(n, dtype=int)
         self.ready = False
         self._last = time.perf_counter()
         self.codet_frames = []
+
+    def _centroid_to_cell(self, cx, cy):
+        r = min(int(cy * self.GRID_ROWS), self.GRID_ROWS - 1)
+        c = min(int(cx * self.GRID_COLS), self.GRID_COLS - 1)
+        return max(0, r), max(0, c)
 
     def update(self, frames, frame_counts=None):
         """Run one detection tick. If frame_counts (per-camera recorded frame
@@ -124,11 +142,16 @@ class BoardDetector:
         seen = []
         for i in range(self.n):
             fr = frames[i] if frames is not None and i < len(frames) else None
-            nc = self._engine.count(fr)
+            nc, centroid = self._engine.detect(fr)
             if nc >= self.glow_threshold:
                 self.glow[i] = 1.0
             if nc >= self.edge_threshold:
                 seen.append(i)
+                if centroid is not None:
+                    r, c = self._centroid_to_cell(*centroid)
+                    if not self.grid_covered[i, r, c]:
+                        self.grid_covered[i, r, c] = True
+                        self.grid_cells_hit[i] = int(self.grid_covered[i].sum())
 
         if len(seen) >= 2:
             for i in seen:
@@ -146,6 +169,9 @@ class BoardDetector:
 
     def _update_ready(self):
         if self.n == 0 or np.any(self.per_cam_covis < self.min_per_cam_shared):
+            self.ready = False
+            return
+        if np.any(self.grid_cells_hit < self.MIN_GRID_CELLS):
             self.ready = False
             return
         parent = list(range(self.n))

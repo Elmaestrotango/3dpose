@@ -342,6 +342,37 @@ class SidebarWidget(QWidget):
         self._calibrate_toggle.setEnabled(enabled)
         self._record_toggle.setEnabled(enabled)
 
+    def set_solve_enabled(self, enabled: bool):
+        """Enable/disable the Solve button independently of the toggles.
+
+        A solve runs 4-5 minutes without changing the app state, so it needs its
+        own gate: a second click would rebind the worker and drop the only
+        reference to a running QThread, which is an immediate qFatal.
+        """
+        self._run_calib_btn.setEnabled(enabled)
+
+    def clear_toggles_silently(self):
+        """Force both toggles off WITHOUT emitting — for refusing a start.
+
+        Emitting here would re-enter the stop path we are already guarding.
+
+        But blockSignals also suppresses the widget's OWN animation, because
+        ToggleSwitch wires `toggled -> _on_toggled` in its constructor
+        (toggle_switch.py:18). Unchecking alone therefore leaves the thumb
+        painted fully ON while isChecked() is False — an arm indicator that lies,
+        on a rig with a laser. Drive the animation by hand instead.
+
+        Deliberately does NOT touch enabled state: the only caller is the
+        non-IDLE guard, i.e. a real acquisition is in progress, and the state
+        machine owns which toggles are available then. The refuse-at-IDLE path
+        uses reset_toggles() instead, which restores enablement properly.
+        """
+        for t in (self._calibrate_toggle, self._record_toggle):
+            t.blockSignals(True)
+            t.setChecked(False)
+            t.blockSignals(False)
+            t._on_toggled(False)
+
     def stop_record(self):
         """Flip Record off programmatically — emits record_toggled like a click."""
         self._record_toggle.setChecked(False)
