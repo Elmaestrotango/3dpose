@@ -99,6 +99,45 @@ class RigProfile:
         return sorted(PROFILES_DIR.glob("*.yaml"))
 
 
+def _environment_metadata() -> dict:
+    """Host/GPU facts worth freezing into every recording.
+
+    Cheap, entirely best-effort, and never allowed to break saving metadata:
+    a session that failed to record its environment is still a session, but a
+    session whose environment is unknown is much harder to explain later.
+    """
+    import platform
+    import subprocess
+    import sys
+
+    env = {
+        "host": platform.node(),
+        "os": platform.platform(),
+        "python": sys.version.split()[0],
+    }
+    try:
+        r = subprocess.run(
+            ["nvidia-smi",
+             "--query-gpu=name,driver_version,memory.total",
+             "--format=csv,noheader"],
+            capture_output=True, text=True, timeout=10)
+        if r.returncode == 0 and r.stdout.strip():
+            name, driver, mem = [x.strip() for x in
+                                 r.stdout.strip().splitlines()[0].split(",")]
+            env.update(gpu=name, gpu_driver=driver, gpu_memory=mem)
+    except Exception:
+        pass
+    try:
+        from gui_app import hardware_check
+        # Cached from the acquisition preflight; do not probe again here.
+        n = getattr(hardware_check, "_nvenc_sessions", None)
+        if n is not None:
+            env["nvenc_sessions_available"] = n
+    except Exception:
+        pass
+    return env
+
+
 @dataclass
 class SessionConfig:
     date: str = ""
@@ -175,6 +214,13 @@ class SessionConfig:
 
     def save_metadata(self):
         now = datetime.now()
+        # NOTE: _environment_metadata() is folded in below. It records the GPU
+        # driver and the NVENC session count because both are *silent* failure
+        # sources that move underneath you: NVIDIA has changed the concurrent
+        # session cap across driver generations (2 -> 3 -> 5 -> 8 -> 12), and a
+        # driver update that lowers it below the camera count pushes cameras
+        # onto the raw fallback. Without this in the metadata, a session that
+        # breaks after a driver update is undiagnosable after the fact.
         meta = dict(
             date=self.date, session_id=self.session_id,
             mouse_1=self.mouse_1, mouse_2=self.mouse_2,
@@ -185,6 +231,7 @@ class SessionConfig:
             resolution=[self.frame_width, self.frame_height],
             time_of_day=now.strftime("%H:%M:%S"),
             timestamp_iso=now.isoformat(),
+            **_environment_metadata(),
         )
         self.session_dir.mkdir(parents=True, exist_ok=True)
         path = self.session_dir / "session_metadata.json"

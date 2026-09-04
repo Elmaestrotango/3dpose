@@ -106,9 +106,35 @@ class _EncoderThread(threading.Thread):
                             print(f"[enc{self._cam_index}] EndEncode failed: {e}", flush=True)
                     return
                 if spill_fd is not None:
-                    os.write(spill_fd, nv12[:self._height])  # Y plane = gray
-                    self.spilled += 1
+                    # Guarded, unlike a normal write: this is the ALREADY
+                    # degraded path, and it is the one place where a partial
+                    # write corrupts everything after it. raw_tail.bin is read
+                    # back as fixed-size w*h frames, so a short write shears
+                    # every subsequent frame while `spilled` keeps counting them
+                    # as good. Disk-full is the realistic trigger — the capacity
+                    # preflight budgets ~4.6 KB/frame for H.264, and this path
+                    # writes the full 2.3 MB plane.
+                    try:
+                        plane = nv12[:self._height]
+                        n = os.write(spill_fd, plane)
+                        if n != plane.nbytes:
+                            raise OSError(
+                                f"short write: {n} of {plane.nbytes} bytes "
+                                f"(disk full?)")
+                        self.spilled += 1
+                    except Exception as e:
+                        print(f"[enc{self._cam_index}] RAW SPILL WRITE FAILED "
+                              f"after {self.spilled} frames: {e}. Stopping the "
+                              f"spill rather than writing a sheared tail — "
+                              f"frames from here on are LOST.", flush=True)
+                        try:
+                            os.close(spill_fd)
+                        except Exception:
+                            pass
+                        spill_fd = -1        # sentinel: spill is dead, drop frames
                     continue
+                if spill_fd == -1:
+                    continue                 # spill failed; nothing to do but drop
                 try:
                     bs = self._enc.Encode(nv12)
                     if bs:
@@ -132,8 +158,12 @@ class _EncoderThread(threading.Thread):
                     os.write(spill_fd, nv12[:self._height])
                     self.spilled += 1
         finally:
-            if spill_fd is not None:
-                os.close(spill_fd)
+            # -1 is the "spill died and was already closed" sentinel.
+            if spill_fd is not None and spill_fd != -1:
+                try:
+                    os.close(spill_fd)
+                except Exception:
+                    pass
 
 
 class GrabThread(QThread):
@@ -650,6 +680,17 @@ class GrabThread(QThread):
                     print(f"[grab{self._cam_index}] encoder thread did not exit (GPU stall?)", flush=True)
                 else:
                     print(f"[grab{self._cam_index}] encoded={enc_thread.encoded} spilled={enc_thread.spilled}", flush=True)
+                    # Hand the NVENC session back explicitly. This is the
+                    # non-kick real-time path, which relies on refcounting
+                    # otherwise — and refcounting fails in exactly the case that
+                    # matters, when the join times out and the thread object
+                    # stays reachable. This path is also the fallback used when
+                    # sessions are already scarce.
+                    try:
+                        enc_thread.release_encoder()
+                    except Exception as e:
+                        print(f"[grab{self._cam_index}] encoder release failed: "
+                              f"{e}", flush=True)
             if h264_fd is not None:
                 os.close(h264_fd)
             if fd is not None:
