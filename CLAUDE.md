@@ -209,7 +209,10 @@ Plain scripts, no pytest — run directly:
   (confirmed / retry-after-reset / legacy firmware / regression). Stubs pyserial,
   so it needs no COM port. **Run this after touching `serial_controller.py`** —
   it is the guard against silently recording zero frames.
-- `python test_frame_sync.py` — kick-out coordinator == post-hoc intersection.
+- `python test_frame_sync.py` — kick-out coordinator == post-hoc intersection, plus the
+  block-ID rate check (test 10: clean camera, oscillator drift, 2:1 halving, the
+  1-in-100 partial skip, abstention on short clips, and IDs outrunning the trigger).
+  **Run after touching `frame_sync.py`.**
 - `python test_sync_router.py` — encoder router smoke test (needs NVENC).
 
 ## Conventions
@@ -355,6 +358,39 @@ Plain scripts, no pytest — run directly:
     encoder silently accepts a queue's worth and encodes none, which makes frame *i* of
     the mp4 map to the wrong trigger. `sync_encode.stop()` reconciles against
     `encoded + spilled` and writes `WARNINGS.txt` on a mismatch.
+- **BlockID == trigger ordinal is an AXIOM, and one failure mode falsifies it silently
+  (guarded 2026-09-04).** A BlockID counts frames the camera *acquired*, not triggers
+  the board *fired*. A camera over the exposure ceiling is still busy when the next
+  pulse arrives and **ignores** it — no frame, so no ID consumed — and from then on its
+  block ID N is trigger N+k. This is categorically different from every other loss mode
+  because it leaves **no gap in `blockids.npy`**: the IDs stay contiguous, the frame
+  count still matches the other cameras (only common IDs are kept), and
+  `Buffer_Underrun_Count` / `Failed_Buffer_Count` / `forced` all stay at zero. So
+  `_advance()` (which compares block IDs and nothing else), the post-hoc intersection,
+  and `stim_trace`'s `t = (blockid-1)/fps` all agree on an answer that is wrong, and the
+  videos drift apart in time while looking perfect. It is the one failure that presents
+  as success.
+  - **The guard**: the device timestamp is a free-running hardware clock, independent of
+    the block-ID counter, so over any span block IDs must advance at the trigger rate.
+    `frame_sync.check_block_id_rate()` + `block_rate_warnings()`; called from
+    `sync_encode.stop()` and from `alignment.align_recording()` — the latter **before**
+    the `needs_alignment` early return, because "already aligned" is exactly what this
+    failure reports. Also reachable retroactively via `uv run 2_align.py <rec_dir>`.
+    **Nothing was added to the hot path**: the timestamps were already collected.
+  - **`BLOCK_RATE_TOL = 0.003` is measured, not theoretical.** Across 74 camera-sessions
+    of real data (2026-06-12..09-03, 30 and 100 fps, including the 24% and 43% loss
+    sessions) the measured rate sits at **+220..+250 ppm** of configured — the fixed
+    offset between the Mega's resonator and the cameras' oscillators, in a band only
+    30 ppm wide. 0.3% is 12x the worst real sample and still catches a 1-in-100 skip.
+    **Do not widen it to 1%** — that was tried and lands exactly on the 1-in-100 case,
+    which is the case worth catching (a gross 2:1 halving is already loud via forced
+    drops and a halved release rate; the slow partial skip is the silent one).
+  - **All cameras off by the same amount is NOT this bug.** Cameras don't fail
+    identically, so that pattern means the reference is wrong: a profile `frame_rate`
+    that doesn't match the board, or a camera model that doesn't report device
+    timestamps in ns (`grab_thread` assumes 1e9; Basler ace does, hence
+    `GevTimestampTickFrequency` in the message). `block_rate_warnings()` says so
+    explicitly rather than blaming exposure N times.
 - **Cameras drop frames independently (GigE packet loss), so frame i is NOT the same
   trigger across cameras.** Every recorded frame is tagged with its GigE BlockID (=
   trigger ordinal) in `blockids.npy`. Two ways the videos are made trigger-aligned:
