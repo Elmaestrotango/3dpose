@@ -16,10 +16,14 @@ Rig-validated fixes layered on top of the original PR (all on master):
 - **`board_legacy: true`** in the board config — the physical 3dpose board uses
   the pre-OpenCV-4.6 ChArUco layout; without `setLegacyPattern(True)` the ≥4.7
   `CharucoDetector` returns 0 corners silently. Defaults false for other boards.
-  **`1_calibrate.py` pins `opencv-contrib-python>=4.7`** because of this: it is a
-  PEP 723 script, so uv re-resolves it freely, and OpenCV moved
-  `CharucoBoard.chessboardCorners` (attribute) to `getChessboardCorners()`
-  (method) across the 4.6/4.7 line. A `>=4.6` floor let uv land on either side —
+  **`opencv-contrib-python>=4.7` is pinned in `pyproject.toml`** because of this.
+  It used to be pinned in `1_calibrate.py`'s PEP 723 header, back when that
+  script resolved its own environment and uv could re-resolve it freely; the
+  header was removed 2026-09-03 so the solve runs in the project env and works
+  OFFLINE, and the floor moved to `pyproject.toml` with it. The floor matters
+  because OpenCV moved `CharucoBoard.chessboardCorners` (attribute) to
+  `getChessboardCorners()` (method) across the 4.6/4.7 line. A `>=4.6` floor let
+  uv land on either side —
   4.6 crashed on the accessor (seen 2026-07-27) and, worse, made the
   `hasattr(board, "setLegacyPattern")` guard no-op silently. Both call sites now
   go through `_apply_legacy_pattern()`, which raises rather than skip, and the
@@ -29,9 +33,14 @@ Rig-validated fixes layered on top of the original PR (all on master):
   than calibration eligibility and starved oblique cameras (cam1/cam4).
 - **`coverage_worker.py`** runs detection off the UI thread at ~30 Hz on full-res
   frames (`GrabThread.set_keep_full`).
-- **`encode_parallel`** profile field (default 3) caps concurrent NVENC jobs.
+- **`encode_parallel`** profile field (default 3) caps concurrent post-session
+  encode jobs — real NVENC jobs in raw mode, but stream-copy remuxes (no NVENC
+  session) in the default real-time mode.
 - READY requires three conditions: `min_per_cam_shared = 250` co-detection ticks
-  per camera, `min_edge = 80` per pair, AND `MIN_GRID_CELLS = 3` out of 4
+  per camera, a **connected coverage graph** where `min_edge = 80` co-detections
+  is what makes a PAIR count as an edge (one connected component is required,
+  NOT all 15 pairs — the board is one-sided, so opposed cameras can never
+  co-detect and a complete graph could never fill), AND `MIN_GRID_CELLS = 3` out of 4
   spatial grid cells covered per camera (prevents degenerate intrinsics from
   waving the board in one spot). The 2×2 grid divides each camera's FOV by the
   marker centroid and shows as a badge on each HUD node.
@@ -61,6 +70,19 @@ Non-obvious invariants — break these and the failure is silent or dangerous:
   upload, ~30 s). Record then just sends the normal start command and the
   paradigm runs from t=0. Test/Record warn when the canvas has drifted from the
   last upload.
+- **TWO sketches are held and swapped automatically per acquisition
+  (2026-09-03).** `_sketch_for(acq_type)` picks between a recording-only sketch
+  (`stim_compiler.recording_only_sketch()`) and the session's applied
+  stim sketch; `_ensure_sketch_for()` flashes only when the board is not already
+  holding the right one. Consequences worth not breaking:
+  - **Calibration ALWAYS gets the recording-only sketch, so calibration can
+    never activate stim.** This is a safety property, not a convenience.
+  - **Apply is only needed when the PARADIGM changes**, not per acquisition —
+    the swap between calibration and recording is automatic.
+  - `_session_stim_ino` is **session-scoped and never persisted**. Every launch
+    starts with a blank canvas and the recording-only sketch, so a paradigm can
+    never survive a restart. Stim is opt-in per launch, by explicit Apply.
+  - `_board_has_paradigm` was REMOVED as superseded — do not reintroduce it.
 - **No floating-point math in `updateStim()`.** Period and pulse width are
   resolved to integer microseconds by the compiler. An AVR float divide is ~30 µs
   and runs inside the trigger busy-wait, blunting the firmware's ±0.35 µs edge
@@ -213,11 +235,26 @@ Plain scripts, no pytest — run directly:
   block-ID rate check (test 10: clean camera, oscillator drift, 2:1 halving, the
   1-in-100 partial skip, abstention on short clips, and IDs outrunning the trigger).
   **Run after touching `frame_sync.py`.**
+- `uv run python test_grab_failure.py` — the five ways a grab thread must fail
+  LOUDLY rather than silently: padding, re-arm exhaustion, retirement. Needs
+  PyQt5, so it will not run on a bare python. **Run after touching
+  `grab_thread.py`.**
 - `python test_sync_router.py` — encoder router smoke test (needs NVENC).
 
 ## Conventions
 - New OpenCV dependency: `opencv-contrib-python` (run `uv sync`). The coverage
   HUD self-disables if OpenCV is missing, so the GUI still runs.
+- **`.gitignore` anchors `/_*.py` to the repo root — do NOT unanchor it.** Those
+  are the throwaway probe/analysis scripts, which all live at the root. As a bare
+  `_*.py` the glob ALSO matched `__init__.py`, which silently kept
+  `gui_app/backends/__init__.py` out of every commit and broke the package on a
+  fresh clone (`from gui_app.backends import load_backend` is executed at import
+  by both `camera_manager` and `grab_thread`, so the app would not start).
+  `gui_app/__init__.py` and `gui_app/widgets/__init__.py` predate the rule and
+  were already tracked, so they were immune — meaning only a NEW package can
+  trigger it and it looked harmless for months. `git add` skips ignored paths
+  without a word. `!**/__init__.py` is a second line of defence. **After adding
+  any new package, verify with `git ls-files "*__init__.py"`.**
 - **Exposure/gain live in the `.pfs`, and the exposure ceiling is ~3.9 ms at 100 fps.**
   In trigger mode the frame-rate timer starts *after* exposure ends, so the minimum
   interval is `exposure + 1/AcquisitionFrameRate`. `_set_trigger_mode()` hardcodes 165
@@ -334,6 +371,20 @@ Plain scripts, no pytest — run directly:
   remuxes to mp4 (`ffmpeg -c copy`). Inline encode starved GigE packet reassembly and
   dropped ~28% of frames — do NOT put work back on the grab loop's critical path. Deps:
   `PyNvVideoCodec`, `nvidia-cuda-runtime-cu12`.
+- **Camera vendor code is confined to `gui_app/backends/` (added 2026-09-03).**
+  `backends/__init__.py` defines the `CameraBackend` / `GrabResultProtocol`
+  contracts plus `load_backend(name)`; `backends/basler.py` holds every pypylon
+  cold-path call (enumerate, open, describe, extended block IDs, driver choice,
+  free-run/triggered setup, exposure/gain, stream stats). `camera_manager` and
+  `grab_thread` reach it only via `load_backend("basler")`. Porting to another
+  vendor means writing ONE new module beside `basler.py`.
+  - **The per-frame grab RESULT is deliberately NOT wrapped.** Not for call
+    overhead (~60 ns, irrelevant) but because the hot path's invariants — the
+    view's lifetime and the no-copy guarantee — are exactly what a wrapper
+    breaks. A wrapper that materialised the array would silently reintroduce
+    the copy that caused years of frame loss. Keep the protocol duck-typed.
+  - Do not `import pypylon` outside `backends/`. The whole point is that a
+    non-Basler rig fails in one place with a clear message.
 - **Grab-loop invariants (added 2026-09-03 — breaking any of these is silent).**
   - **Never write `result.Array` in the grab loop.** It is a GIL-held 2.3 MB memcpy
     (0.837 ms/frame/camera) and it was the root cause of years of frame loss. Use
