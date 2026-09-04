@@ -76,7 +76,7 @@ class SyncEncodeRouter:
             # every already-created session for an indeterminate time. The grab
             # threads then fall back to creating their own encoders — against
             # the same driver cap (12 here) — so at least one camera silently
-            # degrades to raw.bin at ~207 GB per 10 minutes with no disk guard.
+            # degrades to raw.bin at ~129 GiB per 10 minutes with no disk guard.
             # None of these threads were started, so releasing is safe.
             for et in self._encoders:
                 try:

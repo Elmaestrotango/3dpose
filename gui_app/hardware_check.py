@@ -163,8 +163,9 @@ def check_capacity(n_cams: int, width: int, height: int,
     Everything here scales linearly with camera count, which is why it exists:
     the numbers that were comfortable at 6 cameras are not at 9, and each of
     these limits currently fails SILENTLY — a camera dropping to `raw.bin`
-    (~207 GB/10 min for that camera alone), a MemoryError inside a grab thread,
-    or a disk filling mid-session.
+    (~129 GiB/10 min for that camera alone: raw.bin holds the mono8 frame, so
+    it is width*height bytes each, ~500x the H.264 size), a MemoryError inside
+    a grab thread, or a disk filling mid-session.
     """
     blocking: list[str] = []
     warnings: list[str] = []
@@ -197,13 +198,18 @@ def check_capacity(n_cams: int, width: int, height: int,
         got = nvenc_session_capacity(width, height, n_cams + 2)
         if got == 0:
             blocking.append("NVENC granted no encode sessions, so real-time "
-                            "encoding cannot start. Use the raw profile.")
+                            "encoding cannot start. To record anyway, set "
+                            "`realtime_encode: false` in the rig profile — that "
+                            "writes raw frames and encodes after the session, "
+                            "which needs ~500x the disk.")
         elif 0 < got < n_cams:
             blocking.append(
                 f"NVENC granted only {got} concurrent sessions but {n_cams} "
                 f"cameras need one each. The driver caps this. Cameras beyond "
                 f"the cap would silently fall back to raw.bin at ~{frame_b*fps/2**30*600:.0f} "
-                f"GiB per 10 min each. Use the raw profile, or record fewer cameras.")
+                f"GiB per 10 min each. Record fewer cameras, or set "
+                f"`realtime_encode: false` in the rig profile to put every "
+                f"camera on the raw path deliberately.")
 
     # --- disk ----------------------------------------------------------------
     # Real-time H.264 is ~4.6 KB/frame; raw is the full frame every frame.

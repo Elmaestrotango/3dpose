@@ -224,7 +224,14 @@ Plain scripts, no pytest — run directly:
   for BOTH rigs (1/165 = 6.06 ms), so exposure past ~3.94 ms pushes the interval over
   the 10 ms trigger period and every second trigger is skipped — the 50 fps bug. The
   3dface pfs says `AcquisitionFrameRate 1000000`, but code overrides it, so the same
-  ceiling applies there. Code never sets ExposureTime or Gain; the pfs is the only source.
+  ceiling applies there. **The pfs is the only SOURCE of a recording's exposure/gain, but
+  the code does write both** — `camera_manager.apply_exposure_gain()` runs on every
+  acquisition start (added 2026-09-03 for the calibration exposure). With
+  `exposure_us=None` (recording) it re-applies the pfs baseline captured at open, so a
+  calibration exposure can't leak in; with a value (calibration) it applies that. Either
+  way it **CLAMPS to `(1e6/fps - 1e6/limit) * 0.9`** and logs `CLAMPED from ...`. So the
+  effective exposure may be below the pfs value — read the `[cam1] exposure=...` line,
+  don't assume the pfs.
   - **Raised to 3000 µs + 6 dB (3.0×) from 2000 µs / 0 dB on 2026-08-11**, both rigs.
     The old values put 65% of pixels in levels 0–15 with **21.5% clipped at exactly 0** —
     destroyed at the ADC, unrecoverable by brightening in a player, and crushed further
