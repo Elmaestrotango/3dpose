@@ -1,7 +1,10 @@
 """Background worker that runs the ChArUco calibration solve via uv run.
 
-1_calibrate.py is a PEP 723 script with its own pinned dependency set, so it
-resolves into an isolated environment rather than the project venv.
+1_calibrate.py runs in the PROJECT environment. It used to carry PEP 723 inline
+metadata and resolve its own isolated environment, which meant a rig could
+install completely and still fail at its first solve with no network. Its
+requirements are in pyproject.toml now, so `uv sync` is a one-shot install and
+the solve works offline.
 """
 import subprocess
 import shutil
@@ -36,9 +39,10 @@ class CalibrationWorker(QThread):
             cmd.extend(["--board-config", self._board_config])
 
         try:
-            # Pass 1 alone takes ~4-5 min on a full session; the pass-2 prescan
-            # decodes every frame of every video, so give the 3-pass fallback
-            # chain real headroom before declaring it hung.
+            # Marker detection dominates the runtime and scales with video
+            # length x camera count, so a long session is minutes of real work
+            # before anything is solved. 30 minutes is headroom, not an
+            # estimate — it exists to distinguish "slow" from "hung".
             result = subprocess.run(
                 cmd, capture_output=True, text=True, timeout=1800,
             )
@@ -81,7 +85,11 @@ def _parse_calibration_error(stdout: str, stderr: str, returncode: int) -> str:
             if "no module named" in line.lower():
                 module = line.strip()
                 break
-        return f"Missing dependency:\n{module}\n\nTry: uv cache clean && uv run 1_calibrate.py"
+        return (f"Missing dependency:\n{module}\n\n"
+                f"The solve runs in the project environment, so this means the "
+                f"environment is incomplete rather than stale. Run `uv sync` in "
+                f"the repository folder to install everything pyproject.toml "
+                f"asks for, then try again.")
 
     if "singular matrix" in combined or "linalg" in combined:
         return (
