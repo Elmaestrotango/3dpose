@@ -6,7 +6,7 @@ frame_rate: 100
 calibration_frame_rate: 30   # calibration captures at this rate (no benefit to 100 fps for a slowly-waved board)
 quality: 21
 encode_parallel: 3           # concurrent NVENC jobs (raw mode) / .h264->mp4 remux jobs (realtime mode)
-realtime_encode: true        # GPU H.264 encode during capture (no raw.bin, no post-hoc pass). Select "3dpose (raw)" to fall back.
+realtime_encode: true        # GPU H.264 encode during capture (no raw.bin, no post-hoc pass). Set false for the raw fallback.
 realtime_kick: true          # default: real-time cross-camera frame kick-out — only frames every camera caught are encoded, so videos come out trigger-aligned with no post-hoc re-encode.
 kick_max_lag: 480            # Coordinator buffer, in frames. RAISED 2026-08-11 when one
                              # camera per session drifted to the cap and force-dropped

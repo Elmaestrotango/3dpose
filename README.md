@@ -164,9 +164,22 @@ Cameras should appear in the live preview grid at ~30 fps. If you see a hardware
 
 ### 8. Create a Desktop shortcut (optional)
 
-- Right-click Desktop > New > Shortcut
-- Target: `<repo-path>\_launch.bat`
-- Change icon to `<repo-path>\panopticon.ico`
+```powershell
+powershell -ExecutionPolicy Bypass -File make_shortcut.ps1
+```
+
+This points the shortcut straight at the venv's `pythonw.exe`, which is a GUI-subsystem
+binary — Windows never allocates a console for it, so you get exactly one window.
+
+Do **not** point a shortcut at `_launch.bat`: a `.bat` is a console program, so Windows
+gives it a console window, and `uv run` then blocks for the whole life of the app — that
+console sits on the taskbar for the entire session. (Marking the shortcut "minimised"
+hides it but does not stop it existing.)
+
+`_launch.bat` is still the right thing to run when you *want* the console — if the app
+fails to start, it shows you why. It also goes through `uv run`, so it picks up
+dependency changes; the shortcut does not, so run `uv sync` after a `pyproject.toml`
+change.
 
 ---
 
@@ -229,10 +242,29 @@ Each rig has a YAML profile in `profiles/`. The profile defines everything speci
 | `serial_port` | string | Teensy COM port (e.g., `COM3`) |
 | `trigger_pins` | list[int] | Teensy GPIO pins, one per camera (e.g., `[2, 4, 6, 8, 10, 12]`) |
 
-This repo ships two profiles: **`3dpose`** (real-time GPU encode with cross-camera frame
-kick-out — the default) and **`3dpose (raw)`** (`profiles/3dpose_raw.yaml`, the
-raw-to-disk fallback). Pick the latter from the dropdown if NVENC misbehaves or for a
-recording you can't risk. See **Frame alignment** below for what kick-out does.
+This repo ships one profile per rig: **`3dpose`** and **`3dface`**. Both use real-time
+GPU encode with cross-camera frame kick-out. See **Frame alignment** below for what
+kick-out does.
+
+### Falling back to raw capture
+
+Dedicated `(raw)` profiles used to ship alongside these and were removed once the
+real-time path proved out (a 20-minute 6-camera run at 99.95%, zero buffer underruns,
+zero forced drops). The raw path itself is **still fully supported** — it is a profile
+flag, not dead code. To get it back, copy the profile and flip one field:
+
+```bash
+cp profiles/3dpose.yaml profiles/3dpose_raw.yaml
+```
+```yaml
+name: 3dpose (raw)
+realtime_encode: false     # write raw.bin during capture, encode after
+```
+
+Worth knowing before you do: raw capture writes `n_cams x fps x frame_bytes` — **1.38
+GB/s at 6 cameras, ~138 GB per camera per 10 minutes** — and then needs a post-hoc encode
+pass of roughly real time. The GUI also falls back to raw *automatically*, per camera, if
+NVENC cannot start, so you do not need a raw profile just to be safe.
 
 To create a new profile for a different rig:
 
@@ -279,7 +311,7 @@ To create a new board config:
 7. Flip **Record** toggle — record behavioral data
 8. Flip it off — videos are finalized (seconds), and `calibration.toml` is copied to the recording directory
 
-> With online encode (the default), encoding happens live during capture, so step 5/8 is a near-instant remux. In the **3dpose (raw)** fallback profile these steps run the full post-hoc encode instead (~10 min for a 10-min recording).
+> With online encode (the default), encoding happens live during capture, so step 5/8 is a near-instant remux. With `realtime_encode: false` these steps run the full post-hoc encode instead (~10 min for a 10-min recording).
 
 ### Keyboard / mouse
 
@@ -399,7 +431,7 @@ Either way the per-camera videos end up identical length with identical block ID
 
 ### Raw capture + post-hoc encoding (fallback)
 
-Used when `realtime_encode: false` (the **3dpose (raw)** profile) or when NVENC is
+Used when `realtime_encode: false` or when NVENC is
 unavailable. Raw mono8 frames are written directly to disk via `os.write()` into
 `raw.bin`; after recording stops, ffmpeg encodes them to H.264 via NVENC
 (`encode_parallel` cameras at a time). Rock-solid — the disk write can never fall

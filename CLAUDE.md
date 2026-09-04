@@ -413,7 +413,7 @@ Plain scripts, no pytest — run directly:
     run is pending.) The original text follows. Raising
     `kick_max_lag` would only paper over it (ring RAM is `max_lag+264` NV12
     buffers/cam ≈ 10.4 GB at 240, 15.4 GB at 480).
-- `3dpose (raw)` profile (`realtime_encode: false`) = the proven raw.bin + post-hoc
+- **Raw fallback** (`realtime_encode: false`) = the proven raw.bin + post-hoc
   NVENC fallback (no GPU encode during capture).
 - Blocking camera ops (open/close/reconfigure) run off the Qt main thread via
   `gui_app/ui_workers.py` `CallableWorker` (else the window goes "not responding").

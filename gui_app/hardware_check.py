@@ -215,7 +215,7 @@ def check_capacity(n_cams: int, width: int, height: int,
             # A WARNING, never a blocker. `minutes` is an assumed worst case, not
             # a known recording length, and it is the most speculative number
             # here — so it must not be the one the operator cannot override. It
-            # would otherwise refuse the `3dpose (raw)` profile outright, which
+            # would otherwise refuse a raw-capture profile outright, which
             # CLAUDE.md documents as the fallback when the real-time path
             # misbehaves: 6 cams x 100 fps x 2.3 MB x 600 s is ~772 GiB demanded
             # for what may be a one-minute test.
