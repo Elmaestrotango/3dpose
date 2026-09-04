@@ -345,6 +345,42 @@ def test_trace_unwraps_16bit_blockids():
     print("13) trace unwraps 16-bit block-ID rollover: PASS")
 
 
+# ── the sketch-swap invalidation rule (added 2026-09-04) ────────────────────
+# A calibration always flashes the recording-only sketch. If the stim editor is
+# not told, its _uploaded_ino still holds the paradigm, so Test finds canvas ==
+# uploaded, skips the re-upload prompt, and drives a board with NUM_CHAINS == 0:
+# the laser never fires and nothing says so. This pins the decision rule that
+# main_window._ensure_sketch_for uses.
+
+def _should_invalidate(want_ino, session_stim_ino):
+    """Mirror of the guard in _ensure_sketch_for's success path."""
+    return session_stim_ino is not None and want_ino != session_stim_ino
+
+
+def test_sketch_swap_invalidates_stale_upload():
+    TRIG = [2, 4, 6, 8, 10, 12]
+    blank = sc.recording_only_sketch([53], TRIG)
+    paradigm = sc.compile_ino([B("A", pin=53)], [], [53], TRIG)
+    assert blank != paradigm, "test premise broken: the two sketches are equal"
+
+    # A calibration after an Apply: blank goes on, the editor must be told.
+    assert _should_invalidate(blank, paradigm), \
+        "calibration flashed the blank sketch but left the editor thinking " \
+        "its paradigm is still on the board"
+
+    # Recording the same paradigm again: no flash, nothing to invalidate.
+    assert not _should_invalidate(paradigm, paradigm), \
+        "invalidated an upload that is genuinely still on the board"
+
+    # Never applied anything: there is no stale state to clear, so staying
+    # quiet matters — otherwise a plain calibration nags about re-applying a
+    # paradigm the user never created.
+    assert not _should_invalidate(blank, None), \
+        "nagged about a paradigm that was never applied"
+
+    print("14) a sketch swap invalidates a stale upload record: PASS")
+
+
 def main():
     test_start_resolution()
     test_chain_extraction_terminates()
@@ -357,6 +393,7 @@ def main():
     test_describe()
     test_generated_sketch_is_wellformed()
     test_ready_ack()
+    test_sketch_swap_invalidates_stale_upload()
     if _HAS_NUMPY:
         test_trace_locate()
         test_trace_ttl_matches_firmware()

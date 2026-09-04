@@ -328,10 +328,20 @@ class CameraManager(QObject):
         self._grab_threads.clear()
         return results
 
-    def resume_preview(self):
+    def resume_preview(self, preview_fps: float = 30.0):
         """Return all cameras to free-run preview after an acquisition. Resilient
-        to a camera that went offline mid-session (it is skipped, not fatal)."""
+        to a camera that went offline mid-session (it is skipped, not fatal).
+
+        Restores the .pfs exposure and gain. Without this the preview keeps
+        whatever the last acquisition set, so after a calibration it sat at
+        calibration_exposure_us (15 ms on 3dpose, 5x the recording value). Free
+        run at 30 fps has the headroom, so nothing breaks — it just looks far
+        brighter than what a recording will actually capture, which is exactly
+        the misreading the "judge exposure from a recording, not the preview"
+        rule exists to prevent. Passing None restores the baseline read at open.
+        """
         self._set_freerun_mode()
+        self.apply_exposure_gain(preview_fps, None, None)
         self._start_grab_threads()
 
     def close_all(self):

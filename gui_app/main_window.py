@@ -722,6 +722,18 @@ class MainWindow(QMainWindow):
                 self._sidebar.reset_toggles()
                 return
             settings.setValue("board_sketch_sha", want_sha)
+            # The board now carries `want`. If that is not the paradigm the stim
+            # editor last uploaded, the editor's record of what is on the board
+            # is stale and MUST be cleared. Otherwise Test compares the canvas
+            # against _uploaded_ino, finds them equal, skips the re-upload
+            # prompt, and drives a board whose sketch has NUM_CHAINS == 0: the
+            # laser never fires and nothing says so. A calibration reaches this
+            # every time, because calibration always flashes recording-only.
+            if (self._stim_window is not None
+                    and self._session_stim_ino is not None
+                    and want != self._session_stim_ino):
+                self._stim_window.invalidate_upload(
+                    f"a {acq_type} needed the {label} sketch")
             self._teensy_connection()        # retake the port before acquiring
             self._start_acquisition(acq_type)
 
@@ -1292,7 +1304,16 @@ class MainWindow(QMainWindow):
                 get_port=lambda: self._profile.serial_port,
                 get_output_dir=lambda: self._sidebar.output_dir,
                 get_fps=lambda: self._profile.frame_rate,
-                is_busy=lambda: self._state in (State.RECORDING, State.CALIBRATING),
+                # Must cover a firmware flash too, not just an acquisition. The
+                # launch-time clean flash and the per-acquisition sketch swap
+                # both run with _state IDLE and _busy True, and both hand the
+                # serial port to arduino-cli. Without _busy here the editor's
+                # Apply and Test stay enabled and can launch a second
+                # arduino-cli onto a port the first one already holds.
+                is_busy=lambda: (
+                    self._state in (State.RECORDING, State.CALIBRATING)
+                    or self._busy
+                    or (self._fw_op is not None and self._fw_op.isRunning())),
                 get_safe_pins=lambda: self._profile.stim_safe_pins,
                 get_trigger_pins=lambda: self._profile.trigger_pins,
                 get_serial=self._teensy_connection,
@@ -1312,11 +1333,15 @@ class MainWindow(QMainWindow):
         # False, so quitting during a ~30 s arduino-cli flash would destroy a
         # running QThread and can kill avrdude mid-write — leaving a Mega with
         # no allStimLow() boot guard, i.e. a laser pin floating on next power-up.
+        # _fw_op is the per-acquisition sketch swap and the launch-time clean
+        # flash. Same hazard as the editor's Apply above and for the same
+        # reason: it is arduino-cli driving avrdude, so it must never be torn
+        # down silently.
         if self._stim_window is not None and self._stim_window.is_uploading():
             return True
         return any(w is not None and w.isRunning() for w in
                    (self._encode_worker, self._align_worker, self._calib_worker,
-                    self._cam_op, self._coverage_worker))
+                    self._cam_op, self._coverage_worker, self._fw_op))
 
     def closeEvent(self, event):
         # Quitting mid-session can't be finalized — confirm, then ABANDON the
@@ -1368,9 +1393,27 @@ class MainWindow(QMainWindow):
             State.RECORDING, State.CALIBRATING, State.ENCODING, State.ALIGNING)
         # Kill child processes (ffmpeg remux/encode, the uv-run solve): unblocks
         # the workers and unlocks output files so they can be removed.
+        #
+        # NEVER kill the firmware toolchain. avrdude interrupted mid-write
+        # leaves the Mega with a half-programmed flash, which means no
+        # allStimLow() boot guard — so the laser pin floats on the next
+        # power-up, which a powered driver reads as ON. A stranded arduino-cli
+        # is a far smaller problem than that: it finishes on its own in ~30 s,
+        # and _workers_running() already refuses to reach this path silently
+        # while an upload is in flight.
+        _FIRMWARE_PROCS = ("avrdude", "arduino-cli")
         try:
             import psutil
             for child in psutil.Process().children(recursive=True):
+                try:
+                    name = (child.name() or "").lower()
+                except Exception:
+                    name = ""
+                if any(p in name for p in _FIRMWARE_PROCS):
+                    print(f"[quit] leaving {name} alone: killing it mid-write "
+                          f"would strip the board's laser-safety boot guard",
+                          flush=True)
+                    continue
                 try:
                     child.kill()
                 except Exception:
@@ -1388,6 +1431,13 @@ class MainWindow(QMainWindow):
                   self._calib_worker, self._coverage_worker):
             if w is not None and w.isRunning():
                 w.wait(3000)
+        # A flash gets far longer, because it is not being killed above and
+        # abandoning the QThread under a live avrdude is the thing this is
+        # avoiding. arduino-cli's compile+upload is ~30 s.
+        if self._fw_op is not None and self._fw_op.isRunning():
+            print("[quit] waiting for the firmware flash to finish before "
+                  "tearing down", flush=True)
+            self._fw_op.wait(60000)
         if self._cam_op is not None and self._cam_op.isRunning():
             # Still inside pylon after 3 s. Leaking the camera handles costs
             # nothing at process exit; closing them under a live native call

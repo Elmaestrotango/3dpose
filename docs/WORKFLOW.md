@@ -352,8 +352,10 @@ line between 1 and 4 — is still thin and dark.
 
 **What to do:** work that pair specifically. Find where both of those cameras can see the
 board at the same time, which for opposed cameras usually means holding it edge-on between
-them, and hold it there. A single thin line is enough to keep the display out of READY,
-because the pair graph has to be connected.
+them, and hold it there. READY needs the pair graph to form a *single connected component*,
+not every pair to be connected, so one thin line blocks it only when that pair is the sole
+link between two groups of cameras — but working it raises both of those cameras' paired
+counts either way, which is what the caption is waiting on here.
 
 ### Stage 4 — READY
 
@@ -474,8 +476,8 @@ saw the board at once, so views a camera had to itself are absent even though th
 stage could have used them. Whether the two paths produce equivalent calibrations has not
 been measured. The practical consequence is for later, when you are looking at a marginal
 result: before concluding the calibration recording itself was too thin, re-run the solve by
-hand with `codet_frames.json` moved aside, or with a lower `--skip`, and see whether the
-numbers improve.
+hand with `codet_frames.json` moved aside — which both widens the frame set and is what
+makes `--skip` take effect at all — and see whether the numbers improve.
 
 What it leaves behind are two files in the `calibration/` folder:
 **`calibration.toml`**, which holds the actual result in aniposelib's layout (per camera a
@@ -690,21 +692,24 @@ produces one bad pair is often one you were warned about while recording.
 #### When you want a better calibration than the button gives
 
 It is worth knowing that the in-app Solve is deliberately a fast solve, not the most
-accurate one available. It reads every third frame (`--skip 3`), and internally it caps
-itself at 60 pose-diverse frames for each camera's intrinsics and 30 shared frames for each
-pair. Those caps are what let it finish in a couple of minutes instead of an hour, and for
-ordinary use the result is fine — the plot above is how you confirm that.
+accurate one available. It reads only the frames `codet_frames.json` lists — the moments two
+or more cameras saw the board — and internally it caps itself at 60 pose-diverse frames for
+each camera's intrinsics and 30 shared frames for each pair. Those caps are what let it
+finish in a couple of minutes instead of an hour, and for ordinary use the result is fine —
+the plot above is how you confirm that.
 
 But if the calibration is the limiting factor on your reconstruction, you can spend time to
-get a better one. Running the solver over every frame instead of every third is a single
-argument:
+get a better one. Move `codet_frames.json` out of `calibration/` first — while it is sitting
+there the frame list decides everything and `--skip` is ignored — and then running the solver
+over every frame instead of every third is a single argument:
 
 ```
 uv run 1_calibrate.py <session_dir> --board-config configs/boards/<your_board>.yaml --skip 1
 ```
 
 This takes substantially longer and gives the intrinsics and the pairwise fits more poses to
-choose from. Going the other way is a false economy: `--skip 10` runs quickly and visibly
+choose from, including the views a camera had to itself, which the co-detection list leaves
+out. Going the other way is a false economy: `--skip 10` runs quickly and visibly
 degrades the result, so treat 3 as a floor rather than a starting point for tuning.
 
 Two structural limits are worth being aware of, because no amount of extra frames removes
@@ -1359,7 +1364,7 @@ with `calibration` in the name, and the alignment pass prefers ones with `record
 | `WARNINGS.txt` | Present only when this camera's frame-to-trigger mapping was repaired or could not be verified. | you |
 | `encode_error.log` | Present only when this camera's encode failed. `ffmpeg`'s stderr. Removed on success. | you |
 | `stream.h264` | Transient. The GPU-produced elementary stream during real-time capture; remuxed to `.mp4` and deleted. Left behind means the encode failed. | the encode worker |
-| `raw.bin` | Transient. Uncompressed frames, in the raw fallback profile or for a camera whose GPU encoder failed to start. Deleted after a successful encode. | the encode worker |
+| `raw.bin` | Transient. Uncompressed frames, written when the profile sets `realtime_encode: false` or for a camera whose GPU encoder failed to start. Deleted after a successful encode. | the encode worker |
 | `raw_tail.bin`, `tail.h264` | Transient. Frames captured after a camera's GPU encoder died mid-recording, appended to `stream.h264` before the remux. | the encode worker |
 | `aligned_tmp.mp4` | Transient. An alignment pass in progress; renamed over the original on success. | the alignment pass |
 
@@ -1591,7 +1596,7 @@ is the whole diagnosis.
 | No node ever brightens in the coverage display | Nothing is detecting the board. Either it is too dark — raise `calibration_exposure_us`, and note that a 30 fps calibration has room for roughly 27 ms of exposure against about 3.94 ms at 100 fps, of which the application allows 90% — or the profile's `board_config` does not describe the physical board. A board printed before the OpenCV 4.6 layout change needs `board_legacy: true`, without which newer detectors find every marker and return zero board corners, silently. |
 | The coverage display never appears | OpenCV is missing, or the profile's `board_config` path does not exist. The display disables itself so the rest of the application still runs. |
 | `paired` climbs but `grid` sticks at `1/3` or `2/3` | The board is being waved in one place. Carry it into the corners of each camera's view. |
-| One line stays thin while everything else is bright | That pair of cameras rarely sees the board together, and READY needs the pair graph connected. Work that pair on its own. |
+| One line stays thin while everything else is bright | That pair of cameras rarely sees the board together. READY needs the pair graph to be one connected component rather than every pair connected, so a single thin line holds READY up only when that pair is the sole link between two groups — but working it raises both cameras' paired counts either way, and the solve wants that pair. Work it on its own. |
 | `No ChArUco board detections found.` | The solve found nothing to work with. Check the board was visible to all cameras during the calibration recording and that the board config matches the physical board. |
 | `Calibration solve failed (singular matrix).` | Too few detections, or the board only ever seen from one angle. Record a longer calibration with more orientations. |
 | `Consider recording calibration longer with the board visible to more cameras simultaneously.` | The solve produced a calibration but is not confident: a pair with a stereo RMS above 20 px, or a camera with fewer than 30 detection frames. The per-pair numbers are in the log, and `reprojection_error_histogram.png` shows them — see [Reading the pairwise calibration plot](#reading-the-pairwise-calibration-plot). |
@@ -1603,7 +1608,7 @@ is the whole diagnosis.
 | Fewer cameras in `calibration.toml` than you recorded, with no warning anywhere | A camera was dropped from the solve: too few detection frames, too few for its own intrinsics, or no co-detections with any other camera. This does not raise a dialog. Read the `Cameras: …` line the solve prints at the end — see [Which cameras actually made it into the solve](#which-cameras-actually-made-it-into-the-solve). |
 | `Calibration failed (exit code 1): …` | The tail of the solve's error output. `fewer than 2 cameras with detections`, `fewer than 2 cameras with valid intrinsics` and `no camera pairs with co-detections` all mean the calibration recording was too thin to solve — record it again and watch the coverage display. |
 | `Board config not found: …  Set board_config in your profile YAML to a valid file in configs/boards/.` | The profile points at a board description that is not there. |
-| `uv not found on PATH` | The solve runs as a self-contained script through `uv`. Install `uv`, or run `1_calibrate.py` by hand. |
+| `uv not found on PATH` | The solve is launched as `uv run 1_calibrate.py`, in the project environment. Install `uv`, or run `1_calibrate.py` by hand with the project's Python. |
 | `Calibration directory not found: <path>` or `No calibration videos found in: <path>` | The metadata fields do not match the calibration that was recorded. Solve builds the path from the fields as they are when you press it. |
 
 ### Stimulation

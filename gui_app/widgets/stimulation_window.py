@@ -1219,8 +1219,10 @@ class StimulationWindow(QDialog):
         if self._is_busy():
             QMessageBox.information(
                 self, "Busy",
-                "The serial port is in use by the running acquisition.\n"
-                "Stop it before uploading.")
+                "Something else is using the serial port — either a running "
+                "acquisition or a firmware flash.\n\nWait for it to finish, or "
+                "stop the acquisition, then upload again. Two uploads to the "
+                "same port at once leave the board in an unknown state.")
             self._test_after_upload = False
             return
         self._apply_btn.setEnabled(False)

@@ -285,8 +285,10 @@ exposure_max = 1/trigger_fps - 1/AcquisitionFrameRate
 ```
 
 Two pieces of code decide those terms. `BaslerBackend.set_triggered()` applies
-the profile's `trigger_rate_limit` as `AcquisitionFrameRate` (165 on both shipped
-profiles, i.e. a 6.06 ms floor contribution). Then
+the profile's `trigger_rate_limit` as `AcquisitionFrameRate` — 165 in effect on
+both shipped profiles, i.e. a 6.06 ms floor contribution, though only `3dpose`
+sets the field: 165 is also the default in `RigProfile` when a profile omits it.
+Then
 `CameraManager.apply_exposure_gain()` derives the ceiling from the trigger rate
 actually in use and **enforces** it with a 10% safety margin, rather than
 trusting the profile to be self-consistent:
@@ -722,16 +724,17 @@ directly as milliseconds per frame. What each one means:
 | Field | Definition | Healthy |
 |---|---|---|
 | `avg_wait` | Time blocked in `retrieve()` | Large. It is the slack in the period |
-| `avg_proc` | Everything from `retrieve()` returning to the end of the display branch | Well under the period |
+| `avg_proc` | From `retrieve()` returning to the end of the submit/write branch. The display branch, the fps bookkeeping and `Release()` all sit outside it | Well under the period |
 | `cycle` | Start of one iteration to the start of the next | **Exactly the trigger period** |
-| `copy`, `submit`, `disp`, `rel` | Components of `proc`, plus `Release()` | `copy` dominates |
+| `copy`, `submit` | Components of `proc` | `copy` dominates |
+| `disp`, `rel` | Measured separately, outside `proc`: the display branch, and `Release()` | Small |
 | `deliv_lag` | `(host time at retrieve − device timestamp)` minus its value at the first frame | ~0, not growing |
 | `qsize` | Encoder queue depth, or coordinator pending depth in kick mode | ~0 |
 
 `cycle` is the one number that closes the budget: `wait + proc` does not cover
-the whole iteration, because `Release()`, the frame-rate bookkeeping and the loop
-edge sit outside both. A `cycle` above the trigger period means the loop is
-losing to the clock even if `proc` looks fine.
+the whole iteration, because the display branch, `Release()`, the frame-rate
+bookkeeping and the loop edge all sit outside both. A `cycle` above the trigger
+period means the loop is losing to the clock even if `proc` looks fine.
 
 `deliv_lag` is measured against the camera's own clock, so host scheduling cannot
 skew it. It is the honest health signal, because the failure it catches is silent
@@ -1644,6 +1647,15 @@ Cold path, per `CameraBackend`:
 | `retrieve(cam, timeout_ms)` | Block for the next frame; return a `GrabResultProtocol`; raise `TimeoutException` |
 | `close(cam)` | Release the device |
 | `stream_stats(cam)` | Whatever distinguishes **host starvation** from **network loss** |
+
+The `CameraBackend` Protocol as written is not quite the whole surface, and a
+backend that implements only the table above starts and then fails at the first
+acquisition. `camera_manager` also calls `get_exposure_gain(cam)`,
+`set_exposure_gain(cam, exposure_us, gain_db)`, `enable_extended_block_ids(i,
+cam)` and `select_gige_driver(i, cam, which)`; `grab_thread` reads the module
+attribute `GRAB_STRATEGY` and drives `StartGrabbing`/`StopGrabbing`/`IsGrabbing`
+on the *native* camera object rather than through the backend's equivalents.
+Supply all of those as well.
 
 Hot path, per `GrabResultProtocol`: `GrabSucceeded()`, `ErrorCode`,
 `ErrorDescription`, `BlockID`, `TimeStamp`, `PaddingX`, `PaddingY`,
