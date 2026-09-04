@@ -687,6 +687,35 @@ of those cameras can see it at once — for opposed cameras that usually means e
 them. This is the same pair the coverage display shows as a thin, dark line, so a solve that
 produces one bad pair is often one you were warned about while recording.
 
+#### When you want a better calibration than the button gives
+
+It is worth knowing that the in-app Solve is deliberately a fast solve, not the most
+accurate one available. It reads every third frame (`--skip 3`), and internally it caps
+itself at 60 pose-diverse frames for each camera's intrinsics and 30 shared frames for each
+pair. Those caps are what let it finish in a couple of minutes instead of an hour, and for
+ordinary use the result is fine — the plot above is how you confirm that.
+
+But if the calibration is the limiting factor on your reconstruction, you can spend time to
+get a better one. Running the solver over every frame instead of every third is a single
+argument:
+
+```
+uv run 1_calibrate.py <session_dir> --board-config configs/boards/<your_board>.yaml --skip 1
+```
+
+This takes substantially longer and gives the intrinsics and the pairwise fits more poses to
+choose from. Going the other way is a false economy: `--skip 10` runs quickly and visibly
+degrades the result, so treat 3 as a floor rather than a starting point for tuning.
+
+Two structural limits are worth being aware of, because no amount of extra frames removes
+them. The pairs are chained into a single coordinate frame along a lowest-error spanning
+tree, with **no global bundle adjustment** afterwards — so errors are never redistributed
+across the whole rig, and a mediocre pair sitting on the chosen path propagates its error to
+everything downstream of it. That is the deeper reason to read the pairwise chart rather than
+trusting a single overall number. If you need a jointly-optimised calibration, solve with a
+package that performs bundle adjustment — `sleap-anipose` and `aniposelib`, which already
+read the `calibration.toml` this writes, are the natural choices.
+
 ### The rule that keeps a calibration valid
 
 There is one more thing to say before moving on, and it is the single easiest way to ruin a
