@@ -1059,6 +1059,20 @@ class StimulationWindow(QDialog):
                     f"pin, or merge them into a single chain.")
         return None
 
+    def invalidate_upload(self, reason: str = ""):
+        """Forget that this canvas is on the board, because it no longer is.
+
+        Called when something outside the editor reflashes the board. Without
+        it `provenance()` would keep reporting matches_uploaded_firmware: true
+        against firmware that no longer holds this paradigm, and a recording
+        made without re-applying would carry a confident but false record of
+        what the animal received. `None` — "unknown" — is the honest state.
+        """
+        self._uploaded_ino = None
+        self._set_status(
+            f"Board reflashed{' — ' + reason if reason else ''}. "
+            f"Press Apply again before recording.", error=True)
+
     def is_uploading(self) -> bool:
         """True while arduino-cli is compiling/flashing the board.
 

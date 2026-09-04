@@ -515,24 +515,39 @@ class MainWindow(QMainWindow):
                      if acq_type == "calibration"
                      and self._config.calibration_gain_db >= 0 else None))
 
-        # Starting the board starts whatever paradigm is flashed on it, and that
-        # happens for a calibration exactly as it does for a recording. A
-        # calibration is the acquisition performed with a PERSON inside the
-        # arena holding the board, so confirm before putting a live stim pin —
-        # possibly a laser — into that situation.
+        # A CALIBRATION NEVER RUNS STIMULATION.
+        #
+        # Starting the board starts whatever paradigm is flashed on it — the
+        # sketch calls initStim() from the same config path a calibration uses —
+        # and a calibration is the one acquisition performed with a PERSON
+        # inside the arena holding the target.
+        #
+        # The guarantee is made by the firmware not containing a paradigm,
+        # rather than by asking it not to run one. Suppressing stim over the
+        # wire is not safe to rely on: readPins()/readFPS() block on
+        # `while (!Serial.available())`, and the config path ends with
+        # `while (Serial.available()) Serial.parseFloat();`, so an extra flag
+        # token is either swallowed by that drain on firmware that predates it
+        # or mis-parsed from a buffered newline. An interlock cannot rest on
+        # that. Reflashing is unambiguous and verifiable.
+        #
+        # Cost is normally zero: startup already leaves the board stim-free, so
+        # this is a no-op unless a paradigm was Applied during this session.
         if acq_type == "calibration" and self._board_has_paradigm():
             reply = QMessageBox.warning(
-                self, "Stimulation is loaded on the board",
-                "A stimulation paradigm is currently flashed on the trigger "
-                "board.\n\nStarting a calibration will run it from t=0, and a "
-                "calibration is normally done with a person inside the arena "
-                "holding the target.\n\nKey off the laser, or open Stimulation "
-                "and Apply an empty canvas, before calibrating.\n\n"
-                "Start the calibration anyway?",
+                self, "Calibration cannot run stimulation",
+                "A stimulation paradigm is currently on the trigger board, and "
+                "a calibration is performed with a person inside the arena.\n\n"
+                "The board will be reflashed to a stimulation-free sketch "
+                "before the calibration starts (about 30 seconds). You will "
+                "need to Apply your paradigm again before recording.\n\n"
+                "Continue?",
                 QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
             if reply != QMessageBox.Yes:
                 self._sidebar.reset_toggles()
                 return
+            self._clear_stim_then(lambda: self._start_acquisition("calibration"))
+            return
 
         teensy = self._teensy_connection()
         if teensy is None:
@@ -555,11 +570,9 @@ class MainWindow(QMainWindow):
         if acq_type == "calibration":
             self._state = State.CALIBRATING
             self._sidebar.set_status("CALIBRATING", "#4488ff")
-            # Provenance is written for a calibration too when a paradigm is
-            # live. The board runs it either way, so without this a paradigm
-            # that fired during a calibration would leave no trace on disk.
-            if self._board_has_paradigm():
-                self._save_stim_paradigm()
+            # No stim provenance is written for a calibration, and none is
+            # needed: the board is reflashed stim-free before a calibration can
+            # start, so there is never a paradigm to record.
             self._start_coverage_hud()
         else:
             self._state = State.RECORDING
@@ -635,6 +648,67 @@ class MainWindow(QMainWindow):
             self._stim_end_timer = None
 
     # ── shared trigger-board link ─────────────────────────────────────────────
+    def _clear_stim_then(self, on_success):
+        """Reflash the stim-free sketch, then run `on_success` if it worked.
+
+        The serial port must be handed over: arduino-cli needs it exclusively,
+        and reopening afterwards is what puts the board's reset inside Apply
+        rather than inside the next acquisition.
+
+        If the flash fails, `on_success` is NOT called. Refusing to start is the
+        correct outcome — the point of the reflash is that the board provably
+        holds no paradigm, and a failed flash means it may still hold one.
+        """
+        from gui_app import stim_compiler
+        try:
+            blank = stim_compiler.recording_only_sketch(
+                self._profile.stim_safe_pins, self._profile.trigger_pins)
+            sha = stim_compiler.sketch_sha(blank)
+        except Exception as e:
+            QMessageBox.critical(self, "Cannot clear stimulation",
+                                 f"Could not build the stimulation-free "
+                                 f"sketch, so the board cannot be guaranteed "
+                                 f"clear:\n\n{e}")
+            self._sidebar.reset_toggles()
+            return
+
+        self.release_serial_port()
+        self._begin_busy("Clearing stim firmware…")
+        port = self._profile.serial_port
+        self._fw_op = CallableWorker(lambda: stim_compiler.upload(blank, port))
+
+        def done(result):
+            self._end_busy()
+            self._sidebar.set_status("IDLE", "#888")
+            ok, msg = result if isinstance(result, tuple) else (False, str(result))
+            if not ok:
+                print(f"[acq] stim clear failed: {msg}", flush=True)
+                QMessageBox.critical(
+                    self, "Cannot start the calibration",
+                    "The trigger board could not be reflashed, so it may still "
+                    "hold a stimulation paradigm. The calibration has not been "
+                    "started.\n\nKey off the laser and check the board, then "
+                    "retry.\n\n" + msg)
+                self._sidebar.reset_toggles()
+                return
+            from PyQt5.QtCore import QSettings
+            QSettings("Salk", "Panopticon").setValue("board_sketch_sha", sha)
+            # The editor still believes its paradigm is on the board. Left
+            # alone, a recording started without re-applying would record
+            # matches_uploaded_firmware: true against firmware that no longer
+            # contains the paradigm — provenance claiming something false is
+            # worse than provenance admitting it does not know.
+            if self._stim_window is not None:
+                self._stim_window.invalidate_upload(
+                    "board was reflashed stimulation-free for a calibration")
+            print("[acq] board cleared of stimulation; starting calibration",
+                  flush=True)
+            self._teensy_connection()      # retake the port before acquiring
+            on_success()
+
+        self._fw_op.done.connect(done)
+        self._fw_op.start()
+
     def _board_has_paradigm(self) -> bool:
         """True if the flashed sketch is not the stim-free recording sketch.
 
