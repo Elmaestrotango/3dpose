@@ -511,10 +511,9 @@ requirement or a shopping list.
 | OS | Windows |
 
 On that machine a 60-second six-camera run at 100 fps captured 100.00% of
-triggers, and section 3 below quotes the rest of that run's numbers. It is also
-the rig [PERF_EXPERIMENTS.md](PERF_EXPERIMENTS.md) logs every performance
-measurement against, which is the place to look for the numbers behind the
-numbers. Having the machine in view explains a couple of figures quoted earlier,
+triggers, and section 3 below quotes the rest of that run's numbers. Every
+performance figure in these pages was measured on it. Having the machine in
+view explains a couple of figures quoted earlier,
 too: the "46% of a single core against a 4% average across 24 cores" is 24 cores
 of that CPU, and the 63.4 GB is what makes 27.2 GiB of buffers comfortable
 rather than marginal. Scaling in any direction away from this means going back
@@ -594,14 +593,14 @@ short.
 
 ```powershell
 cd $HOME\Desktop
-git clone --recurse-submodules https://github.com/Elmaestrotango/3dpose.git
-cd 3dpose
+git clone --recurse-submodules https://github.com/talmolab/panopticon.git
+cd panopticon
 ```
 
 Expected output ends with something like:
 
 ```
-Cloning into '3dpose'...
+Cloning into 'panopticon'...
 remote: Enumerating objects: ...
 Receiving objects: 100% ...
 Resolving deltas: 100% ...
@@ -615,8 +614,8 @@ If `git` is not recognized, install Git for Windows from
 <https://git-scm.com/download/win> and reopen PowerShell.
 
 Every later command in this page assumes the prompt is inside the repository
-(`PS C:\Users\you\Desktop\3dpose>`). To get back there in a new window:
-`cd $HOME\Desktop\3dpose`.
+(`PS C:\Users\you\Desktop\panopticon>`). To get back there in a new window:
+`cd $HOME\Desktop\panopticon`.
 
 ### Step 4 — install the Python dependencies
 
@@ -675,8 +674,8 @@ streaming are UDP, and Windows blocks inbound UDP to an unknown program by
 default. Replace the path with your own:
 
 ```powershell
-New-NetFirewallRule -DisplayName "PanopticonGigE" -Direction Inbound -Action Allow -Protocol UDP -Program "C:\Users\you\Desktop\3dpose\.venv\Scripts\python.exe"
-New-NetFirewallRule -DisplayName "PanopticonGigE-w" -Direction Inbound -Action Allow -Protocol UDP -Program "C:\Users\you\Desktop\3dpose\.venv\Scripts\pythonw.exe"
+New-NetFirewallRule -DisplayName "PanopticonGigE" -Direction Inbound -Action Allow -Protocol UDP -Program "C:\Users\you\Desktop\panopticon\.venv\Scripts\python.exe"
+New-NetFirewallRule -DisplayName "PanopticonGigE-w" -Direction Inbound -Action Allow -Protocol UDP -Program "C:\Users\you\Desktop\panopticon\.venv\Scripts\pythonw.exe"
 ```
 
 Each command echoes the rule it created, ending with `Enabled : True`. Two rules
@@ -987,7 +986,7 @@ opens with one live preview pane per camera, free-running at about 30 fps.
 The console shows one block per camera:
 
 ```
-[startup] logging to C:\Users\you\Desktop\3dpose\logs\panopticon_20260903_191735.log
+[startup] logging to C:\Users\you\Desktop\panopticon\logs\panopticon_20260903_191735.log
 [acq] profile: 3dpose
 [cam1] 41920544 1920x1200 Mono8
 [cam1] extended (64-bit) block IDs: enabled
@@ -1038,9 +1037,9 @@ Expected:
 
 ```
 Shortcut written: C:\Users\you\Desktop\Panopticon.lnk
-  Target : C:\Users\you\Desktop\3dpose\.venv\Scripts\pythonw.exe
-  Args   : "C:\Users\you\Desktop\3dpose\gui.py"
-  WorkDir: C:\Users\you\Desktop\3dpose
+  Target : C:\Users\you\Desktop\panopticon\.venv\Scripts\pythonw.exe
+  Args   : "C:\Users\you\Desktop\panopticon\gui.py"
+  WorkDir: C:\Users\you\Desktop\panopticon
 ```
 
 The shortcut points at the virtual environment's `pythonw.exe`, a

@@ -13,3 +13,7 @@ __pycache__/
 campy/.git/
 .venv/
 probe_out/
+
+# Internal engineering notebook: kept on this machine, not published.
+# Its history stays in the repo; it simply stops receiving updates upstream.
+docs/PERF_EXPERIMENTS.md
